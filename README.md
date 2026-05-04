@@ -12,6 +12,8 @@ Linux performance benchmark that uses `perf_event_open` to compare multiple comm
 - **Peak RSS tracking.** Memory spikes per run.
 - **Statistical rigor.** Mean, standard deviation, quartiles, outlier detection (Tukey's fences), Student's t-test for significance.
 - **Color-coded deltas.** First command is the reference. Subsequent results show % difference with confidence intervals.
+- **Warmup runs.** Run unmeasured iterations before sampling to warm caches and branch predictors.
+- **Configurable sampling.** Set min/max samples and duration per command.
 - **Machine-readable output.** `--json` writes structured results to a file for CI pipelines.
 - **No shell overhead.** Commands spawn directly. No shell noise in measurements.
 - **Progress bar.** Spinner and animated bar with estimated completion.
@@ -23,12 +25,17 @@ Usage: zebrac [options] <command1> ... <commandN>
 
 Compares the performance of the provided commands.
 
-Options:
- -d, --duration <ms>    (default: 5000) how long to repeatedly sample each command
- --color <when>         (default: auto) color output mode
-                            available options: 'auto', 'never', 'ansi'
- -f, --allow-failures   (default: false) compare performance if a non-zero exit code is returned
- --json [<path>]        (default: false) output results as JSON to file (default: zebrac-results.json)
+Sampling:
+  -d, --duration <ms>    sampling duration per command (default: 5000)
+  -i, --min-samples <n>  minimum samples per command (default: 5)
+  -a, --max-samples <n>  maximum samples per command (default: 10000)
+  -w, --warmup <n>       warmup runs before measurement (default: 3)
+
+Output:
+  --color <when>         color mode: auto, never, ansi (default: auto)
+  -f, --allow-failures   benchmark despite non-zero exit codes
+  --json [<path>]        write results as JSON (default: zebrac-results.json)
+  -q, --quiet            suppress terminal output
 ```
 
 ### Examples
@@ -45,10 +52,16 @@ Quick 2-second benchmark:
 zebrac --duration 2000 'curl https://example.com'
 ```
 
-With JSON output for CI:
+With warmup and custom sample count:
 
 ```bash
-zebrac --json ./ci-results.json --duration 5000 './myapp'
+zebrac --warmup 10 --min-samples 20 './myapp'
+```
+
+With JSON output for CI (quiet, only JSON file):
+
+```bash
+zebrac --quiet --json ./ci-results.json --duration 5000 './myapp'
 ```
 
 ## Build from Source

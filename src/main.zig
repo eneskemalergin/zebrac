@@ -13,13 +13,17 @@ const usage_text =
     \\
     \\Compares the performance of the provided commands.
     \\
-    \\Options:
-    \\ -d, --duration <ms>    (default: 5000) how long to repeatedly sample each command
-    \\ --color <when>         (default: auto) color output mode
-    \\                            available options: 'auto', 'never', 'ansi'
-    \\ -f, --allow-failures   (default: false) compare performance if a non-zero exit code is returned
-    \\ --json [<path>]        (default: false) output results as JSON to file (default: zebrac-results.json)
-    \\ -q, --quiet            suppress terminal output (progress bar + results table)
+    \\Sampling:
+    \\  -d, --duration <ms>    sampling duration per command (default: 5000)
+    \\  -i, --min-samples <n>  minimum samples per command (default: 5)
+    \\  -a, --max-samples <n>  maximum samples per command (default: 10000)
+    \\  -w, --warmup <n>       warmup runs before measurement (default: 3)
+    \\
+    \\Output:
+    \\  --color <when>         color mode: auto, never, ansi (default: auto)
+    \\  -f, --allow-failures   benchmark despite non-zero exit codes
+    \\  --json [<path>]        write results as JSON (default: zebrac-results.json)
+    \\  -q, --quiet            suppress terminal output
     \\
 ;
 
@@ -97,6 +101,9 @@ pub fn main(init: process.Init) !void {
     var allow_failures = false;
     var json_path: ?[]const u8 = null;
     var quiet = false;
+    var min_samples: u64 = 5;
+    var max_samples: u64 = MAX_SAMPLES;
+    var warmup: u64 = 3;
 
     var arg_i: usize = 1;
     while (arg_i < args.len) : (arg_i += 1) {
@@ -157,6 +164,37 @@ pub fn main(init: process.Init) !void {
             }
         } else if (std.mem.eql(u8, arg, "-q") or std.mem.eql(u8, arg, "--quiet")) {
             quiet = true;
+        } else if (std.mem.eql(u8, arg, "-i") or std.mem.eql(u8, arg, "--min-samples")) {
+            arg_i += 1;
+            if (arg_i >= args.len) {
+                std.debug.print("'{s}' requires a number.\n{s}", .{ arg, usage_text });
+                process.exit(1);
+            }
+            min_samples = std.fmt.parseInt(u64, args[arg_i], 10) catch |err| {
+                std.debug.print("unable to parse --min-samples argument '{s}': {t}\n", .{ args[arg_i], err });
+                process.exit(1);
+            };
+        } else if (std.mem.eql(u8, arg, "-a") or std.mem.eql(u8, arg, "--max-samples")) {
+            arg_i += 1;
+            if (arg_i >= args.len) {
+                std.debug.print("'{s}' requires a number.\n{s}", .{ arg, usage_text });
+                process.exit(1);
+            }
+            max_samples = std.fmt.parseInt(u64, args[arg_i], 10) catch |err| {
+                std.debug.print("unable to parse --max-samples argument '{s}': {t}\n", .{ args[arg_i], err });
+                process.exit(1);
+            };
+            if (max_samples > MAX_SAMPLES) max_samples = MAX_SAMPLES;
+        } else if (std.mem.eql(u8, arg, "-w") or std.mem.eql(u8, arg, "--warmup")) {
+            arg_i += 1;
+            if (arg_i >= args.len) {
+                std.debug.print("'{s}' requires a number.\n{s}", .{ arg, usage_text });
+                process.exit(1);
+            }
+            warmup = std.fmt.parseInt(u64, args[arg_i], 10) catch |err| {
+                std.debug.print("unable to parse --warmup argument '{s}': {t}\n", .{ args[arg_i], err });
+                process.exit(1);
+            };
         } else {
             std.debug.print("unrecognized argument: '{s}'\n{s}", .{ arg, usage_text });
             process.exit(1);
@@ -201,13 +239,40 @@ pub fn main(init: process.Init) !void {
         };
         _ = prog_name;
 
-        const min_samples = 3;
+        for (0..warmup) |_| {
+            var child = process.spawn(io, .{
+                .argv = command.argv,
+                .stdin = .inherit,
+                .stdout = .ignore,
+                .stderr = .ignore,
+                .request_resource_usage_statistics = false,
+            }) catch |err| {
+                std.debug.print("\nerror: Couldn't execute {s}: {t}\n", .{ command.argv[0], err });
+                process.exit(1);
+            };
+            const term = child.wait(io) catch |err| {
+                std.debug.print("\nerror: warmup for '{s}': {t}\n", .{ command.raw_cmd, err });
+                process.exit(1);
+            };
+            switch (term) {
+                .exited => |code| {
+                    if (code != 0 and !allow_failures) {
+                        std.debug.print("\nerror: warmup for '{s}' failed with exit code {d}\n", .{ command.raw_cmd, code });
+                        process.exit(1);
+                    }
+                },
+                else => {
+                    std.debug.print("error: warmup terminated unexpectedly\n", .{});
+                    process.exit(1);
+                },
+            }
+        }
 
         const first_start: Io.Timestamp = .now(io, .awake);
         var sample_index: usize = 0;
         while ((sample_index < min_samples or
             first_start.untilNow(io, .awake).toNanoseconds() < max_nano_seconds) and
-            sample_index < samples_buf.len) : (sample_index += 1)
+            sample_index < max_samples) : (sample_index += 1)
         {
             if (!quiet) try bar.?.render(io);
             for (perf_measurements, &perf_fds) |measurement, *perf_fd| {
@@ -322,7 +387,7 @@ pub fn main(init: process.Init) !void {
                     const cur_samples: u64 = sample_index + 1;
                     const ns_per_sample: u64 = @intCast(@divTrunc((first_start.untilNow(io, .awake).toNanoseconds()), cur_samples));
                     const estimate = std.math.divCeil(u64, max_nano_seconds, ns_per_sample) catch unreachable;
-                    break :est_total @intCast(@min(MAX_SAMPLES, @max(cur_samples, estimate, min_samples)));
+                    break :est_total @intCast(@min(max_samples, @max(cur_samples, estimate, min_samples)));
                 };
                 bar.?.current += 1;
             }
