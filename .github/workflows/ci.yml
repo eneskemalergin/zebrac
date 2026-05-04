@@ -23,5 +23,5 @@ jobs:
     - name: Archive executable
       uses: actions/upload-artifact@v4
       with:
-        name: poop
+        name: zebrac
         path: zig-out/bin/*

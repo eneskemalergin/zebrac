@@ -9,7 +9,7 @@ const progress = @import("progress.zig");
 const MAX_SAMPLES = 10000;
 
 const usage_text =
-    \\Usage: poop [options] <command1> ... <commandN>
+    \\Usage: zebrac [options] <command1> ... <commandN>
     \\
     \\Compares the performance of the provided commands.
     \\
@@ -18,6 +18,7 @@ const usage_text =
     \\ --color <when>         (default: auto) color output mode
     \\                            available options: 'auto', 'never', 'ansi'
     \\ -f, --allow-failures   (default: false) compare performance if a non-zero exit code is returned
+    \\ --json [<path>]        (default: false) output results as JSON to file (default: zebrac-results.json)
     \\
 ;
 
@@ -93,6 +94,7 @@ pub fn main(init: process.Init) !void {
     var max_nano_seconds: u64 = std.time.ns_per_s * 5;
     var color: ColorMode = .auto;
     var allow_failures = false;
+    var json_path: ?[]const u8 = null;
 
     var arg_i: usize = 1;
     while (arg_i < args.len) : (arg_i += 1) {
@@ -144,6 +146,13 @@ pub fn main(init: process.Init) !void {
             }
         } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--allow-failures")) {
             allow_failures = true;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            if (arg_i + 1 < args.len and !std.mem.startsWith(u8, args[arg_i + 1], "-")) {
+                arg_i += 1;
+                json_path = args[arg_i];
+            } else {
+                json_path = "zebrac-results.json";
+            }
         } else {
             std.debug.print("unrecognized argument: '{s}'\n{s}", .{ arg, usage_text });
             process.exit(1);
@@ -156,21 +165,24 @@ pub fn main(init: process.Init) !void {
         process.exit(1);
     }
 
-    var bar: progress.ProgressBar = try .init(io, arena, .stdout());
-
-    const terminal: Io.Terminal = .{
-        .writer = stdout_w,
-        .mode = switch (color) {
-            .auto => try .detect(
-                io,
-                .stdout(),
-                if (init.environ_map.get("NO_COLOR")) |value| value.len != 0 else false,
-                if (init.environ_map.get("CLICOLOR_FORCE")) |value| value.len != 0 else false,
-            ),
-            .never => .no_color,
-            .ansi => .escape_codes,
-        },
-    };
+    var bar: ?progress.ProgressBar = null;
+    var terminal: ?Io.Terminal = null;
+    if (json_path == null) {
+        bar = try progress.ProgressBar.init(io, arena, .stdout());
+        terminal = Io.Terminal{
+            .writer = stdout_w,
+            .mode = switch (color) {
+                .auto => try .detect(
+                    io,
+                    .stdout(),
+                    if (init.environ_map.get("NO_COLOR")) |value| value.len != 0 else false,
+                    if (init.environ_map.get("CLICOLOR_FORCE")) |value| value.len != 0 else false,
+                ),
+                .never => .no_color,
+                .ansi => .escape_codes,
+            },
+        };
+    }
 
     var perf_fds: [perf_measurements.len]fd_t = @splat(-1);
     var samples_buf: [MAX_SAMPLES]Sample = undefined;
@@ -193,7 +205,7 @@ pub fn main(init: process.Init) !void {
             first_start.untilNow(io, .awake).toNanoseconds() < max_nano_seconds) and
             sample_index < samples_buf.len) : (sample_index += 1)
         {
-            if (terminal.mode != .no_color) try bar.render(io);
+            if (json_path == null) try bar.?.render(io);
             for (perf_measurements, &perf_fds) |measurement, *perf_fd| {
                 var attr: std.os.linux.perf_event_attr = .{
                     .type = PERF.TYPE.HARDWARE,
@@ -252,8 +264,8 @@ pub fn main(init: process.Init) !void {
             switch (term) {
                 .exited => |code| {
                     if (code != 0 and !allow_failures) {
-                        if (terminal.mode != .no_color)
-                            bar.clear(io) catch {};
+                        if (json_path == null)
+                            bar.?.clear(io) catch {};
                         std.debug.print("\nerror: Benchmark {d} command '{s}' failed with exit code {d}:\n", .{
                             command_n,
                             command.raw_cmd,
@@ -301,22 +313,21 @@ pub fn main(init: process.Init) !void {
                 perf_fd.* = -1;
             }
 
-            if (terminal.mode != .no_color) {
-                bar.estimate = est_total: {
+            if (json_path == null) {
+                bar.?.estimate = est_total: {
                     const cur_samples: u64 = sample_index + 1;
                     const ns_per_sample: u64 = @intCast(@divTrunc((first_start.untilNow(io, .awake).toNanoseconds()), cur_samples));
                     const estimate = std.math.divCeil(u64, max_nano_seconds, ns_per_sample) catch unreachable;
                     break :est_total @intCast(@min(MAX_SAMPLES, @max(cur_samples, estimate, min_samples)));
                 };
-                bar.current += 1;
+                bar.?.current += 1;
             }
         }
 
-        if (terminal.mode != .no_color) {
-            // reset bar for next command
-            try bar.clear(io);
-            bar.current = 0;
-            bar.estimate = 1;
+        if (json_path == null) {
+            try bar.?.clear(io);
+            bar.?.current = 0;
+            bar.?.estimate = 1;
         }
 
         const all_samples = samples_buf[0..sample_index];
@@ -332,50 +343,50 @@ pub fn main(init: process.Init) !void {
         };
         command.sample_count = all_samples.len;
 
-        {
-            try terminal.setColor(.bold);
+        if (terminal) |t| {
+            try t.setColor(.bold);
             try stdout_w.print("Benchmark {d}", .{command_n});
-            try terminal.setColor(.dim);
+            try t.setColor(.dim);
             try stdout_w.print(" ({d} runs)", .{command.sample_count});
-            try terminal.setColor(.reset);
+            try t.setColor(.reset);
             try stdout_w.writeAll(":");
             for (command.argv) |arg| try stdout_w.print(" {s}", .{arg});
             try stdout_w.writeAll("\n");
 
-            try terminal.setColor(.bold);
+            try t.setColor(.bold);
             try stdout_w.writeAll("  measurement");
             try stdout_w.splatByteAll(' ', 23 - "  measurement".len);
-            try terminal.setColor(.bright_green);
+            try t.setColor(.bright_green);
             try stdout_w.writeAll("mean");
-            try terminal.setColor(.reset);
-            try terminal.setColor(.bold);
+            try t.setColor(.reset);
+            try t.setColor(.bold);
             try stdout_w.writeAll(" ± ");
-            try terminal.setColor(.green);
+            try t.setColor(.green);
             try stdout_w.writeAll("σ");
-            try terminal.setColor(.reset);
+            try t.setColor(.reset);
 
-            try terminal.setColor(.bold);
+            try t.setColor(.bold);
             try stdout_w.splatByteAll(' ', 12);
-            try terminal.setColor(.cyan);
+            try t.setColor(.cyan);
             try stdout_w.writeAll("min");
-            try terminal.setColor(.reset);
-            try terminal.setColor(.bold);
+            try t.setColor(.reset);
+            try t.setColor(.bold);
             try stdout_w.writeAll(" … ");
-            try terminal.setColor(.magenta);
+            try t.setColor(.magenta);
             try stdout_w.writeAll("max");
-            try terminal.setColor(.reset);
+            try t.setColor(.reset);
 
-            try terminal.setColor(.bold);
+            try t.setColor(.bold);
             try stdout_w.splatByteAll(' ', 20 - " outliers".len);
-            try terminal.setColor(.bright_yellow);
+            try t.setColor(.bright_yellow);
             try stdout_w.writeAll("outliers");
-            try terminal.setColor(.reset);
+            try t.setColor(.reset);
 
             if (commands.items.len >= 2) {
-                try terminal.setColor(.bold);
+                try t.setColor(.bold);
                 try stdout_w.splatByteAll(' ', 9);
                 try stdout_w.writeAll("delta");
-                try terminal.setColor(.reset);
+                try t.setColor(.reset);
             }
 
             try stdout_w.writeAll("\n");
@@ -386,14 +397,85 @@ pub fn main(init: process.Init) !void {
                     null
                 else
                     @field(commands.items[0].measurements, field.name);
-                try printMeasurement(terminal, measurement, field.name, first_measurement, commands.items.len);
+                try printMeasurement(t, measurement, field.name, first_measurement, commands.items.len);
             }
 
             try stdout_w.flush(); // 💩
         }
     }
 
+    if (json_path) |path| {
+        var file_buf: [4096]u8 = undefined;
+        var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer file.close(io);
+        var file_writer = file.writerStreaming(io, &file_buf);
+        try printJsonOutput(&file_writer.interface, commands.items);
+        try file_writer.flush();
+        try stdout_w.print("results written to {s}\n", .{path});
+    }
+
     try stdout_w.flush(); // 💩
+}
+
+fn printJsonOutput(w: *Io.Writer, commands: []Command) !void {
+    var s = std.json.Stringify{
+        .writer = w,
+        .options = .{ .whitespace = .indent_2 },
+    };
+    try s.beginObject();
+    try s.objectField("results");
+    try s.beginArray();
+    for (commands) |cmd| {
+        try s.beginObject();
+        try s.objectField("command");
+        try s.write(cmd.raw_cmd);
+        try s.objectField("sample_count");
+        try s.write(cmd.sample_count);
+        try s.objectField("argv");
+        try s.write(cmd.argv);
+        try s.objectField("wall_time");
+        try writeJsonMeasurement(&s, cmd.measurements.wall_time);
+        try s.objectField("peak_rss");
+        try writeJsonMeasurement(&s, cmd.measurements.peak_rss);
+        try s.objectField("cpu_cycles");
+        try writeJsonMeasurement(&s, cmd.measurements.cpu_cycles);
+        try s.objectField("instructions");
+        try writeJsonMeasurement(&s, cmd.measurements.instructions);
+        try s.objectField("cache_references");
+        try writeJsonMeasurement(&s, cmd.measurements.cache_references);
+        try s.objectField("cache_misses");
+        try writeJsonMeasurement(&s, cmd.measurements.cache_misses);
+        try s.objectField("branch_misses");
+        try writeJsonMeasurement(&s, cmd.measurements.branch_misses);
+        try s.endObject();
+    }
+    try s.endArray();
+    try s.endObject();
+}
+
+fn writeJsonMeasurement(s: *std.json.Stringify, m: Measurement) !void {
+    try s.beginObject();
+    try s.objectField("mean");
+    try s.write(m.mean);
+    try s.objectField("std_dev");
+    try s.write(m.std_dev);
+    try s.objectField("min");
+    try s.write(m.min);
+    try s.objectField("max");
+    try s.write(m.max);
+    try s.objectField("median");
+    try s.write(m.median);
+    try s.objectField("q1");
+    try s.write(m.q1);
+    try s.objectField("q3");
+    try s.write(m.q3);
+    try s.objectField("outlier_count");
+    try s.write(m.outlier_count);
+    try s.objectField("sample_count");
+    try s.write(m.sample_count);
+    try s.objectField("unit");
+    try s.write(@tagName(m.unit));
+    try s.endObject();
 }
 
 fn parseCmd(arena: std.mem.Allocator, list: *std.ArrayList([]const u8), cmd: []const u8) !void {

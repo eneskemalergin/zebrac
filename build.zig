@@ -5,7 +5,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const exe = b.addExecutable(.{
-        .name = "poop",
+        .name = "zebrac",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -39,7 +39,7 @@ pub fn build(b: *std.Build) void {
         const resolved_target = b.resolveTargetQuery(target_query);
         const t = resolved_target.result;
         const rel_exe = b.addExecutable(.{
-            .name = "poop",
+            .name = "zebrac",
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/main.zig"),
                 .target = resolved_target,

@@ -1,52 +1,111 @@
-# Performance Optimizer Observation Platform
+# zebrac: Zig Extended Benchmarking & Resource Analysis (with memory Checking)
 
 Stop flushing your performance down the drain.
 
-## Overview
+Linux performance benchmark that uses `perf_event_open` to compare multiple commands. Colorful terminal UI.
 
-This command line tool uses Linux's `perf_event_open` functionality to compare the performance of multiple commands
-with a colorful terminal user interface.
+![screenshot](https://github.com/andrewrk/poop/assets/106511/6fc9d22b-f95b-46ce-8dc5-d5cecc77c226)
 
-![image](https://github.com/andrewrk/poop/assets/106511/6fc9d22b-f95b-46ce-8dc5-d5cecc77c226)
+## Features
+
+- **Hardware counters.** CPU cycles, instructions, cache references, cache misses, branch misses alongside wall time.
+- **Peak RSS tracking.** Memory spikes per run.
+- **Statistical rigor.** Mean, standard deviation, quartiles, outlier detection (Tukey's fences), Student's t-test for significance.
+- **Color-coded deltas.** First command is the reference. Subsequent results show % difference with confidence intervals.
+- **Machine-readable output.** `--json` writes structured results to a file for CI pipelines.
+- **No shell overhead.** Commands spawn directly. No shell noise in measurements.
+- **Progress bar.** Spinner and animated bar with estimated completion.
 
 ## Usage
 
-```
-Usage: poop [options] <command1> ... <commandN>
+```bash
+Usage: zebrac [options] <command1> ... <commandN>
 
 Compares the performance of the provided commands.
 
 Options:
- --duration <ms>    (default: 5000) how long to repeatedly sample each command
-
+ -d, --duration <ms>    (default: 5000) how long to repeatedly sample each command
+ --color <when>         (default: auto) color output mode
+                            available options: 'auto', 'never', 'ansi'
+ -f, --allow-failures   (default: false) compare performance if a non-zero exit code is returned
+ --json [<path>]        (default: false) output results as JSON to file (default: zebrac-results.json)
 ```
 
-## Building from Source
+### Examples
 
-Tested with [Zig](https://ziglang.org/) `0.15.1`.
+Compare two builds:
 
+```bash
+zebrac ./app-old ./app-new
 ```
-zig build
+
+Quick 2-second benchmark:
+
+```bash
+zebrac --duration 2000 'curl https://example.com'
 ```
+
+With JSON output for CI:
+
+```bash
+zebrac --json ./ci-results.json --duration 5000 './myapp'
+```
+
+## Build from Source
+
+Tested with [Zig](https://ziglang.org/) 0.16.0 (bundled in this repo).
+
+```bash
+git clone https://github.com/eneskemalergin/zebrac
+cd zebrac
+zig build -Doptimize=ReleaseSmall
+./zig-out/bin/zebrac --help
+```
+
+Cross-compile for aarch64, x86_64, x86, and riscv64 Linux:
+
+```bash
+zig build release
+```
+
+## Tooling Usage
+
+The `--json` flag writes structured results to a file alongside the terminal output. Default path is `zebrac-results.json`. Custom path with `--json ./path/to/file.json`.
+
+```bash
+zebrac --json --duration 3000 './myapp'
+# terminal output shows, then: results written to zebrac-results.json
+jq '.results[0].wall_time.mean' zebrac-results.json
+```
+
+Parse in Python:
+
+```python
+import json
+data = json.load(open('zebrac-results.json'))
+mean = data['results'][0]['wall_time']['mean']
+```
+
+Each measurement includes `mean`, `std_dev`, `min`, `max`, `median`, `q1`, `q3`, `outlier_count`, `sample_count`, and `unit`.
 
 ## Comparison with Hyperfine
 
-Poop (so far) is brand new, whereas
-[Hyperfine](https://github.com/sharkdp/hyperfine) is a mature project with more
-configuration options and generally more polish.
+Zebrac is brand new. [Hyperfine](https://github.com/sharkdp/hyperfine) is a mature project with more configuration options.
 
-However, poop does report peak memory usage as well as 5 other hardware
-counters, which I personally find useful when doing performance testing. Hey,
-maybe it will inspire the Hyperfine maintainers to add the extra data points!
+Zebrac reports peak memory usage and 5 hardware counters (cycles, instructions, cache refs/misses, branch misses). Hyperfine does not report hardware counters.
 
-Poop does not support running the commands in a shell. This has the upside of
-not including shell spawning noise in the data points collected, and the
-downside of not supporting strings inside the commands. Hyperfine by default
-runs the commands in a shell, with command line options to disable this.
+Zebrac does not use a shell. Commands run directly. This avoids shell spawning noise but means no shell syntax in commands. Hyperfine runs commands in a shell by default, with a flag to disable it.
 
-Poop treats the first command as a reference and the subsequent ones relative
-to it, giving the user the choice of the meaning of the coloring of the deltas.
-Hyperfine by default prints the wall-clock-fastest command first, with a command
-line option to select a different reference command explicitly.
+Zebrac treats the first command as a reference. Subsequent results are relative to it. Hyperfine prints the wall-clock-fastest command first, with a flag to select a different reference.
 
-While Hyperfine is cross-platform, Poop is Linux-only.
+Hyperfine is cross-platform. Zebrac is Linux-only.
+
+## References
+
+- [andrewrk/poop](https://github.com/andrewrk/poop) - original upstream. Zebrac is a fork by [eneskemalergin](https://github.com/eneskemalergin/zebrac).
+- [Hyperfine](https://github.com/sharkdp/hyperfine) - command-line benchmarking tool. Cross-platform, more features, no hardware counters.
+- [perf](https://perf.wiki.kernel.org/) - Linux profiler. Low-level event monitoring. Zebrac wraps a subset of its functionality.
+
+## License
+
+MIT
