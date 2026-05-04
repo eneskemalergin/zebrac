@@ -19,6 +19,7 @@ const usage_text =
     \\                            available options: 'auto', 'never', 'ansi'
     \\ -f, --allow-failures   (default: false) compare performance if a non-zero exit code is returned
     \\ --json [<path>]        (default: false) output results as JSON to file (default: zebrac-results.json)
+    \\ -q, --quiet            suppress terminal output (progress bar + results table)
     \\
 ;
 
@@ -95,6 +96,7 @@ pub fn main(init: process.Init) !void {
     var color: ColorMode = .auto;
     var allow_failures = false;
     var json_path: ?[]const u8 = null;
+    var quiet = false;
 
     var arg_i: usize = 1;
     while (arg_i < args.len) : (arg_i += 1) {
@@ -110,7 +112,7 @@ pub fn main(init: process.Init) !void {
             });
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             try stdout_w.writeAll(usage_text);
-            try stdout_w.flush(); // 💩
+            try stdout_w.flush();
             return process.cleanExit(io);
         } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--duration")) {
             arg_i += 1;
@@ -153,6 +155,8 @@ pub fn main(init: process.Init) !void {
             } else {
                 json_path = "zebrac-results.json";
             }
+        } else if (std.mem.eql(u8, arg, "-q") or std.mem.eql(u8, arg, "--quiet")) {
+            quiet = true;
         } else {
             std.debug.print("unrecognized argument: '{s}'\n{s}", .{ arg, usage_text });
             process.exit(1);
@@ -161,14 +165,13 @@ pub fn main(init: process.Init) !void {
 
     if (commands.items.len == 0) {
         try stdout_w.writeAll(usage_text);
-        try stdout_w.flush(); // 💩
+        try stdout_w.flush();
         process.exit(1);
     }
 
     var bar: ?progress.ProgressBar = null;
     var terminal: ?Io.Terminal = null;
-    if (json_path == null) {
-        bar = try progress.ProgressBar.init(io, arena, .stdout());
+    if (!quiet) {
         terminal = Io.Terminal{
             .writer = stdout_w,
             .mode = switch (color) {
@@ -182,6 +185,7 @@ pub fn main(init: process.Init) !void {
                 .ansi => .escape_codes,
             },
         };
+        bar = try progress.ProgressBar.init(io, arena, stdout_w, terminal.?.mode);
     }
 
     var perf_fds: [perf_measurements.len]fd_t = @splat(-1);
@@ -205,7 +209,7 @@ pub fn main(init: process.Init) !void {
             first_start.untilNow(io, .awake).toNanoseconds() < max_nano_seconds) and
             sample_index < samples_buf.len) : (sample_index += 1)
         {
-            if (json_path == null) try bar.?.render(io);
+            if (!quiet) try bar.?.render(io);
             for (perf_measurements, &perf_fds) |measurement, *perf_fd| {
                 var attr: std.os.linux.perf_event_attr = .{
                     .type = PERF.TYPE.HARDWARE,
@@ -264,7 +268,7 @@ pub fn main(init: process.Init) !void {
             switch (term) {
                 .exited => |code| {
                     if (code != 0 and !allow_failures) {
-                        if (json_path == null)
+                        if (!quiet)
                             bar.?.clear(io) catch {};
                         std.debug.print("\nerror: Benchmark {d} command '{s}' failed with exit code {d}:\n", .{
                             command_n,
@@ -313,7 +317,7 @@ pub fn main(init: process.Init) !void {
                 perf_fd.* = -1;
             }
 
-            if (json_path == null) {
+            if (!quiet) {
                 bar.?.estimate = est_total: {
                     const cur_samples: u64 = sample_index + 1;
                     const ns_per_sample: u64 = @intCast(@divTrunc((first_start.untilNow(io, .awake).toNanoseconds()), cur_samples));
@@ -324,7 +328,7 @@ pub fn main(init: process.Init) !void {
             }
         }
 
-        if (json_path == null) {
+        if (!quiet) {
             try bar.?.clear(io);
             bar.?.current = 0;
             bar.?.estimate = 1;
@@ -400,7 +404,7 @@ pub fn main(init: process.Init) !void {
                 try printMeasurement(t, measurement, field.name, first_measurement, commands.items.len);
             }
 
-            try stdout_w.flush(); // 💩
+            try stdout_w.flush();
         }
     }
 
@@ -411,10 +415,10 @@ pub fn main(init: process.Init) !void {
         var file_writer = file.writerStreaming(io, &file_buf);
         try printJsonOutput(&file_writer.interface, commands.items);
         try file_writer.flush();
-        try stdout_w.print("results written to {s}\n", .{path});
+        if (!quiet) try stdout_w.print("results written to {s}\n", .{path});
     }
 
-    try stdout_w.flush(); // 💩
+    try stdout_w.flush();
 }
 
 fn printJsonOutput(w: *Io.Writer, commands: []Command) !void {
@@ -575,19 +579,20 @@ fn printMeasurement(
     var count: usize = 0;
 
     const color_enabled = terminal.mode != .no_color;
+    const ansi_overhead: usize = if (color_enabled) 0 else 13;
     const spaces = 32 - ("  (mean  ):".len + name.len + 2);
     try w.splatByteAll(' ', spaces);
     try terminal.setColor(.bright_green);
     try printUnit(&fbs, m.mean, m.unit, m.std_dev, color_enabled);
     try w.writeAll(fbs.buffered());
-    count += fbs.end;
+    count += fbs.end + ansi_overhead;
     fbs.end = 0;
     try terminal.setColor(.reset);
     try w.writeAll(" ± ");
     try terminal.setColor(.green);
     try printUnit(&fbs, m.std_dev, m.unit, 0, color_enabled);
     try w.writeAll(fbs.buffered());
-    count += fbs.end;
+    count += fbs.end + ansi_overhead;
     fbs.end = 0;
     try terminal.setColor(.reset);
 
@@ -597,14 +602,14 @@ fn printMeasurement(
     try terminal.setColor(.cyan);
     try printUnit(&fbs, @floatFromInt(m.min), m.unit, m.std_dev, color_enabled);
     try w.writeAll(fbs.buffered());
-    count += fbs.end;
+    count += fbs.end + ansi_overhead;
     fbs.end = 0;
     try terminal.setColor(.reset);
     try w.writeAll(" … ");
     try terminal.setColor(.magenta);
     try printUnit(&fbs, @floatFromInt(m.max), m.unit, m.std_dev, color_enabled);
     try w.writeAll(fbs.buffered());
-    count += fbs.end;
+    count += fbs.end + ansi_overhead;
     fbs.end = 0;
     try terminal.setColor(.reset);
 
@@ -651,7 +656,7 @@ fn printMeasurement(
             };
             if (m.mean > f.mean) {
                 if (is_sig) {
-                    try w.writeAll("💩");
+                    try w.writeAll("! ");
                     try terminal.setColor(.bright_red);
                 } else {
                     try terminal.setColor(.dim);
@@ -661,7 +666,7 @@ fn printMeasurement(
             } else {
                 if (is_sig) {
                     try terminal.setColor(.bright_yellow);
-                    try w.writeAll("⚡");
+                    try w.writeAll("* ");
                     try terminal.setColor(.bright_green);
                 } else {
                     try terminal.setColor(.dim);
@@ -697,10 +702,9 @@ fn printNum3SigFigs(w: *std.Io.Writer, num: f64) !void {
 }
 
 fn printUnit(w: *std.Io.Writer, x: f64, unit: Measurement.Unit, std_dev: f64, color_enabled: bool) !void {
-    _ = std_dev; // TODO something useful with this
+    _ = std_dev;
     const num = x;
     var val: f64 = 0;
-    const color: []const u8 = progress.EscapeCodes.dim ++ progress.EscapeCodes.white;
     var ustr: []const u8 = "  ";
     if (num >= 1000_000_000_000) {
         val = num / 1000_000_000_000;
@@ -740,7 +744,7 @@ fn printUnit(w: *std.Io.Writer, x: f64, unit: Measurement.Unit, std_dev: f64, co
     }
     try printNum3SigFigs(w, val);
     if (color_enabled) {
-        try w.print("{s}{s}{s}", .{ color, ustr, progress.EscapeCodes.reset });
+        try w.print("\x1b[2m\x1b[37m{s}\x1b[0m", .{ustr});
     } else {
         try w.writeAll(ustr);
     }
