@@ -1,12 +1,10 @@
 <!-- markdownlint-disable MD033 MD036 MD041 -->
 <p align="center">
-  <img src="assets/zebrac-logo.svg" alt="zebrac logo" width="80">
+  <img src="assets/zebrac-logo-v2.svg" alt="zebrac logo" width="280">
 </p>
 
-<h1 align="center">zebrac</h1>
-
 <p align="center">
-  <em>Zig Extended Benchmarking & Resource Analysis (with memory Checking)</em>
+  <em><strong>Z</strong>ig <strong>E</strong>xtended <strong>B</strong>enchmarking & <strong>R</strong>esource <strong>A</strong>nalysis (with memory <strong>C</strong>hecking)</em>
 </p>
 
 <p align="center">
