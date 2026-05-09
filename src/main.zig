@@ -103,7 +103,7 @@ pub fn main(init: process.Init) !void {
     var quiet = false;
     var min_samples: u64 = 5;
     var max_samples: u64 = MAX_SAMPLES;
-    var warmup: u64 = 3;
+    var warmup: usize = 3;
 
     var arg_i: usize = 1;
     while (arg_i < args.len) : (arg_i += 1) {
@@ -191,7 +191,7 @@ pub fn main(init: process.Init) !void {
                 std.debug.print("'{s}' requires a number.\n{s}", .{ arg, usage_text });
                 process.exit(1);
             }
-            warmup = std.fmt.parseInt(u64, args[arg_i], 10) catch |err| {
+            warmup = std.fmt.parseInt(usize, args[arg_i], 10) catch |err| {
                 std.debug.print("unable to parse --warmup argument '{s}': {t}\n", .{ args[arg_i], err });
                 process.exit(1);
             };

@@ -127,7 +127,7 @@ pub const ProgressBar = struct {
         try self.buf.ensureTotalCapacity(width + WIDTH_PADDING);
         const bw = &self.buf.writer;
         const bar_width = width - Spinner.frame1.len - " 10000 runs ".len - " 100% ".len;
-        const prog_len = (bar_width * 2) * self.current / self.estimate;
+        const prog_len = (@as(u64, @intCast(bar_width)) * 2) * self.current / self.estimate;
         const full_bars_len: usize = @intCast(prog_len / 2);
 
         try bw.print("{s}{s}{s} {d: >5} runs ", .{
