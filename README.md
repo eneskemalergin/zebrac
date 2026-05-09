@@ -1,10 +1,34 @@
-# zebrac: Zig Extended Benchmarking & Resource Analysis (with memory Checking)
+<!-- markdownlint-disable MD033 MD036 MD041 -->
+<p align="center">
+  <img src="assets/zebrac-logo.svg" alt="zebrac logo" width="80">
+</p>
 
-Stop flushing your performance down the drain.
+<h1 align="center">zebrac</h1>
 
-Linux performance benchmark that uses `perf_event_open` to compare multiple commands. Colorful terminal UI.
+<p align="center">
+  <em>Zig Extended Benchmarking & Resource Analysis (with memory Checking)</em>
+</p>
 
-![screenshot](https://github.com/andrewrk/poop/assets/106511/6fc9d22b-f95b-46ce-8dc5-d5cecc77c226)
+<p align="center">
+  Linux performance benchmark that uses <code>perf_event_open</code> to compare multiple commands. Hardware counters, peak RSS, statistical significance, colorful terminal UI.
+</p>
+
+<p align="center">
+  <a href="https://github.com/eneskemalergin/zebrac/actions/workflows/ci.yml">
+    <img src="https://github.com/eneskemalergin/zebrac/actions/workflows/ci.yml/badge.svg?style=flat-square" alt="CI">
+  </a>
+  <img src="https://img.shields.io/badge/version-v0.5.1-8A2BE2?style=flat-square" alt="v0.5.1">
+  <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
+  <img src="https://img.shields.io/badge/license-MIT-4B9D6E?style=flat-square" alt="MIT">
+  <img src="https://img.shields.io/badge/linux-x86__64%20%7C%20aarch64%20%7C%20riscv64-1793D1?style=flat-square" alt="Linux">
+</p>
+
+<p align="center">
+  <b>zebrac</b> is a fork of <a href="https://github.com/andrewrk/poop">poop</a> with hardware counters, statistical analysis, JSON output, warmup runs, configurable sampling, and CI features - what poop was missing.<br>
+  <a href="CHANGELOG.md">CHANGELOG</a>
+</p>
+
+---
 
 ## Features
 
@@ -20,7 +44,7 @@ Linux performance benchmark that uses `perf_event_open` to compare multiple comm
 
 ## Usage
 
-```bash
+```text
 Usage: zebrac [options] <command1> ... <commandN>
 
 Compares the performance of the provided commands.
@@ -103,22 +127,30 @@ Each measurement includes `mean`, `std_dev`, `min`, `max`, `median`, `q1`, `q3`,
 
 ## Comparison with Hyperfine
 
-Zebrac is brand new. [Hyperfine](https://github.com/sharkdp/hyperfine) is a mature project with more configuration options.
+zebrac is new. [Hyperfine](https://github.com/sharkdp/hyperfine) has been around longer and has more configuration options.
 
-Zebrac reports peak memory usage and 5 hardware counters (cycles, instructions, cache refs/misses, branch misses). Hyperfine does not report hardware counters.
+zebrac reports peak memory usage and 5 hardware counters (cycles, instructions, cache refs/misses, branch misses). Hyperfine has none of those.
 
-Zebrac does not use a shell. Commands run directly. This avoids shell spawning noise but means no shell syntax in commands. Hyperfine runs commands in a shell by default, with a flag to disable it.
+Commands run directly in zebrac - no shell spawning noise, but no shell syntax either. Hyperfine defaults to shell mode, with a flag to turn it off.
 
-Zebrac treats the first command as a reference. Subsequent results are relative to it. Hyperfine prints the wall-clock-fastest command first, with a flag to select a different reference.
+zebrac uses the first command as a reference and shows deltas. Hyperfine sorts by wall clock and lets you pick the reference.
 
-Hyperfine is cross-platform. Zebrac is Linux-only.
+Hyperfine is cross-platform. zebrac is Linux-only.
 
 ## References
 
-- [andrewrk/poop](https://github.com/andrewrk/poop) - original upstream. Zebrac is a fork by [eneskemalergin](https://github.com/eneskemalergin/zebrac).
+- [andrewrk/poop](https://github.com/andrewrk/poop) - original upstream. zebrac adds hardware counters, statistical analysis, JSON export, warmup, configurable sampling, and CI integration.
 - [Hyperfine](https://github.com/sharkdp/hyperfine) - command-line benchmarking tool. Cross-platform, more features, no hardware counters.
-- [perf](https://perf.wiki.kernel.org/) - Linux profiler. Low-level event monitoring. Zebrac wraps a subset of its functionality.
+- [perf](https://perf.wiki.kernel.org/) - Linux profiler. Low-level event monitoring. zebrac wraps a subset of its functionality.
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
+
+---
+
+<p align="center"><em>
+Cold gates swing in time,<br>
+Cache and branch laid bare to see;<br>
+Truth in every tick.
+</em></p>

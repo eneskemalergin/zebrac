@@ -1,0 +1,80 @@
+<!-- markdownlint-disable MD024 -->
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog covers the poop lineage starting at v0.3.0 and tracks zebrac-specific changes after [0.5.0] section.
+
+## [0.5.1] - 2026-05-08
+
+### Added
+
+- `--json [<path>]` output flag - writes structured results to a JSON file for CI and tooling
+- `-i, --min-samples <n>` flag - set minimum samples per command (default: 5)
+- `-a, --max-samples <n>` flag - set maximum samples per command (default: 10000)
+- `-w, --warmup <n>` flag - run unmeasured iterations before sampling (default: 3)
+- `-f, --allow-failures` flag - benchmark despite non-zero exit codes
+- Better error messages when a command cannot be executed
+
+### Changed
+
+- Renamed from **poop** to **zebrac** (Zig Extended Benchmarking & Resource Analysis with memory Checking)
+- Updated to Zig 0.16.0 (tracked master through 0.12.0, 0.15.0, 0.16.0)
+- CI now cross-compiles for x86-linux, x86_64-linux, aarch64-linux, and riscv64-linux
+- `build.zig` supports `-Dstrip` and `zig build release` for multi-target upstream binary releases
+- Updated `.gitignore`
+- README overhaul
+
+### Fixed
+
+- `--color` argument parsing regression
+
+## [0.5.0] - 2024-09-06
+
+### Added
+
+- Show command stderr on failure
+
+### Changed
+
+- Updated to Zig 0.11.0
+- Updated for latest Zig standard library
+- Updated for latest breaking Zig changes (std.os -> std.posix)
+
+## [0.4.0] - 2023-06-21
+
+### Added
+
+- Fancy progress bar - animated bar with spinner and estimated completion
+- Metric prefix formatting - auto-scaling (ns/us/ms/s, bytes/KB/MB/GB, K/M/G/T for counts), limited to 3 significant figures
+- `--color auto|never|ansi` flag to control color mode
+- `-d, --duration <ms>` shorthand for sampling duration
+- Print usage text on no or unrecognized arguments
+- Show command stderr on failure (reverted after release)
+- Improved CLI argument error messages
+- `build.zig` release step for easy binary distribution
+
+### Changed
+
+- Use stdout instead of stderr for TTY detection
+- Updated to Zig 0.11.0-dev.3771
+
+## [0.3.0] - 2023-06-16
+
+### Added
+
+- **Hardware counters** - CPU cycles, instructions, cache references, cache misses, branch misses via `perf_event_open`
+- **Wall time** measurement with nanosecond precision
+- **Peak RSS** tracking per run via `getrusage`
+- **Statistical analysis** - mean, standard deviation, min, max, median, Q1, Q3, outlier count (Tukey's fences)
+- **95% confidence interval** with Student's t-test for significance between commands
+- **Color-coded deltas** - first command is the reference; subsequent results show % difference with confidence interval
+- **Multi-command comparison** - run N commands, compare all against the first
+- **Configurable sampling duration** via `--duration <ms>` (default: 5000)
+- **Outlier detection and reporting** with count and percentage
+- **Progress indicator** - shows current run count
+- **CI pipeline** via GitHub Actions
+- **MIT license**
+- `--help` flag with grouped Sampling and Output sections
