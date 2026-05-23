@@ -7,6 +7,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog covers the poop lineage starting at v0.3.0 and tracks zebrac-specific changes after [0.5.0] section.
 
+## [0.5.2] - 2026-05-23
+
+### Fixed
+
+- Student's t-table values for df=28 and df=29 were swapped (2.045↔2.048)
+- `printNum3SigFigs` printed exact integer values without decimals, losing a significant figure (e.g., 5.0 rendered as "5" instead of "5.00")
+- Column alignment in measurement table was off by 2–47 characters due to stale magic constants; headers now properly align with data columns
+- ANSI escape code overhead was double-counted in column width calculations, misaligning output regardless of color mode
+- `NO_COLOR` and `CLICOLOR_FORCE` env vars with empty values were ignored; now any presence disables or forces color per spec
+- Removed dead `prog_name` allocation (50 bytes per command, never used)
+- Progress bar estimate guarded against division by zero on extremely fast commands
+
 ## [0.5.1] - 2026-05-08
 
 ### Added

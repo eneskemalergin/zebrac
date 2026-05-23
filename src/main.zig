@@ -216,8 +216,8 @@ pub fn main(init: process.Init) !void {
                 .auto => try .detect(
                     io,
                     .stdout(),
-                    if (init.environ_map.get("NO_COLOR")) |value| value.len != 0 else false,
-                    if (init.environ_map.get("CLICOLOR_FORCE")) |value| value.len != 0 else false,
+                    if (init.environ_map.get("NO_COLOR")) |_| true else false,
+                    if (init.environ_map.get("CLICOLOR_FORCE")) |_| true else false,
                 ),
                 .never => .no_color,
                 .ansi => .escape_codes,
@@ -230,15 +230,6 @@ pub fn main(init: process.Init) !void {
     var samples_buf: [MAX_SAMPLES]Sample = undefined;
 
     for (commands.items, 1..) |*command, command_n| {
-        const max_prog_name_len = 50;
-        const prog_name = blk: {
-            if (command.raw_cmd.len > max_prog_name_len) {
-                break :blk try std.fmt.allocPrint(arena, "'{s}...'", .{command.raw_cmd[0 .. max_prog_name_len - 3]});
-            }
-            break :blk try std.fmt.allocPrint(arena, "'{s}'", .{command.raw_cmd});
-        };
-        _ = prog_name;
-
         for (0..warmup) |_| {
             var child = process.spawn(io, .{
                 .argv = command.argv,
@@ -385,7 +376,8 @@ pub fn main(init: process.Init) !void {
             if (!quiet) {
                 bar.?.estimate = est_total: {
                     const cur_samples: u64 = sample_index + 1;
-                    const ns_per_sample: u64 = @intCast(@divTrunc((first_start.untilNow(io, .awake).toNanoseconds()), cur_samples));
+                    var ns_per_sample: u64 = @intCast(@divTrunc((first_start.untilNow(io, .awake).toNanoseconds()), cur_samples));
+                    if (ns_per_sample == 0) ns_per_sample = 1;
                     const estimate = std.math.divCeil(u64, max_nano_seconds, ns_per_sample) catch unreachable;
                     break :est_total @intCast(@min(max_samples, @max(cur_samples, estimate, min_samples)));
                 };
@@ -644,41 +636,41 @@ fn printMeasurement(
     var count: usize = 0;
 
     const color_enabled = terminal.mode != .no_color;
-    const ansi_overhead: usize = if (color_enabled) 0 else 13;
-    const spaces = 32 - ("  (mean  ):".len + name.len + 2);
+    const ansi_overhead: usize = if (color_enabled) 13 else 0;
+    const spaces = 21 -| name.len;
     try w.splatByteAll(' ', spaces);
     try terminal.setColor(.bright_green);
     try printUnit(&fbs, m.mean, m.unit, m.std_dev, color_enabled);
     try w.writeAll(fbs.buffered());
-    count += fbs.end + ansi_overhead;
+    count += fbs.end -| ansi_overhead;
     fbs.end = 0;
     try terminal.setColor(.reset);
     try w.writeAll(" ± ");
     try terminal.setColor(.green);
     try printUnit(&fbs, m.std_dev, m.unit, 0, color_enabled);
     try w.writeAll(fbs.buffered());
-    count += fbs.end + ansi_overhead;
+    count += fbs.end -| ansi_overhead;
     fbs.end = 0;
     try terminal.setColor(.reset);
 
-    try w.splatByteAll(' ', 64 - ("  measurement      ".len + count + 3));
+    try w.splatByteAll(' ', 17 -| count);
     count = 0;
 
     try terminal.setColor(.cyan);
     try printUnit(&fbs, @floatFromInt(m.min), m.unit, m.std_dev, color_enabled);
     try w.writeAll(fbs.buffered());
-    count += fbs.end + ansi_overhead;
+    count += fbs.end -| ansi_overhead;
     fbs.end = 0;
     try terminal.setColor(.reset);
     try w.writeAll(" … ");
     try terminal.setColor(.magenta);
     try printUnit(&fbs, @floatFromInt(m.max), m.unit, m.std_dev, color_enabled);
     try w.writeAll(fbs.buffered());
-    count += fbs.end + ansi_overhead;
+    count += fbs.end -| ansi_overhead;
     fbs.end = 0;
     try terminal.setColor(.reset);
 
-    try w.splatByteAll(' ', 46 - (count + 1));
+    try w.splatByteAll(' ', 17 -| count);
     count = 0;
 
     const outlier_percent = @as(f64, @floatFromInt(m.outlier_count)) / @as(f64, @floatFromInt(m.sample_count)) * 100;
@@ -754,9 +746,8 @@ fn printMeasurement(
 }
 
 fn printNum3SigFigs(w: *std.Io.Writer, num: f64) !void {
-    if (num >= 1000 or @round(num) == num) {
+    if (num >= 1000) {
         try w.print("{d: >4.0}", .{num});
-        // TODO Do we need special handling here since it overruns 3 sig figs?
     } else if (num >= 100) {
         try w.print("{d: >4.0}", .{num});
     } else if (num >= 10) {
@@ -858,8 +849,8 @@ const t_table95_1to30 = [_]f64{
     2.06,
     2.056,
     2.052,
-    2.045,
     2.048,
+    2.045,
     2.042,
 };
 
