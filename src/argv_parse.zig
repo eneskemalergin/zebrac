@@ -135,12 +135,14 @@ pub fn parseCommandLine(arena: std.mem.Allocator, argv: *std.ArrayList([]const u
     if (argv.items.len == 0) return error.EmptyCommand;
 }
 
-pub fn errorMessage(err: ParseError) []const u8 {
+pub fn errorMessage(err: anyerror) []const u8 {
     return switch (err) {
+        error.OutOfMemory => "out of memory",
         error.UnclosedSingleQuote => "missing closing single quote (')",
         error.UnclosedDoubleQuote => "missing closing double quote (\")",
         error.TrailingBackslash => "trailing backslash with nothing to escape",
         error.EmptyCommand => "empty command (only whitespace, or nothing to run)",
+        else => "invalid command line",
     };
 }
 

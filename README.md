@@ -15,7 +15,7 @@
   <a href="https://github.com/eneskemalergin/zebrac/actions/workflows/ci.yml">
     <img src="https://github.com/eneskemalergin/zebrac/actions/workflows/ci.yml/badge.svg?style=flat-square" alt="CI">
   </a>
-  <img src="https://img.shields.io/badge/version-v0.5.2-8A2BE2?style=flat-square" alt="v0.5.2">
+  <img src="https://img.shields.io/badge/version-v0.5.3-8A2BE2?style=flat-square" alt="v0.5.3">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/license-MIT-4B9D6E?style=flat-square" alt="MIT">
   <img src="https://img.shields.io/badge/linux-x86__64%20%7C%20aarch64%20%7C%20riscv64-1793D1?style=flat-square" alt="Linux">
@@ -120,7 +120,7 @@ zig build
 
 Default `zig build` produces a stripped **ReleaseSmall** binary (~250 KB on x86_64). For debugging: `zig build -Doptimize=Debug`. Other modes: `-Doptimize=ReleaseSafe` or `ReleaseFast`.
 
-Run unit tests: `zig build test` (includes pseudo-random stress tests for the lexer and stats). Optional LLVM fuzzing: `zig build test --fuzz` when your Zig toolchain supports it.
+Run unit tests: `zig build test` (includes pseudo-random stress tests for the lexer and stats). Match the GitHub Actions build job locally: `zig build ci` (tests + all four ReleaseSmall cross-compiles). Also run `zig fmt --check build.zig src/` before pushing. Optional LLVM fuzzing: `zig build test --fuzz` when your Zig toolchain supports it.
 
 Cross-compile for aarch64, x86_64, x86, and riscv64 Linux:
 

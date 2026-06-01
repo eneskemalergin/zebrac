@@ -35,6 +35,28 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_tests.step);
 
+    const ci = b.step("ci", "Tests plus ReleaseSmall cross-builds (same as GitHub Actions build job)");
+    ci.dependOn(&run_exe_tests.step);
+    const ci_targets = [_]std.Target.Query{
+        .{ .cpu_arch = .x86, .os_tag = .linux },
+        .{ .cpu_arch = .x86_64, .os_tag = .linux },
+        .{ .cpu_arch = .aarch64, .os_tag = .linux },
+        .{ .cpu_arch = .riscv64, .os_tag = .linux },
+    };
+    for (ci_targets) |target_query| {
+        const resolved = b.resolveTargetQuery(target_query);
+        const ci_exe = b.addExecutable(.{
+            .name = "zebrac",
+            .root_module = b.createModule(.{
+                .root_source_file = root_source,
+                .target = resolved,
+                .optimize = .ReleaseSmall,
+                .strip = true,
+            }),
+        });
+        ci.dependOn(&b.addInstallArtifact(ci_exe, .{}).step);
+    }
+
     // Fuzz targets live in `test` blocks (`std.testing.fuzz`). Example:
     //   zig build test --fuzz
     //   zig build test --fuzz=10M
