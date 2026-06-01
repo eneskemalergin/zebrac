@@ -5,23 +5,34 @@ on:
     branches:
       - main
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Format check
+        run: zig fmt --check build.zig src/
+      - name: Test
+        run: zig build test
+
   build:
+    needs: check
     strategy:
       fail-fast: false
       matrix:
         target: [ x86-linux, x86_64-linux, aarch64-linux, riscv64-linux ]
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
-    - uses: mlugg/setup-zig@v2
-      with:
-        version: master
-
-    - name: Build
-      run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
-
-    - name: Archive executable
-      uses: actions/upload-artifact@v4
-      with:
-        name: zebrac
-        path: zig-out/bin/*
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+      - name: Archive executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: zebrac-${{ matrix.target }}
+          path: zig-out/bin/*

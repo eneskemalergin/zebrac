@@ -3,10 +3,10 @@ const Io = std.Io;
 const process = std.process;
 const PERF = std.os.linux.PERF;
 const fd_t = std.posix.fd_t;
-const pid_t = std.os.pid_t;
 const assert = std.debug.assert;
 const progress = @import("progress.zig");
 const MAX_SAMPLES = 10000;
+const max_stderr_bytes = 1024 * 1024;
 
 const usage_text =
     \\Usage: zebrac [options] <command1> ... <commandN>
@@ -225,11 +225,13 @@ pub fn main(init: process.Init) !void {
         };
         bar = try progress.ProgressBar.init(io, arena, stdout_w, terminal.?.mode);
     }
+    defer if (bar) |*b| b.deinit();
 
     var perf_fds: [perf_measurements.len]fd_t = @splat(-1);
-    var samples_buf: [MAX_SAMPLES]Sample = undefined;
 
     for (commands.items, 1..) |*command, command_n| {
+        var samples: std.ArrayList(Sample) = .empty;
+        try samples.ensureTotalCapacity(arena, @intCast(max_samples));
         for (0..warmup) |_| {
             var child = process.spawn(io, .{
                 .argv = command.argv,
@@ -266,22 +268,8 @@ pub fn main(init: process.Init) !void {
             sample_index < max_samples) : (sample_index += 1)
         {
             if (!quiet) try bar.?.render(io);
-            for (perf_measurements, &perf_fds) |measurement, *perf_fd| {
-                var attr: std.os.linux.perf_event_attr = .{
-                    .type = PERF.TYPE.HARDWARE,
-                    .config = @intFromEnum(measurement.config),
-                    .flags = .{
-                        .disabled = true,
-                        .exclude_kernel = true,
-                        .exclude_hv = true,
-                        .inherit = true,
-                        .enable_on_exec = true,
-                    },
-                };
-                perf_fd.* = std.posix.perf_event_open(&attr, 0, -1, perf_fds[0], PERF.FLAG.FD_CLOEXEC) catch |err| {
-                    std.debug.panic("unable to open perf event: {t}\n", .{err});
-                };
-            }
+            openPerfGroup(&perf_fds);
+            defer closePerfFds(&perf_fds);
 
             _ = std.os.linux.ioctl(perf_fds[0], PERF.EVENT_IOC.DISABLE, PERF.IOC_FLAG_GROUP);
             _ = std.os.linux.ioctl(perf_fds[0], PERF.EVENT_IOC.RESET, PERF.IOC_FLAG_GROUP);
@@ -296,22 +284,32 @@ pub fn main(init: process.Init) !void {
                 .request_resource_usage_statistics = true,
             });
 
-            var buffer: [4096]u8 = undefined;
-            var child_stderr = child.stderr.?.readerStreaming(io, &buffer);
+            var stderr_pipe_buf: [4096]u8 = undefined;
+            var child_stderr = child.stderr.?.readerStreaming(io, &stderr_pipe_buf);
 
-            var stderr_buffer: [4096]u8 = undefined;
-            var w: Io.Writer = .fixed(&stderr_buffer);
+            var stderr_list: std.ArrayList(u8) = .empty;
+            try stderr_list.ensureTotalCapacity(arena, 4096);
+            var stderr_capture = Io.Writer.Allocating.fromArrayList(arena, &stderr_list);
+            var stderr_truncated = false;
 
-            var discarded: ?usize = null;
-
-            while (true) _ = child_stderr.interface.stream(&w, .unlimited) catch |err| switch (err) {
-                error.ReadFailed => return child_stderr.err.?,
-                error.WriteFailed => {
-                    discarded = try child_stderr.interface.discardRemaining();
+            while (true) {
+                _ = child_stderr.interface.stream(&stderr_capture.writer, .unlimited) catch |err| switch (err) {
+                    error.ReadFailed => return child_stderr.err.?,
+                    error.WriteFailed => {
+                        stderr_truncated = true;
+                        _ = try child_stderr.interface.discardRemaining();
+                        break;
+                    },
+                    error.EndOfStream => break,
+                };
+                if (stderr_list.items.len >= max_stderr_bytes) {
+                    stderr_list.items.len = max_stderr_bytes;
+                    stderr_truncated = true;
+                    _ = try child_stderr.interface.discardRemaining();
                     break;
-                },
-                error.EndOfStream => break,
-            };
+                }
+            }
+            stderr_list = stderr_capture.toArrayList();
 
             const term = child.wait(io) catch |err| {
                 std.debug.print("\nerror: Couldn't execute {s}: {t}\n", .{ command.argv[0], err });
@@ -331,14 +329,14 @@ pub fn main(init: process.Init) !void {
                             command.raw_cmd,
                             code,
                         });
-                        if (discarded) |_| {
+                        if (stderr_truncated) {
                             std.debug.print(
                                 \\────────────── truncated stderr ──────────────
                                 \\{s}
                                 \\──────────────────────────────────────────────
                                 \\
                             ,
-                                .{w.buffered()},
+                                .{stderr_list.items},
                             );
                         } else {
                             std.debug.print(
@@ -347,7 +345,7 @@ pub fn main(init: process.Init) !void {
                                 \\──────────────────────────────────────────────
                                 \\
                             ,
-                                .{w.buffered()},
+                                .{stderr_list.items},
                             );
                         }
                         process.exit(1);
@@ -359,7 +357,7 @@ pub fn main(init: process.Init) !void {
                 },
             }
 
-            samples_buf[sample_index] = .{
+            try samples.append(arena, .{
                 .wall_time = @intCast(duration.toNanoseconds()),
                 .peak_rss = peak_rss,
                 .cpu_cycles = readPerfFd(perf_fds[0]),
@@ -367,11 +365,7 @@ pub fn main(init: process.Init) !void {
                 .cache_references = readPerfFd(perf_fds[2]),
                 .cache_misses = readPerfFd(perf_fds[3]),
                 .branch_misses = readPerfFd(perf_fds[4]),
-            };
-            for (&perf_fds) |*perf_fd| {
-                _ = std.os.linux.close(perf_fd.*);
-                perf_fd.* = -1;
-            }
+            });
 
             if (!quiet) {
                 bar.?.estimate = est_total: {
@@ -391,16 +385,16 @@ pub fn main(init: process.Init) !void {
             bar.?.estimate = 1;
         }
 
-        const all_samples = samples_buf[0..sample_index];
+        const all_samples = samples.items;
 
         command.measurements = .{
-            .wall_time = .compute(all_samples, "wall_time", .nanoseconds),
-            .peak_rss = .compute(all_samples, "peak_rss", .bytes),
-            .cpu_cycles = .compute(all_samples, "cpu_cycles", .count),
-            .instructions = .compute(all_samples, "instructions", .count),
-            .cache_references = .compute(all_samples, "cache_references", .count),
-            .cache_misses = .compute(all_samples, "cache_misses", .count),
-            .branch_misses = .compute(all_samples, "branch_misses", .count),
+            .wall_time = try Measurement.compute(arena, all_samples, "wall_time", .nanoseconds),
+            .peak_rss = try Measurement.compute(arena, all_samples, "peak_rss", .bytes),
+            .cpu_cycles = try Measurement.compute(arena, all_samples, "cpu_cycles", .count),
+            .instructions = try Measurement.compute(arena, all_samples, "instructions", .count),
+            .cache_references = try Measurement.compute(arena, all_samples, "cache_references", .count),
+            .cache_misses = try Measurement.compute(arena, all_samples, "cache_misses", .count),
+            .branch_misses = try Measurement.compute(arena, all_samples, "branch_misses", .count),
         };
         command.sample_count = all_samples.len;
 
@@ -539,6 +533,59 @@ fn writeJsonMeasurement(s: *std.json.Stringify, m: Measurement) !void {
     try s.endObject();
 }
 
+fn closePerfFds(fds: []fd_t) void {
+    for (fds) |*fd| {
+        if (fd.* != -1) {
+            _ = std.os.linux.close(fd.*);
+            fd.* = -1;
+        }
+    }
+}
+
+fn printPerfOpenError(err: std.posix.PerfEventOpenError, counter_name: []const u8) noreturn {
+    std.debug.print("\nerror: cannot open perf counter '{s}': ", .{counter_name});
+    switch (err) {
+        error.PermissionDenied => std.debug.print(
+            \\permission denied (check /proc/sys/kernel/perf_event_paranoid; try: echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid)
+            \\
+        , .{}),
+        error.ProcessResources => std.debug.print(
+            \\too many open perf events or file descriptors
+            \\
+        , .{}),
+        error.DeviceBusy => std.debug.print(
+            \\PMU is in exclusive use by another process
+            \\
+        , .{}),
+        error.EventNotSupported => std.debug.print(
+            \\counter not supported on this CPU
+            \\
+        , .{}),
+        else => |e| std.debug.print("{t}\n", .{e}),
+    }
+    process.exit(1);
+}
+
+fn openPerfGroup(fds: *[perf_measurements.len]fd_t) void {
+    for (perf_measurements, fds) |measurement, *perf_fd| {
+        var attr: std.os.linux.perf_event_attr = .{
+            .type = PERF.TYPE.HARDWARE,
+            .config = @intFromEnum(measurement.config),
+            .flags = .{
+                .disabled = true,
+                .exclude_kernel = true,
+                .exclude_hv = true,
+                .inherit = true,
+                .enable_on_exec = true,
+            },
+        };
+        perf_fd.* = std.posix.perf_event_open(&attr, 0, -1, fds[0], PERF.FLAG.FD_CLOEXEC) catch |err| {
+            closePerfFds(fds);
+            printPerfOpenError(err, measurement.name);
+        };
+    }
+}
+
 fn parseCmd(arena: std.mem.Allocator, list: *std.ArrayList([]const u8), cmd: []const u8) !void {
     var it = std.mem.tokenizeScalar(u8, cmd, ' ');
     while (it.next()) |s| try list.append(arena, s);
@@ -571,51 +618,63 @@ const Measurement = struct {
         count,
     };
 
-    fn compute(samples: []Sample, comptime field: []const u8, unit: Unit) Measurement {
-        std.mem.sort(Sample, samples, {}, Sample.lessThanContext(field).lessThan);
+    fn compute(
+        allocator: std.mem.Allocator,
+        samples: []const Sample,
+        comptime field: []const u8,
+        unit: Unit,
+    ) !Measurement {
+        assert(samples.len > 0);
+        const sorted = try allocator.alloc(Sample, samples.len);
+        defer allocator.free(sorted);
+        @memcpy(sorted, samples);
+        std.mem.sort(Sample, sorted, {}, Sample.lessThanContext(field).lessThan);
         // Compute stats
         var total: u64 = 0;
         var min: u64 = std.math.maxInt(u64);
         var max: u64 = 0;
-        for (samples) |s| {
+        for (sorted) |s| {
             const v = @field(s, field);
             total += v;
             if (v < min) min = v;
             if (v > max) max = v;
         }
-        const mean = @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(samples.len));
+        const mean = @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(sorted.len));
         var std_dev: f64 = 0;
-        for (samples) |s| {
+        for (sorted) |s| {
             const v = @field(s, field);
             const delta: f64 = @as(f64, @floatFromInt(v)) - mean;
             std_dev += delta * delta;
         }
-        if (samples.len > 1) {
-            std_dev /= @floatFromInt(samples.len - 1);
+        if (sorted.len > 1) {
+            std_dev /= @floatFromInt(sorted.len - 1);
             std_dev = @sqrt(std_dev);
         }
 
-        const q1 = @field(samples[samples.len / 4], field);
-        const q3 = if (samples.len < 4) @field(samples[samples.len - 1], field) else @field(samples[samples.len - samples.len / 4], field);
+        const q1 = @field(sorted[sorted.len / 4], field);
+        const q3 = if (sorted.len < 4)
+            @field(sorted[sorted.len - 1], field)
+        else
+            @field(sorted[sorted.len - sorted.len / 4], field);
         // Tukey's Fences outliers
         var outlier_count: u64 = 0;
         const iqr: f64 = @floatFromInt(q3 - q1);
         const low_fence = @as(f64, @floatFromInt(q1)) - 1.5 * iqr;
         const high_fence = @as(f64, @floatFromInt(q3)) + 1.5 * iqr;
-        for (samples) |s| {
+        for (sorted) |s| {
             const v: f64 = @floatFromInt(@field(s, field));
             if (v < low_fence or v > high_fence) outlier_count += 1;
         }
         return .{
             .q1 = q1,
-            .median = @field(samples[samples.len / 2], field),
+            .median = @field(sorted[sorted.len / 2], field),
             .q3 = q3,
             .mean = mean,
             .min = min,
             .max = max,
             .std_dev = std_dev,
             .outlier_count = outlier_count,
-            .sample_count = samples.len,
+            .sample_count = sorted.len,
             .unit = unit,
         };
     }
@@ -868,3 +927,76 @@ const t_table95_10s_10to120 = [_]f64{
     1.982,
     1.98,
 };
+
+fn sampleWith(comptime field: []const u8, value: u64) Sample {
+    var s: Sample = .{
+        .wall_time = 0,
+        .cpu_cycles = 0,
+        .instructions = 0,
+        .cache_references = 0,
+        .cache_misses = 0,
+        .branch_misses = 0,
+        .peak_rss = 0,
+    };
+    @field(s, field) = value;
+    return s;
+}
+
+test "getStatScore95: z-score without df" {
+    try std.testing.expectApproxEqAbs(@as(f64, 1.96), getStatScore95(null), 0.001);
+}
+
+test "getStatScore95: df 1 and 30" {
+    try std.testing.expectApproxEqAbs(12.706, getStatScore95(1), 0.001);
+    try std.testing.expectApproxEqAbs(2.042, getStatScore95(30), 0.001);
+}
+
+test "getStatScore95: df 28 and 29 not swapped" {
+    try std.testing.expectApproxEqAbs(2.048, getStatScore95(28), 0.001);
+    try std.testing.expectApproxEqAbs(2.045, getStatScore95(29), 0.001);
+}
+
+test "Measurement.compute: mean and quartiles" {
+    const gpa = std.testing.allocator;
+    const samples = [_]Sample{
+        sampleWith("wall_time", 10),
+        sampleWith("wall_time", 20),
+        sampleWith("wall_time", 30),
+        sampleWith("wall_time", 40),
+    };
+    const m = try Measurement.compute(gpa, &samples, "wall_time", .nanoseconds);
+    try std.testing.expectEqual(@as(u64, 10), m.min);
+    try std.testing.expectEqual(@as(u64, 40), m.max);
+    try std.testing.expectEqual(@as(u64, 30), m.median);
+    try std.testing.expectApproxEqAbs(@as(f64, 25), m.mean, 0.001);
+    try std.testing.expectEqual(@as(u64, 4), m.sample_count);
+}
+
+test "Measurement.compute: does not reorder caller slice" {
+    const gpa = std.testing.allocator;
+    var samples = [_]Sample{
+        sampleWith("wall_time", 30),
+        sampleWith("wall_time", 10),
+        sampleWith("wall_time", 20),
+    };
+    _ = try Measurement.compute(gpa, &samples, "wall_time", .nanoseconds);
+    try std.testing.expectEqual(@as(u64, 30), samples[0].wall_time);
+}
+
+test "parseCmd: space-separated argv" {
+    const gpa = std.testing.allocator;
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try parseCmd(gpa, &argv, "echo hello world");
+    try std.testing.expectEqual(@as(usize, 3), argv.items.len);
+    try std.testing.expectEqualStrings("echo", argv.items[0]);
+    try std.testing.expectEqualStrings("hello", argv.items[1]);
+    try std.testing.expectEqualStrings("world", argv.items[2]);
+}
+
+test "printNum3SigFigs: small values keep decimals" {
+    var buf: [32]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try printNum3SigFigs(&w, 5.0);
+    try std.testing.expectEqualStrings("5.00", w.buffered());
+}
