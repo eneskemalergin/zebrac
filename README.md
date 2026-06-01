@@ -38,6 +38,7 @@
 - **Configurable sampling.** Set min/max samples and duration per command.
 - **Machine-readable output.** `--json` writes structured results to a file for CI pipelines.
 - **No shell overhead.** Commands spawn directly. No shell noise in measurements.
+- **Shell-like quoting.** `'...'`, `"..."`, and `\ ` outside quotes (see [Quoting rules](#quoting-rules)).
 - **Progress bar.** Spinner and animated bar with estimated completion.
 
 ## Usage
@@ -68,6 +69,12 @@ Compare two builds:
 zebrac ./app-old ./app-new
 ```
 
+Path with spaces:
+
+```bash
+zebrac './build/my app' "./build/my app --release"
+```
+
 Quick 2-second benchmark:
 
 ```bash
@@ -86,6 +93,20 @@ With JSON output for CI (quiet, only JSON file):
 zebrac --quiet --json ./ci-results.json --duration 5000 './myapp'
 ```
 
+## Quoting rules
+
+zebrac does not run `/bin/sh`. Each **command operand** you pass (every non-flag argument) is parsed again by a small lexer (`argv_parse.zig`) before spawn. Your shell still splits `zebrac`’s own argv first; quoting below applies to those command strings, not to `zebrac`’s flags.
+
+| Syntax     | Behavior                                                                      |
+| ---------- | ----------------------------------------------------------------------------- |
+| `foo bar`  | Two arguments (whitespace: space, tab, newline, carriage return).             |
+| `'...'`    | Literal; no escapes inside.                                                   |
+| `"..."`    | Literal; no escapes inside.                                                   |
+| `\x`       | Outside quotes only: x becomes part of the word (use `\\` for one backslash). |
+| `echo'hi'` | Adjacent quoted and bare text glue into one word (`echohi`).                  |
+
+Not supported: `$VAR`, `` `cmd` ``, globs, `|`, `>`, `&`. UTF-8 paths work as bytes; do not split inside a multibyte character.
+
 ## Build from Source
 
 Tested with [Zig](https://ziglang.org/) 0.16.0 (bundled in this repo).
@@ -93,15 +114,21 @@ Tested with [Zig](https://ziglang.org/) 0.16.0 (bundled in this repo).
 ```bash
 git clone https://github.com/eneskemalergin/zebrac
 cd zebrac
-zig build -Doptimize=ReleaseSmall
+zig build
 ./zig-out/bin/zebrac --help
 ```
+
+Default `zig build` produces a stripped **ReleaseSmall** binary (~250 KB on x86_64). For debugging: `zig build -Doptimize=Debug`. Other modes: `-Doptimize=ReleaseSafe` or `ReleaseFast`.
+
+Run unit tests: `zig build test` (includes pseudo-random stress tests for the lexer and stats). Optional LLVM fuzzing: `zig build test --fuzz` when your Zig toolchain supports it.
 
 Cross-compile for aarch64, x86_64, x86, and riscv64 Linux:
 
 ```bash
 zig build release
 ```
+
+Median in the results table uses the upper middle value when the sample count is even (index `n/2` after sorting).
 
 ## Tooling Usage
 

@@ -7,6 +7,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog covers the poop lineage starting at v0.3.0 and tracks zebrac-specific changes after [0.5.0] section.
 
+## [Unreleased]
+
+## [0.5.3] - 2026-06-01
+
+### Added
+
+- Unit tests and CI format check (`zig fmt --check`, `zig build test`)
+- Actionable `perf_event_open` error messages
+- Shell-like argv parsing: single quotes, double quotes, and backslash escapes outside quotes (`src/argv_parse.zig`)
+- Fuzz tests for argv roundtrip and measurement invariants (`zig build test --fuzz`)
+- `Measurement.StatsError` for empty samples or short scratch buffers
+
+### Changed
+
+- Default build uses **ReleaseSmall** with strip enabled; use `-Doptimize=Debug` for development
+- `zig build release` and CI cross-builds use ReleaseSmall
+- Tests compile in Debug for clearer failures
+- Measurement stats API: `summarizeAll` / `summarizeField` with caller-owned scratch (removed `compute` wrapper)
+- Sample stats reuse one arena scratch buffer per command (seven fewer alloc/free pairs)
+- Heap-backed sample list and stderr capture (1 MiB cap) instead of large stack buffers
+
+### Fixed
+
+- Progress bar buffer deinit on exit
+- Perf event fds closed on every sample iteration via `defer`
+- Mean calculation uses `f64` accumulation so huge counter values cannot overflow `u64` in debug builds
+- `getStatScore95(0)` no longer indexes before the t-table
+
 ## [0.5.2] - 2026-05-23
 
 ### Fixed

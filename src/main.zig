@@ -5,6 +5,7 @@ const PERF = std.os.linux.PERF;
 const fd_t = std.posix.fd_t;
 const assert = std.debug.assert;
 const progress = @import("progress.zig");
+const argv_parse = @import("argv_parse.zig");
 const MAX_SAMPLES = 10000;
 const max_stderr_bytes = 1024 * 1024;
 
@@ -110,7 +111,13 @@ pub fn main(init: process.Init) !void {
         const arg = args[arg_i];
         if (!std.mem.startsWith(u8, arg, "-")) {
             var cmd_argv: std.ArrayList([]const u8) = .empty;
-            try parseCmd(arena, &cmd_argv, arg);
+            argv_parse.parseCommandLine(arena, &cmd_argv, arg) catch |err| {
+                std.debug.print("could not parse command '{s}': {s}\n", .{
+                    arg,
+                    argv_parse.errorMessage(err),
+                });
+                process.exit(1);
+            };
             try commands.append(arena, .{
                 .raw_cmd = arg,
                 .argv = try cmd_argv.toOwnedSlice(arena),
@@ -360,11 +367,11 @@ pub fn main(init: process.Init) !void {
             try samples.append(arena, .{
                 .wall_time = @intCast(duration.toNanoseconds()),
                 .peak_rss = peak_rss,
-                .cpu_cycles = readPerfFd(perf_fds[0]),
-                .instructions = readPerfFd(perf_fds[1]),
-                .cache_references = readPerfFd(perf_fds[2]),
-                .cache_misses = readPerfFd(perf_fds[3]),
-                .branch_misses = readPerfFd(perf_fds[4]),
+                .cpu_cycles = try readPerfFd(perf_fds[0]),
+                .instructions = try readPerfFd(perf_fds[1]),
+                .cache_references = try readPerfFd(perf_fds[2]),
+                .cache_misses = try readPerfFd(perf_fds[3]),
+                .branch_misses = try readPerfFd(perf_fds[4]),
             });
 
             if (!quiet) {
@@ -386,15 +393,19 @@ pub fn main(init: process.Init) !void {
         }
 
         const all_samples = samples.items;
-
-        command.measurements = .{
-            .wall_time = try Measurement.compute(arena, all_samples, "wall_time", .nanoseconds),
-            .peak_rss = try Measurement.compute(arena, all_samples, "peak_rss", .bytes),
-            .cpu_cycles = try Measurement.compute(arena, all_samples, "cpu_cycles", .count),
-            .instructions = try Measurement.compute(arena, all_samples, "instructions", .count),
-            .cache_references = try Measurement.compute(arena, all_samples, "cache_references", .count),
-            .cache_misses = try Measurement.compute(arena, all_samples, "cache_misses", .count),
-            .branch_misses = try Measurement.compute(arena, all_samples, "branch_misses", .count),
+        if (all_samples.len == 0) {
+            std.debug.print("\nerror: no samples collected for '{s}' (try longer --duration or more --min-samples)\n", .{
+                command.raw_cmd,
+            });
+            process.exit(1);
+        }
+        const sort_scratch = try arena.alloc(Sample, all_samples.len);
+        command.measurements = Measurement.summarizeAll(all_samples, sort_scratch) catch |err| {
+            std.debug.print("\nerror: stats for '{s}': {s}\n", .{
+                command.raw_cmd,
+                Measurement.statsErrorMessage(err),
+            });
+            process.exit(1);
         };
         command.sample_count = all_samples.len;
 
@@ -586,17 +597,10 @@ fn openPerfGroup(fds: *[perf_measurements.len]fd_t) void {
     }
 }
 
-fn parseCmd(arena: std.mem.Allocator, list: *std.ArrayList([]const u8), cmd: []const u8) !void {
-    var it = std.mem.tokenizeScalar(u8, cmd, ' ');
-    while (it.next()) |s| try list.append(arena, s);
-}
-
-fn readPerfFd(fd: fd_t) usize {
+fn readPerfFd(fd: fd_t) !usize {
     var result: usize = 0;
-    const n = std.posix.read(fd, std.mem.asBytes(&result)) catch |err| {
-        std.debug.panic("unable to read perf fd: {t}\n", .{err});
-    };
-    assert(n == @sizeOf(usize));
+    const n = try std.posix.read(fd, std.mem.asBytes(&result));
+    if (n != @sizeOf(usize)) return error.ShortPerfRead;
     return result;
 }
 
@@ -618,63 +622,93 @@ const Measurement = struct {
         count,
     };
 
-    fn compute(
-        allocator: std.mem.Allocator,
+    pub const StatsError = error{
+        NoSamples,
+        ScratchTooSmall,
+    };
+
+    pub fn statsErrorMessage(err: StatsError) []const u8 {
+        return switch (err) {
+            error.NoSamples => "no samples to summarize",
+            error.ScratchTooSmall => "sort scratch buffer is shorter than the sample list",
+        };
+    }
+
+    /// One scratch slice for the whole command; seven sorts, no hidden allocations.
+    fn summarizeAll(samples: []const Sample, sort_scratch: []Sample) StatsError!Command.Measurements {
+        if (samples.len == 0) return error.NoSamples;
+        if (sort_scratch.len < samples.len) return error.ScratchTooSmall;
+        const work = sort_scratch[0..samples.len];
+        var out: Command.Measurements = undefined;
+        inline for (@typeInfo(Command.Measurements).@"struct".fields) |field| {
+            const unit: Unit = if (std.mem.eql(u8, field.name, "wall_time"))
+                .nanoseconds
+            else if (std.mem.eql(u8, field.name, "peak_rss"))
+                .bytes
+            else
+                .count;
+            @field(out, field.name) = try summarizeField(samples, work, field.name, unit);
+        }
+        return out;
+    }
+
+    /// Caller owns `work`; we memcpy+sort in place so the sample list stays untouched.
+    fn summarizeField(
         samples: []const Sample,
+        work: []Sample,
         comptime field: []const u8,
         unit: Unit,
-    ) !Measurement {
-        assert(samples.len > 0);
-        const sorted = try allocator.alloc(Sample, samples.len);
-        defer allocator.free(sorted);
-        @memcpy(sorted, samples);
-        std.mem.sort(Sample, sorted, {}, Sample.lessThanContext(field).lessThan);
-        // Compute stats
-        var total: u64 = 0;
+    ) StatsError!Measurement {
+        if (samples.len == 0) return error.NoSamples;
+        if (work.len < samples.len) return error.ScratchTooSmall;
+        const work_slice = work[0..samples.len];
+        @memcpy(work_slice, samples);
+        std.mem.sort(Sample, work_slice, {}, Sample.lessThanContext(field).lessThan);
+        var total: f64 = 0;
         var min: u64 = std.math.maxInt(u64);
         var max: u64 = 0;
-        for (sorted) |s| {
+        for (work_slice) |s| {
             const v = @field(s, field);
-            total += v;
+            total += @floatFromInt(v);
             if (v < min) min = v;
             if (v > max) max = v;
         }
-        const mean = @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(sorted.len));
+        const mean = total / @as(f64, @floatFromInt(work_slice.len));
         var std_dev: f64 = 0;
-        for (sorted) |s| {
+        for (work_slice) |s| {
             const v = @field(s, field);
             const delta: f64 = @as(f64, @floatFromInt(v)) - mean;
             std_dev += delta * delta;
         }
-        if (sorted.len > 1) {
-            std_dev /= @floatFromInt(sorted.len - 1);
+        if (work_slice.len > 1) {
+            std_dev /= @floatFromInt(work_slice.len - 1);
             std_dev = @sqrt(std_dev);
         }
 
-        const q1 = @field(sorted[sorted.len / 4], field);
-        const q3 = if (sorted.len < 4)
-            @field(sorted[sorted.len - 1], field)
+        const q1 = @field(work_slice[work_slice.len / 4], field);
+        const q3 = if (work_slice.len < 4)
+            @field(work_slice[work_slice.len - 1], field)
         else
-            @field(sorted[sorted.len - sorted.len / 4], field);
-        // Tukey's Fences outliers
+            @field(work_slice[work_slice.len - work_slice.len / 4], field);
         var outlier_count: u64 = 0;
         const iqr: f64 = @floatFromInt(q3 - q1);
         const low_fence = @as(f64, @floatFromInt(q1)) - 1.5 * iqr;
         const high_fence = @as(f64, @floatFromInt(q3)) + 1.5 * iqr;
-        for (sorted) |s| {
+        for (work_slice) |s| {
             const v: f64 = @floatFromInt(@field(s, field));
             if (v < low_fence or v > high_fence) outlier_count += 1;
         }
         return .{
             .q1 = q1,
-            .median = @field(sorted[sorted.len / 2], field),
+            // Upper middle index; even-length runs use the higher of the two middles.
+            .median = @field(work_slice[work_slice.len / 2], field),
             .q3 = q3,
             .mean = mean,
             .min = min,
             .max = max,
             .std_dev = std_dev,
             .outlier_count = outlier_count,
-            .sample_count = sorted.len,
+            .sample_count = work_slice.len,
             .unit = unit,
         };
     }
@@ -870,6 +904,7 @@ fn printUnit(w: *std.Io.Writer, x: f64, unit: Measurement.Unit, std_dev: f64, co
 pub fn getStatScore95(df: ?u64) f64 {
     if (df) |dff| {
         const dfv: usize = @intCast(dff);
+        if (dfv == 0) return 1.96;
         if (dfv <= 30) {
             return t_table95_1to30[dfv - 1];
         } else if (dfv <= 120) {
@@ -942,7 +977,15 @@ fn sampleWith(comptime field: []const u8, value: u64) Sample {
     return s;
 }
 
-test "getStatScore95: z-score without df" {
+test "getStatScore95_dfZero_usesZScore" {
+    try std.testing.expectApproxEqAbs(@as(f64, 1.96), getStatScore95(0), 0.001);
+}
+
+test "getStatScore95_dfAbove120_usesZScore" {
+    try std.testing.expectApproxEqAbs(@as(f64, 1.96), getStatScore95(200), 0.001);
+}
+
+test "getStatScore95_nullDf_usesZScore" {
     try std.testing.expectApproxEqAbs(@as(f64, 1.96), getStatScore95(null), 0.001);
 }
 
@@ -956,15 +999,27 @@ test "getStatScore95: df 28 and 29 not swapped" {
     try std.testing.expectApproxEqAbs(2.045, getStatScore95(29), 0.001);
 }
 
-test "Measurement.compute: mean and quartiles" {
-    const gpa = std.testing.allocator;
+test "summarizeAll_zeroSamples_returnsNoSamples" {
+    const samples: []const Sample = &.{};
+    var scratch: [1]Sample = undefined;
+    try std.testing.expectError(error.NoSamples, Measurement.summarizeAll(samples, &scratch));
+}
+
+test "summarizeField_scratchTooSmall_returnsError" {
+    const samples = [_]Sample{sampleWith("wall_time", 1)};
+    var scratch: [0]Sample = undefined;
+    try std.testing.expectError(error.ScratchTooSmall, Measurement.summarizeField(&samples, &scratch, "wall_time", .nanoseconds));
+}
+
+test "summarizeField_fourSamples_computesMeanAndMedian" {
     const samples = [_]Sample{
         sampleWith("wall_time", 10),
         sampleWith("wall_time", 20),
         sampleWith("wall_time", 30),
         sampleWith("wall_time", 40),
     };
-    const m = try Measurement.compute(gpa, &samples, "wall_time", .nanoseconds);
+    var scratch: [4]Sample = undefined;
+    const m = try Measurement.summarizeField(&samples, &scratch, "wall_time", .nanoseconds);
     try std.testing.expectEqual(@as(u64, 10), m.min);
     try std.testing.expectEqual(@as(u64, 40), m.max);
     try std.testing.expectEqual(@as(u64, 30), m.median);
@@ -972,31 +1027,91 @@ test "Measurement.compute: mean and quartiles" {
     try std.testing.expectEqual(@as(u64, 4), m.sample_count);
 }
 
-test "Measurement.compute: does not reorder caller slice" {
-    const gpa = std.testing.allocator;
+test "summarizeField_sortsScratch_leavesInputSliceUntouched" {
     var samples = [_]Sample{
         sampleWith("wall_time", 30),
         sampleWith("wall_time", 10),
         sampleWith("wall_time", 20),
     };
-    _ = try Measurement.compute(gpa, &samples, "wall_time", .nanoseconds);
+    var scratch: [3]Sample = undefined;
+    _ = try Measurement.summarizeField(&samples, &scratch, "wall_time", .nanoseconds);
     try std.testing.expectEqual(@as(u64, 30), samples[0].wall_time);
 }
 
-test "parseCmd: space-separated argv" {
-    const gpa = std.testing.allocator;
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(gpa);
-    try parseCmd(gpa, &argv, "echo hello world");
-    try std.testing.expectEqual(@as(usize, 3), argv.items.len);
-    try std.testing.expectEqualStrings("echo", argv.items[0]);
-    try std.testing.expectEqualStrings("hello", argv.items[1]);
-    try std.testing.expectEqualStrings("world", argv.items[2]);
+test "summarizeField_identicalSamples_zeroOutliers" {
+    const samples = [_]Sample{
+        sampleWith("wall_time", 100),
+        sampleWith("wall_time", 100),
+        sampleWith("wall_time", 100),
+    };
+    var scratch: [3]Sample = undefined;
+    const m = try Measurement.summarizeField(&samples, &scratch, "wall_time", .nanoseconds);
+    try std.testing.expectEqual(@as(u64, 0), m.outlier_count);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), m.std_dev, 0.001);
 }
 
-test "printNum3SigFigs: small values keep decimals" {
+test "summarizeField_oneSample_stdDevStaysZero" {
+    const samples = [_]Sample{sampleWith("wall_time", 42)};
+    var scratch: [1]Sample = undefined;
+    const m = try Measurement.summarizeField(&samples, &scratch, "wall_time", .nanoseconds);
+    try std.testing.expectEqual(@as(u64, 42), m.median);
+    try std.testing.expectApproxEqAbs(@as(f64, 42), m.mean, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), m.std_dev, 0.001);
+}
+
+test "printNum3SigFigs_smallValue_keepsDecimals" {
     var buf: [32]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try printNum3SigFigs(&w, 5.0);
     try std.testing.expectEqualStrings("5.00", w.buffered());
+}
+
+test "printNum3SigFigs_largeValue_usesIntegerWidth" {
+    var buf: [32]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try printNum3SigFigs(&w, 1234);
+    try std.testing.expectEqualStrings("1234", w.buffered());
+}
+
+fn checkSummarizeFieldInvariants(n: u8, samples: []const Sample, scratch: []Sample) !void {
+    const m = try Measurement.summarizeField(samples[0..n], scratch[0..n], "wall_time", .nanoseconds);
+    try std.testing.expectEqual(n, m.sample_count);
+    try std.testing.expect(m.min <= m.max);
+    try std.testing.expect(m.outlier_count <= n);
+    try std.testing.expect(m.q1 <= m.median or n == 1);
+    try std.testing.expect(m.median <= m.q3 or n == 1);
+
+    try std.testing.expectError(error.NoSamples, Measurement.summarizeField(samples[0..0], scratch[0..0], "wall_time", .nanoseconds));
+    if (n > 0) {
+        try std.testing.expectError(error.ScratchTooSmall, Measurement.summarizeField(samples[0..n], scratch[0 .. n - 1], "wall_time", .nanoseconds));
+    }
+}
+
+fn fuzzSummarizeField(_: void, smith: *std.testing.Smith) !void {
+    @disableInstrumentation();
+    const n = smith.valueRangeAtMost(u8, 1, 32);
+    var samples: [32]Sample = undefined;
+    for (0..n) |i| {
+        samples[i] = sampleWith("wall_time", smith.valueRangeAtMost(u64, 0, std.math.maxInt(u32)));
+    }
+    var scratch: [32]Sample = undefined;
+    try checkSummarizeFieldInvariants(n, &samples, &scratch);
+}
+
+test "summarizeField_stress_randomInvariants" {
+    var prng = std.Random.DefaultPrng.init(0x5a1d_cafe);
+    const random = prng.random();
+    var samples: [32]Sample = undefined;
+    var scratch: [32]Sample = undefined;
+    for (0..2048) |_| {
+        const n: u8 = random.intRangeAtMost(u8, 1, 32);
+        for (0..n) |i| {
+            samples[i] = sampleWith("wall_time", random.int(u64));
+        }
+        try checkSummarizeFieldInvariants(n, &samples, &scratch);
+    }
+}
+
+test "summarizeField fuzz invariants" {
+    try std.testing.fuzz({}, fuzzSummarizeField, .{});
 }

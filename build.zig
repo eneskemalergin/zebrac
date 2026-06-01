@@ -2,26 +2,42 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    const optimize = b.option(
+        std.builtin.OptimizeMode,
+        "optimize",
+        "Prioritize performance, safety, or binary size (default: ReleaseSmall)",
+    ) orelse .ReleaseSmall;
+    const strip = b.option(bool, "strip", "Strip debug info from the binary") orelse (optimize != .Debug);
+
+    const root_source = b.path("src/main.zig");
 
     const exe = b.addExecutable(.{
         .name = "zebrac",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+            .root_source_file = root_source,
             .target = target,
             .optimize = optimize,
-            .strip = b.option(bool, "strip", "strip the binary"),
+            .strip = strip,
         }),
     });
 
     b.installArtifact(exe);
 
+    const test_mod = b.createModule(.{
+        .root_source_file = root_source,
+        .target = target,
+        .optimize = .Debug,
+    });
     const exe_tests = b.addTest(.{
-        .root_module = exe.root_module,
+        .root_module = test_mod,
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_tests.step);
+
+    // Fuzz targets live in `test` blocks (`std.testing.fuzz`). Example:
+    //   zig build test --fuzz
+    //   zig build test --fuzz=10M
 
     const release = b.step("release", "make an upstream binary release");
     const release_targets = [_]std.Target.Query{
@@ -50,7 +66,7 @@ pub fn build(b: *std.Build) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/main.zig"),
                 .target = resolved_target,
-                .optimize = .ReleaseSafe,
+                .optimize = .ReleaseSmall,
                 .strip = true,
             }),
         });
