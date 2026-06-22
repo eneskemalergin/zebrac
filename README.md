@@ -8,10 +8,6 @@
 </p>
 
 <p align="center">
-  Linux performance benchmark that uses <code>perf_event_open</code> to compare multiple commands. Hardware counters, peak RSS, statistical significance, colorful terminal UI.
-</p>
-
-<p align="center">
   <a href="https://github.com/eneskemalergin/zebrac/actions/workflows/ci.yml">
     <img src="https://github.com/eneskemalergin/zebrac/actions/workflows/ci.yml/badge.svg?style=flat-square" alt="CI">
   </a>
@@ -22,24 +18,30 @@
 </p>
 
 <p align="center">
-  <b>zebrac</b> is a fork of <a href="https://github.com/andrewrk/poop">poop</a> with hardware counters, statistical analysis, JSON output, warmup runs, configurable sampling, and CI features - what poop was missing.<br>
+  <b>zebrac</b> is a fork of <a href="https://github.com/andrewrk/poop">poop</a>. Adds JSON output, warmup runs, configurable sample limits, shell-like quoting, cross-compilation, and tests.<br>
   <a href="CHANGELOG.md">CHANGELOG</a>
 </p>
+
 
 ---
 
 ## Features
 
-- **Hardware counters.** CPU cycles, instructions, cache references, cache misses, branch misses alongside wall time.
-- **Peak RSS tracking.** Memory spikes per run.
-- **Statistical rigor.** Mean, standard deviation, quartiles, outlier detection (Tukey's fences), Student's t-test for significance.
+Inherited from poop:
+
+- **Hardware counters.** CPU cycles, instructions, cache references, cache misses, branch misses via `perf_event_open`.
+- **Peak RSS tracking.** Memory spikes per run via `getrusage`.
+- **Statistical analysis.** Mean, standard deviation, quartiles, outlier detection (Tukey's fences), Student's t-test.
 - **Color-coded deltas.** First command is the reference. Subsequent results show % difference with confidence intervals.
+- **No shell overhead.** Commands spawn directly. No shell noise in measurements.
+- **Progress bar.** Spinner and animated bar with estimated completion.
+
+Added by zebrac:
+
 - **Warmup runs.** Run unmeasured iterations before sampling to warm caches and branch predictors.
 - **Configurable sampling.** Set min/max samples and duration per command.
 - **Machine-readable output.** `--json` writes structured results to a file for CI pipelines.
-- **No shell overhead.** Commands spawn directly. No shell noise in measurements.
 - **Shell-like quoting.** `'...'`, `"..."`, and `\ ` outside quotes (see [Quoting rules](#quoting-rules)).
-- **Progress bar.** Spinner and animated bar with estimated completion.
 
 ## Usage
 
@@ -164,7 +166,7 @@ Hyperfine is cross-platform. zebrac is Linux-only.
 
 ## References
 
-- [andrewrk/poop](https://github.com/andrewrk/poop) - original upstream. zebrac adds hardware counters, statistical analysis, JSON export, warmup, configurable sampling, and CI integration.
+- [andrewrk/poop](https://github.com/andrewrk/poop) - original upstream. zebrac adds JSON export, warmup, configurable sampling, shell-like quoting, cross-compilation, and tests.
 - [Hyperfine](https://github.com/sharkdp/hyperfine) - command-line benchmarking tool. Cross-platform, more features, no hardware counters.
 - [perf](https://perf.wiki.kernel.org/) - Linux profiler. Low-level event monitoring. zebrac wraps a subset of its functionality.
 
