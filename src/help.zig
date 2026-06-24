@@ -4,7 +4,7 @@
 const std = @import("std");
 
 /// Bump with each release. Also appears in the help header and (later) JSON output.
-pub const version = "0.5.3";
+pub const version = "0.5.4";
 
 /// Maximum line length for help prose. Change this one constant to re-wrap.
 pub const wrap_width: usize = 78;

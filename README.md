@@ -11,7 +11,7 @@
   <a href="https://github.com/eneskemalergin/zebrac/actions/workflows/ci.yml">
     <img src="https://github.com/eneskemalergin/zebrac/actions/workflows/ci.yml/badge.svg?style=flat-square" alt="CI">
   </a>
-  <img src="https://img.shields.io/badge/version-v0.5.3-8A2BE2?style=flat-square" alt="v0.5.3">
+  <img src="https://img.shields.io/badge/version-v0.5.4-8A2BE2?style=flat-square" alt="v0.5.4">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/license-MIT-4B9D6E?style=flat-square" alt="MIT">
   <img src="https://img.shields.io/badge/linux-x86__64%20%7C%20aarch64%20%7C%20riscv64-1793D1?style=flat-square" alt="Linux">
@@ -44,23 +44,40 @@ Added by zebrac:
 
 ## Usage
 
+Linux only. Full reference: run `zebrac --help` after building (source of truth is `src/help.zig`).
+
+```bash
+./zig-out/bin/zebrac --help
+./zig-out/bin/zebrac --version
+```
+
+**Commands:** one quoted string per program (no `/bin/sh`). Two or more commands: first is the baseline, rest show delta %.
+
+**Measured each run:** `wall_time`, `peak_rss`, and five perf hardware counters (`cpu_cycles`, `instructions`, `cache_references`, `cache_misses`, `branch_misses`).
+
+**Sampling:** warmup runs first (unmeasured), then samples until both `--duration` and `--min-samples` are satisfied, or `--max-samples` (cap 10000) stops the run. Rejects `min > max` or `max == 0` before spawn.
+
 ```text
-Usage: zebrac [options] <command1> ... <commandN>
-
-Compares the performance of the provided commands.
-
 Sampling:
-  -d, --duration <ms>    sampling duration per command (default: 5000)
-  -i, --min-samples <n>  minimum samples per command (default: 5)
-  -a, --max-samples <n>  maximum samples per command (default: 10000)
-  -w, --warmup <n>       warmup runs before measurement (default: 3)
+  -d, --duration <ms>      time budget per command [5000]
+  -i, --min-samples <n>    minimum measured runs per command [5]
+  -a, --max-samples <n>    maximum measured runs per command [10000]
+  -w, --warmup <n>         unmeasured runs before sampling [3]
 
 Output:
-  --color <when>         color mode: auto, never, ansi (default: auto)
-  -f, --allow-failures   benchmark despite non-zero exit codes
-  --json [<path>]        write results as JSON (default: zebrac-results.json)
-  -q, --quiet            suppress terminal output
+  --color <mode>           auto, never, or ansi [auto]
+  -q, --quiet              no progress bar or results table
+  --json [<path>]          write results JSON [zebrac-results.json]
+  -f, --allow-failures     keep going if a command exits non-zero
+
+Information:
+  -h, --help               show full usage
+  --version                show version
 ```
+
+**Requirements:** Linux with `perf_event_open`. If counters fail, check `perf_event_paranoid` (see `--help`).
+
+**Environment:** `NO_COLOR` and `CLICOLOR_FORCE` affect color in `auto` mode (see `--help`).
 
 ### Examples
 
@@ -121,7 +138,7 @@ zig build
 
 Default `zig build` produces a stripped **ReleaseSmall** binary (~250 KB on x86_64). For debugging: `zig build -Doptimize=Debug`. Other modes: `-Doptimize=ReleaseSafe` or `ReleaseFast`.
 
-Run unit tests: `zig build test` (includes pseudo-random stress tests for the lexer and stats). Match the GitHub Actions build job locally: `zig build ci` (tests + all four ReleaseSmall cross-compiles). Also run `zig fmt --check build.zig src/` before pushing. Optional LLVM fuzzing: `zig build test --fuzz` when your Zig toolchain supports it.
+Run unit tests: `zig build test` (includes JSON envelope test, lexer/stats fuzz, and stress tests). Match the GitHub Actions check job: `zig fmt --check build.zig src/` and `zig build test`. Match the build job: `zig build ci` (tests + all four ReleaseSmall cross-compiles). Optional LLVM fuzzing: `zig build test --fuzz` when your Zig toolchain supports it.
 
 Cross-compile for aarch64, x86_64, x86, and riscv64 Linux:
 

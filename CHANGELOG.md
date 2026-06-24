@@ -7,7 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog covers the poop lineage starting at v0.3.0 and tracks zebrac-specific changes after [0.5.0] section.
 
-## 0.5.4 - Unreleased
+## [0.5.4] - 2026-06-23
 
 ### Added
 
@@ -19,6 +19,9 @@ zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog cov
 - `--help` rewritten: metrics, sampling, quoting, poop credit, shorter missing-arg errors
 - Sample limit validation: reject `min > max` and `max == 0` before run; clamp note on stderr
 - Results tables print after all commands finish measuring (notes stay off stdout)
+- Results table column alignment (`±`, `…` anchors; outliers/delta left-aligned under headers)
+- Wall-clock display units: use `m`/`h` for long durations; drop `ks` suffix (hard to interpret)
+- README Usage section aligned with `--help`
 
 ## [0.5.3] - 2026-06-01
 
@@ -52,7 +55,7 @@ zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog cov
 
 - Student's t-table values for df=28 and df=29 were swapped (2.045↔2.048)
 - `printNum3SigFigs` printed exact integer values without decimals, losing a significant figure (e.g., 5.0 rendered as "5" instead of "5.00")
-- Column alignment in measurement table was off by 2–47 characters due to stale magic constants; headers now properly align with data columns
+- Column alignment in measurement table was off by 2 to 47 characters due to stale magic constants; headers now properly align with data columns
 - ANSI escape code overhead was double-counted in column width calculations, misaligning output regardless of color mode
 - `NO_COLOR` and `CLICOLOR_FORCE` env vars with empty values were ignored; now any presence disables or forces color per spec
 - Removed dead `prog_name` allocation (50 bytes per command, never used)
