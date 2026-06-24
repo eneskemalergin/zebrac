@@ -32,6 +32,8 @@ const Command = struct {
     const Measurements = struct {
         wall_time: Measurement,
         peak_rss: Measurement,
+        minor_faults: Measurement,
+        major_faults: Measurement,
         cpu_cycles: Measurement,
         instructions: Measurement,
         cache_references: Measurement,
@@ -42,12 +44,14 @@ const Command = struct {
 
 const Sample = struct {
     wall_time: u64,
+    peak_rss: u64,
+    minor_faults: u64,
+    major_faults: u64,
     cpu_cycles: u64,
     instructions: u64,
     cache_references: u64,
     cache_misses: u64,
     branch_misses: u64,
-    peak_rss: u64,
 
     pub fn lessThanContext(comptime field: []const u8) type {
         return struct {
@@ -103,18 +107,20 @@ const TableLayout = struct {
 
         inline for (@typeInfo(Command.Measurements).@"struct".fields) |field| {
             const m = @field(measurements, field.name);
-            layout.name_w = @max(layout.name_w, row_indent + visibleLen(field.name));
-            layout.mean_w = @max(layout.mean_w, measureUnit(&unit_buf, m.mean, m.unit));
-            layout.std_w = @max(layout.std_w, measureUnit(&unit_buf, m.std_dev, m.unit));
-            layout.min_w = @max(layout.min_w, measureUnit(&unit_buf, @floatFromInt(m.min), m.unit));
-            layout.max_w = @max(layout.max_w, measureUnit(&unit_buf, @floatFromInt(m.max), m.unit));
-            layout.outlier_w = @max(
-                layout.outlier_w,
-                measureOutlier(&outlier_buf, m.outlier_count, m.sample_count),
-            );
-            if (with_delta) {
-                const first_m = if (baseline) |b| @field(b, field.name) else null;
-                layout.delta_w = @max(layout.delta_w, measureDelta(&delta_buf, m, first_m));
+            if (measurementRowVisible(field.name, m)) {
+                layout.name_w = @max(layout.name_w, row_indent + visibleLen(field.name));
+                layout.mean_w = @max(layout.mean_w, measureUnit(&unit_buf, m.mean, m.unit));
+                layout.std_w = @max(layout.std_w, measureUnit(&unit_buf, m.std_dev, m.unit));
+                layout.min_w = @max(layout.min_w, measureUnit(&unit_buf, @floatFromInt(m.min), m.unit));
+                layout.max_w = @max(layout.max_w, measureUnit(&unit_buf, @floatFromInt(m.max), m.unit));
+                layout.outlier_w = @max(
+                    layout.outlier_w,
+                    measureOutlier(&outlier_buf, m.outlier_count, m.sample_count),
+                );
+                if (with_delta) {
+                    const first_m = if (baseline) |b| @field(b, field.name) else null;
+                    layout.delta_w = @max(layout.delta_w, measureDelta(&delta_buf, m, first_m));
+                }
             }
         }
         return layout;
@@ -306,6 +312,19 @@ fn measureOutlier(buf: *[32]u8, count: u64, sample_count: u64) usize {
     const pct = @as(f64, @floatFromInt(count)) / @as(f64, @floatFromInt(sample_count)) * 100;
     w.print("{d} ({d:.0}%)", .{ count, pct }) catch return 0;
     return visibleLen(w.buffered());
+}
+
+fn measurementRowVisible(name: []const u8, m: Measurement) bool {
+    if (std.mem.eql(u8, name, "major_faults")) return m.max > 0;
+    return true;
+}
+
+fn readPageFaults(rus: process.Child.ResourceUsageStatistics) struct { minor: u64, major: u64 } {
+    const ru = rus.rusage orelse return .{ .minor = 0, .major = 0 };
+    return .{
+        .minor = @intCast(@max(ru.minflt, 0)),
+        .major = @intCast(@max(ru.majflt, 0)),
+    };
 }
 
 fn measureDelta(buf: *[64]u8, m: Measurement, first_m: ?Measurement) usize {
@@ -720,7 +739,9 @@ pub fn main(init: process.Init) !void {
             };
             const duration = start.untilNow(io, .awake);
             _ = std.os.linux.ioctl(perf_fds[0], PERF.EVENT_IOC.DISABLE, PERF.IOC_FLAG_GROUP);
-            const peak_rss = child.resource_usage_statistics.getMaxRss() orelse 0;
+            const usage = child.resource_usage_statistics;
+            const peak_rss = usage.getMaxRss() orelse 0;
+            const faults = readPageFaults(usage);
 
             switch (term) {
                 .exited => |code| {
@@ -753,6 +774,8 @@ pub fn main(init: process.Init) !void {
             try samples.append(arena, .{
                 .wall_time = @intCast(duration.toNanoseconds()),
                 .peak_rss = peak_rss,
+                .minor_faults = faults.minor,
+                .major_faults = faults.major,
                 .cpu_cycles = try readPerfFd(perf_fds[0]),
                 .instructions = try readPerfFd(perf_fds[1]),
                 .cache_references = try readPerfFd(perf_fds[2]),
@@ -820,11 +843,13 @@ pub fn main(init: process.Init) !void {
 
             inline for (@typeInfo(Command.Measurements).@"struct".fields) |field| {
                 const measurement = @field(command.measurements, field.name);
-                const first_measurement = if (command_n == 1)
-                    null
-                else
-                    @field(commands.items[0].measurements, field.name);
-                try printMeasurement(t, layout, measurement, field.name, first_measurement, with_delta);
+                if (measurementRowVisible(field.name, measurement)) {
+                    const first_measurement = if (command_n == 1)
+                        null
+                    else
+                        @field(commands.items[0].measurements, field.name);
+                    try printMeasurement(t, layout, measurement, field.name, first_measurement, with_delta);
+                }
             }
 
             try stdout_w.flush();
@@ -885,20 +910,10 @@ fn printJsonOutput(w: *Io.Writer, commands: []Command, config: JsonRunConfig) !v
         try s.write(cmd.sample_count);
         try s.objectField("argv");
         try s.write(cmd.argv);
-        try s.objectField("wall_time");
-        try writeJsonMeasurement(&s, cmd.measurements.wall_time);
-        try s.objectField("peak_rss");
-        try writeJsonMeasurement(&s, cmd.measurements.peak_rss);
-        try s.objectField("cpu_cycles");
-        try writeJsonMeasurement(&s, cmd.measurements.cpu_cycles);
-        try s.objectField("instructions");
-        try writeJsonMeasurement(&s, cmd.measurements.instructions);
-        try s.objectField("cache_references");
-        try writeJsonMeasurement(&s, cmd.measurements.cache_references);
-        try s.objectField("cache_misses");
-        try writeJsonMeasurement(&s, cmd.measurements.cache_misses);
-        try s.objectField("branch_misses");
-        try writeJsonMeasurement(&s, cmd.measurements.branch_misses);
+        inline for (@typeInfo(Command.Measurements).@"struct".fields) |field| {
+            try s.objectField(field.name);
+            try writeJsonMeasurement(&s, @field(cmd.measurements, field.name));
+        }
         try s.endObject();
     }
     try s.endArray();
@@ -1095,7 +1110,7 @@ const Measurement = struct {
         };
     }
 
-    /// One scratch slice for the whole command; seven sorts, no hidden allocations.
+    /// One scratch slice for the whole command; sorts once per metric via inline loop.
     fn summarizeAll(samples: []const Sample, sort_scratch: []Sample) StatsError!Command.Measurements {
         if (samples.len == 0) return error.NoSamples;
         if (sort_scratch.len < samples.len) return error.ScratchTooSmall;
@@ -1318,12 +1333,14 @@ const t_table95_10s_10to120 = [_]f64{
 fn sampleWith(comptime field: []const u8, value: u64) Sample {
     var s: Sample = .{
         .wall_time = 0,
+        .peak_rss = 0,
+        .minor_faults = 0,
+        .major_faults = 0,
         .cpu_cycles = 0,
         .instructions = 0,
         .cache_references = 0,
         .cache_misses = 0,
         .branch_misses = 0,
-        .peak_rss = 0,
     };
     @field(s, field) = value;
     return s;
@@ -1352,6 +1369,8 @@ test "printJsonOutput writes schema envelope and config" {
     const measurements: Command.Measurements = .{
         .wall_time = wall,
         .peak_rss = testMeasurement(.bytes),
+        .minor_faults = testMeasurement(.count),
+        .major_faults = testMeasurement(.count),
         .cpu_cycles = testMeasurement(.count),
         .instructions = testMeasurement(.count),
         .cache_references = testMeasurement(.count),
@@ -1390,6 +1409,8 @@ test "printJsonOutput writes schema envelope and config" {
             command: []const u8,
             sample_count: usize,
             wall_time: struct { mean: f64, unit: []const u8 },
+            minor_faults: struct { mean: f64, unit: []const u8 },
+            major_faults: struct { mean: f64, unit: []const u8 },
         },
     };
 
@@ -1407,6 +1428,10 @@ test "printJsonOutput writes schema envelope and config" {
     try std.testing.expectEqualStrings("/bin/true", parsed.value.results[0].command);
     try std.testing.expectEqual(@as(f64, 2), parsed.value.results[0].wall_time.mean);
     try std.testing.expectEqualStrings("nanoseconds", parsed.value.results[0].wall_time.unit);
+    try std.testing.expectEqual(@as(f64, 2), parsed.value.results[0].minor_faults.mean);
+    try std.testing.expectEqualStrings("count", parsed.value.results[0].minor_faults.unit);
+    try std.testing.expectEqual(@as(f64, 2), parsed.value.results[0].major_faults.mean);
+    try std.testing.expectEqualStrings("count", parsed.value.results[0].major_faults.unit);
 }
 
 test "perf fds: one open group per command (manual strace)" {
@@ -1596,6 +1621,69 @@ test "writeDeltaPlain: baseline row writes 0%" {
     try std.testing.expectEqualStrings("0%", out);
 }
 
+test "summarizeAll includes page fault fields" {
+    const samples = [_]Sample{
+        .{
+            .wall_time = 100,
+            .peak_rss = 1000,
+            .minor_faults = 10,
+            .major_faults = 0,
+            .cpu_cycles = 50,
+            .instructions = 40,
+            .cache_references = 30,
+            .cache_misses = 20,
+            .branch_misses = 5,
+        },
+        .{
+            .wall_time = 200,
+            .peak_rss = 2000,
+            .minor_faults = 30,
+            .major_faults = 2,
+            .cpu_cycles = 60,
+            .instructions = 50,
+            .cache_references = 35,
+            .cache_misses = 25,
+            .branch_misses = 6,
+        },
+    };
+    var scratch: [2]Sample = undefined;
+    const m = try Measurement.summarizeAll(&samples, &scratch);
+    try std.testing.expectEqual(@as(u64, 30), m.minor_faults.median);
+    try std.testing.expectEqual(@as(u64, 2), m.major_faults.max);
+    try std.testing.expectEqual(Measurement.Unit.count, m.minor_faults.unit);
+    try std.testing.expectEqual(Measurement.Unit.count, m.major_faults.unit);
+}
+
+test "measurementRowVisible hides major_faults when all zero" {
+    const zero = Measurement{
+        .q1 = 0,
+        .median = 0,
+        .q3 = 0,
+        .min = 0,
+        .max = 0,
+        .mean = 0,
+        .std_dev = 0,
+        .outlier_count = 0,
+        .sample_count = 2,
+        .unit = .count,
+    };
+    const nonzero = Measurement{
+        .q1 = 0,
+        .median = 1,
+        .q3 = 1,
+        .min = 0,
+        .max = 1,
+        .mean = 0.5,
+        .std_dev = 0.5,
+        .outlier_count = 0,
+        .sample_count = 2,
+        .unit = .count,
+    };
+    try std.testing.expect(measurementRowVisible("minor_faults", zero));
+    try std.testing.expect(!measurementRowVisible("major_faults", zero));
+    try std.testing.expect(measurementRowVisible("major_faults", nonzero));
+}
+
 test "printNum3SigFigs_smallValue_keepsDecimals" {
     var buf: [32]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
@@ -1650,6 +1738,8 @@ fn tableSeparatorAlignmentTest(mode: Io.Terminal.Mode) !void {
     const measurements: Command.Measurements = .{
         .wall_time = wall,
         .peak_rss = rss,
+        .minor_faults = wall,
+        .major_faults = wall,
         .cpu_cycles = wall,
         .instructions = wall,
         .cache_references = wall,

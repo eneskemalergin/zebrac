@@ -30,6 +30,7 @@ Inherited from poop:
 
 - **Hardware counters.** CPU cycles, instructions, cache references, cache misses, branch misses via `perf_event_open`.
 - **Peak RSS tracking.** Memory spikes per run via `getrusage`.
+- **Page fault counts.** Minor and major faults per run from the same `getrusage` wait (no extra syscall).
 - **Statistical analysis.** Mean, standard deviation, quartiles, outlier detection (Tukey's fences), Student's t-test.
 - **Color-coded deltas.** First command is the reference. Subsequent results show % difference with confidence intervals.
 - **No shell overhead.** Commands spawn directly. No shell noise in measurements.
@@ -53,7 +54,7 @@ Linux only. Full reference: run `zebrac --help` after building (source of truth 
 
 **Commands:** one quoted string per program (no `/bin/sh`). Two or more commands: first is the baseline, rest show delta %.
 
-**Measured each run:** `wall_time`, `peak_rss`, and five perf hardware counters (`cpu_cycles`, `instructions`, `cache_references`, `cache_misses`, `branch_misses`).
+**Measured each run:** `wall_time`, `peak_rss`, `minor_faults`, `major_faults` (table row hidden when always zero), and five perf hardware counters (`cpu_cycles`, `instructions`, `cache_references`, `cache_misses`, `branch_misses`).
 
 **Sampling:** warmup runs first (unmeasured), then samples until both `--duration` and `--min-samples` are satisfied, or `--max-samples` (cap 10000) stops the run. Rejects `min > max` or `max == 0` before spawn.
 

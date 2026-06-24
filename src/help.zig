@@ -67,6 +67,8 @@ const usage_rest =
     \\What gets measured (each run):
     \\  wall_time        elapsed time, nanoseconds
     \\  peak_rss         peak resident set size, bytes
+    \\  minor_faults     page faults not requiring disk I/O
+    \\  major_faults     page faults requiring disk I/O (hidden when always zero)
     \\  cpu_cycles       perf hardware counter
     \\  instructions     perf hardware counter
     \\  cache_references perf hardware counter
@@ -163,6 +165,8 @@ test "usage_text: required sections present" {
     try std.testing.expect(std.mem.indexOf(u8, usage_text, "perf_event_paranoid") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage_text, "wall_time") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage_text, "peak_rss") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage_text, "minor_faults") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage_text, "major_faults") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage_text, "cpu_cycles") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage_text, "branch_misses") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage_text, "--version") != null);

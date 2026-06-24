@@ -13,6 +13,7 @@ zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog cov
 
 - Progress bar layout tests in `src/progress.zig` (property checks, render smoke); CI runs them via a dedicated `build.zig` test target
 - Results table alignment test for color mode (`escape_codes`)
+- Page fault metrics: `minor_faults` and `major_faults` from child `rusage` (table, JSON, help)
 
 ### Changed
 
