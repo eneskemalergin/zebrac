@@ -314,13 +314,24 @@ fn measureDelta(buf: *[64]u8, m: Measurement, first_m: ?Measurement) usize {
     return visibleLen(w.buffered());
 }
 
+const delta_baseline_epsilon: f64 = 1e-9;
+
+fn deltaIsDefined(m: Measurement, f: Measurement) bool {
+    if (@abs(f.mean) < delta_baseline_epsilon) return false;
+    if (m.sample_count + f.sample_count < 4) return false;
+    return true;
+}
+
 fn writeDeltaPlain(w: *Io.Writer, m: Measurement, first_m: ?Measurement) !void {
     if (first_m == null) {
         try w.writeAll("0%");
         return;
     }
     const f = first_m.?;
-    const half = deltaHalfWidth(m, f);
+    const half = deltaHalfWidth(m, f) orelse {
+        try w.writeAll("n/a");
+        return;
+    };
     const diff_mean_percent = (m.mean - f.mean) * 100 / f.mean;
     const is_sig = deltaIsSignificant(diff_mean_percent, half);
     if (m.mean > f.mean) {
@@ -333,7 +344,8 @@ fn writeDeltaPlain(w: *Io.Writer, m: Measurement, first_m: ?Measurement) !void {
     try w.print("{d: >5.1}% ± {d: >4.1}%", .{ @abs(diff_mean_percent), half });
 }
 
-fn deltaHalfWidth(m: Measurement, f: Measurement) f64 {
+fn deltaHalfWidth(m: Measurement, f: Measurement) ?f64 {
+    if (!deltaIsDefined(m, f)) return null;
     const z = getStatScore95(m.sample_count + f.sample_count - 2);
     const n1: f64 = @floatFromInt(m.sample_count);
     const n2: f64 = @floatFromInt(f.sample_count);
@@ -416,7 +428,14 @@ fn writeDelta(
         return;
     }
     const f = first_m.?;
-    const half_val = deltaHalfWidth(m, f);
+    const half_val = deltaHalfWidth(m, f) orelse {
+        if (color_enabled) try terminal.setColor(.dim);
+        try w.writeAll("n/a");
+        if (color_enabled) try terminal.setColor(.reset);
+        vis.* = col_start + visibleLen("n/a");
+        try TableLayout.padVis(w, vis, col_start + layout.delta_w);
+        return;
+    };
     const diff_mean_percent = (m.mean - f.mean) * 100 / f.mean;
     const is_sig = deltaIsSignificant(diff_mean_percent, half_val);
 
@@ -448,7 +467,7 @@ fn writeDelta(
 
     var measure_buf: [64]u8 = undefined;
     var measure_w = std.Io.Writer.fixed(&measure_buf);
-    writeDeltaPlain(&measure_w, m, first_m) catch {};
+    try writeDeltaPlain(&measure_w, m, first_m);
     vis.* = col_start + visibleLen(measure_w.buffered());
     try TableLayout.padVis(w, vis, col_start + layout.delta_w);
 }
@@ -1489,6 +1508,92 @@ test "summarizeField_oneSample_stdDevStaysZero" {
     try std.testing.expectEqual(@as(u64, 42), m.median);
     try std.testing.expectApproxEqAbs(@as(f64, 42), m.mean, 0.001);
     try std.testing.expectApproxEqAbs(@as(f64, 0), m.std_dev, 0.001);
+}
+
+fn measurementForDeltaTest(mean: f64, std_dev: f64, sample_count: u64) Measurement {
+    return .{
+        .q1 = 0,
+        .median = 0,
+        .q3 = 0,
+        .min = 0,
+        .max = 0,
+        .mean = mean,
+        .std_dev = std_dev,
+        .outlier_count = 0,
+        .sample_count = sample_count,
+        .unit = .count,
+    };
+}
+
+fn writeDeltaPlainToBuf(m: Measurement, first_m: ?Measurement) ![]const u8 {
+    var buf: [64]u8 = undefined;
+    var w = Io.Writer.fixed(&buf);
+    try writeDeltaPlain(&w, m, first_m);
+    return w.buffered();
+}
+
+test "deltaHalfWidth: zero baseline returns null" {
+    const m = measurementForDeltaTest(10, 1, 10);
+    const f = measurementForDeltaTest(0, 1, 10);
+    try std.testing.expect(deltaHalfWidth(m, f) == null);
+}
+
+test "deltaHalfWidth: one sample each returns null" {
+    const m = measurementForDeltaTest(10, 0, 1);
+    const f = measurementForDeltaTest(10, 0, 1);
+    try std.testing.expect(deltaHalfWidth(m, f) == null);
+}
+
+test "deltaHalfWidth: three samples total returns null" {
+    const m = measurementForDeltaTest(10, 1, 2);
+    const f = measurementForDeltaTest(10, 1, 1);
+    try std.testing.expect(deltaHalfWidth(m, f) == null);
+}
+
+test "deltaHalfWidth: valid inputs return finite width" {
+    const m = measurementForDeltaTest(110, 10, 10);
+    const f = measurementForDeltaTest(100, 10, 10);
+    const half = deltaHalfWidth(m, f).?;
+    try std.testing.expect(!std.math.isNan(half));
+    try std.testing.expect(!std.math.isInf(half));
+    try std.testing.expect(half > 0);
+}
+
+test "writeDeltaPlain: undefined baseline writes n/a not nan" {
+    const m = measurementForDeltaTest(5, 1, 10);
+    const f = measurementForDeltaTest(0, 0, 10);
+    const out = try writeDeltaPlainToBuf(m, @as(?Measurement, f));
+    try std.testing.expectEqualStrings("n/a", out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "nan") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "inf") == null);
+}
+
+test "writeDeltaPlain: one sample each writes n/a" {
+    const m = measurementForDeltaTest(10, 0, 1);
+    const f = measurementForDeltaTest(10, 0, 1);
+    const out = try writeDeltaPlainToBuf(m, @as(?Measurement, f));
+    try std.testing.expectEqualStrings("n/a", out);
+}
+
+test "writeDeltaPlain: valid compare writes percent delta" {
+    const m = measurementForDeltaTest(110, 10, 10);
+    const f = measurementForDeltaTest(100, 10, 10);
+    const half = deltaHalfWidth(m, f).?;
+    var expect_buf: [64]u8 = undefined;
+    var expect_w = Io.Writer.fixed(&expect_buf);
+    const diff = (m.mean - f.mean) * 100 / f.mean;
+    const is_sig = deltaIsSignificant(diff, half);
+    try expect_w.writeAll(if (is_sig) "! " else "  ");
+    try expect_w.writeAll("+");
+    try expect_w.print("{d: >5.1}% ± {d: >4.1}%", .{ @abs(diff), half });
+    const out = try writeDeltaPlainToBuf(m, @as(?Measurement, f));
+    try std.testing.expectEqualStrings(expect_w.buffered(), out);
+}
+
+test "writeDeltaPlain: baseline row writes 0%" {
+    const m = measurementForDeltaTest(100, 10, 10);
+    const out = try writeDeltaPlainToBuf(m, null);
+    try std.testing.expectEqualStrings("0%", out);
 }
 
 test "printNum3SigFigs_smallValue_keepsDecimals" {
