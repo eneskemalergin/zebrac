@@ -67,6 +67,383 @@ const ColorMode = enum {
     ansi,
 };
 
+/// Fixed visible column starts (bytes, no ANSI). Header and rows share these.
+const sep_mean: []const u8 = " ± ";
+const sep_minmax: []const u8 = " … ";
+const row_indent: usize = 2;
+const col_gap: usize = 2;
+
+const TableLayout = struct {
+    name_w: usize,
+    mean_w: usize,
+    std_w: usize,
+    min_w: usize,
+    max_w: usize,
+    outlier_w: usize,
+    delta_w: usize,
+
+    fn compute(
+        measurements: Command.Measurements,
+        baseline: ?Command.Measurements,
+        with_delta: bool,
+    ) TableLayout {
+        var layout: TableLayout = .{
+            .name_w = row_indent + visibleLen("measurement"),
+            .mean_w = visibleLen("mean"),
+            .std_w = visibleLen("σ"),
+            .min_w = visibleLen("min"),
+            .max_w = visibleLen("max"),
+            .outlier_w = visibleLen("outliers"),
+            .delta_w = if (with_delta) visibleLen("delta") else 0,
+        };
+        var unit_buf: [32]u8 = undefined;
+        var outlier_buf: [32]u8 = undefined;
+        var delta_buf: [64]u8 = undefined;
+
+        inline for (@typeInfo(Command.Measurements).@"struct".fields) |field| {
+            const m = @field(measurements, field.name);
+            layout.name_w = @max(layout.name_w, row_indent + visibleLen(field.name));
+            layout.mean_w = @max(layout.mean_w, measureUnit(&unit_buf, m.mean, m.unit));
+            layout.std_w = @max(layout.std_w, measureUnit(&unit_buf, m.std_dev, m.unit));
+            layout.min_w = @max(layout.min_w, measureUnit(&unit_buf, @floatFromInt(m.min), m.unit));
+            layout.max_w = @max(layout.max_w, measureUnit(&unit_buf, @floatFromInt(m.max), m.unit));
+            layout.outlier_w = @max(
+                layout.outlier_w,
+                measureOutlier(&outlier_buf, m.outlier_count, m.sample_count),
+            );
+            if (with_delta) {
+                const first_m = if (baseline) |b| @field(b, field.name) else null;
+                layout.delta_w = @max(layout.delta_w, measureDelta(&delta_buf, m, first_m));
+            }
+        }
+        return layout;
+    }
+
+    fn meanSepVis(self: TableLayout) usize {
+        return self.name_w + col_gap + self.mean_w;
+    }
+
+    fn minSepVis(self: TableLayout) usize {
+        return self.name_w + col_gap + self.mean_w + visibleLen(sep_mean) + self.std_w + col_gap + self.min_w;
+    }
+
+    fn outlierStartVis(self: TableLayout) usize {
+        return self.minSepVis() + visibleLen(sep_minmax) + self.max_w + col_gap;
+    }
+
+    fn deltaStartVis(self: TableLayout) usize {
+        return self.outlierStartVis() + self.outlier_w + col_gap;
+    }
+
+    fn padVis(w: *Io.Writer, vis: *usize, target: usize) !void {
+        if (target > vis.*) {
+            try w.splatByteAll(' ', target - vis.*);
+            vis.* = target;
+        }
+    }
+
+    fn gap(w: *Io.Writer, vis: *usize) !void {
+        try padVis(w, vis, vis.* + col_gap);
+    }
+
+    fn printHeader(w: *Io.Writer, t: Io.Terminal, layout: TableLayout, with_delta: bool) !void {
+        var vis: usize = 0;
+        try w.splatByteAll(' ', row_indent);
+        try w.writeAll("measurement");
+        vis = row_indent + visibleLen("measurement");
+        try padVis(w, &vis, layout.name_w);
+
+        try gap(w, &vis);
+        try padVis(w, &vis, layout.meanSepVis() - visibleLen("mean"));
+        try t.setColor(.bright_green);
+        try w.writeAll("mean");
+        try t.setColor(.reset);
+        vis = layout.meanSepVis();
+        try t.setColor(.bold);
+        try w.writeAll(sep_mean);
+        try t.setColor(.reset);
+        vis += visibleLen(sep_mean);
+        try t.setColor(.green);
+        try w.writeAll("σ");
+        try t.setColor(.reset);
+        vis += visibleLen("σ");
+        try padVis(
+            w,
+            &vis,
+            layout.name_w + col_gap + layout.mean_w + visibleLen(sep_mean) + layout.std_w,
+        );
+
+        try gap(w, &vis);
+        try padVis(w, &vis, layout.minSepVis() - visibleLen("min"));
+        try t.setColor(.bold);
+        try t.setColor(.cyan);
+        try w.writeAll("min");
+        try t.setColor(.reset);
+        vis = layout.minSepVis();
+        try t.setColor(.bold);
+        try w.writeAll(sep_minmax);
+        try t.setColor(.reset);
+        try t.setColor(.magenta);
+        try w.writeAll("max");
+        try t.setColor(.reset);
+        vis = layout.minSepVis() + visibleLen(sep_minmax) + visibleLen("max");
+        try padVis(
+            w,
+            &vis,
+            layout.name_w + col_gap + layout.mean_w + visibleLen(sep_mean) + layout.std_w + col_gap + layout.min_w + visibleLen(sep_minmax) + layout.max_w,
+        );
+
+        try gap(w, &vis);
+        try padVis(w, &vis, layout.outlierStartVis());
+        try t.setColor(.bold);
+        try t.setColor(.bright_yellow);
+        try w.writeAll("outliers");
+        try t.setColor(.reset);
+        vis = layout.outlierStartVis() + visibleLen("outliers");
+        try padVis(w, &vis, layout.outlierStartVis() + layout.outlier_w);
+
+        if (with_delta) {
+            try gap(w, &vis);
+            try padVis(w, &vis, layout.deltaStartVis());
+            try t.setColor(.bold);
+            try w.writeAll("delta");
+            try t.setColor(.reset);
+        }
+        try w.writeAll("\n");
+    }
+};
+
+fn visibleLen(s: []const u8) usize {
+    var i: usize = 0;
+    var n: usize = 0;
+    while (i < s.len) {
+        const len = std.unicode.utf8CodepointSequenceLength(s[i]) catch 1;
+        n += 1;
+        i += len;
+    }
+    return n;
+}
+
+const UnitScaled = struct {
+    val: f64,
+    suffix: []const u8,
+};
+
+fn scaleUnit(x: f64, unit: Measurement.Unit) UnitScaled {
+    if (unit == .nanoseconds) {
+        if (x >= 3600 * 1_000_000_000) {
+            return .{ .val = x / (3600 * 1_000_000_000), .suffix = "h " };
+        }
+        if (x >= 60 * 1_000_000_000) {
+            return .{ .val = x / (60 * 1_000_000_000), .suffix = "m " };
+        }
+        if (x >= 1_000_000_000) {
+            return .{ .val = x / 1_000_000_000, .suffix = "s " };
+        }
+        if (x >= 1_000_000) {
+            return .{ .val = x / 1_000_000, .suffix = "ms" };
+        }
+        if (x >= 1_000) {
+            return .{ .val = x / 1_000, .suffix = "us" };
+        }
+        return .{ .val = x, .suffix = "ns" };
+    }
+    if (x >= 1000_000_000_000) {
+        return .{ .val = x / 1000_000_000_000, .suffix = switch (unit) {
+            .count => "T ",
+            .bytes => "TB",
+            .nanoseconds => unreachable,
+        } };
+    }
+    if (x >= 1000_000_000) {
+        return .{ .val = x / 1000_000_000, .suffix = switch (unit) {
+            .count => "G ",
+            .bytes => "GB",
+            .nanoseconds => unreachable,
+        } };
+    }
+    if (x >= 1000_000) {
+        return .{ .val = x / 1000_000, .suffix = switch (unit) {
+            .count => "M ",
+            .bytes => "MB",
+            .nanoseconds => unreachable,
+        } };
+    }
+    if (x >= 1000) {
+        return .{ .val = x / 1000, .suffix = switch (unit) {
+            .count => "K ",
+            .bytes => "KB",
+            .nanoseconds => unreachable,
+        } };
+    }
+    return .{ .val = x, .suffix = switch (unit) {
+        .count => "  ",
+        .bytes => "  ",
+        .nanoseconds => unreachable,
+    } };
+}
+
+fn formatUnitVisibleLen(w: *std.Io.Writer, x: f64, unit: Measurement.Unit) !usize {
+    const s = scaleUnit(x, unit);
+    try printNum3SigFigs(w, s.val);
+    const n = w.end;
+    try w.writeAll(s.suffix);
+    return n + s.suffix.len;
+}
+
+fn measureUnit(buf: *[32]u8, x: f64, unit: Measurement.Unit) usize {
+    var w = std.Io.Writer.fixed(buf);
+    return formatUnitVisibleLen(&w, x, unit) catch 0;
+}
+
+fn measureOutlier(buf: *[32]u8, count: u64, sample_count: u64) usize {
+    var w = std.Io.Writer.fixed(buf);
+    const pct = @as(f64, @floatFromInt(count)) / @as(f64, @floatFromInt(sample_count)) * 100;
+    w.print("{d} ({d:.0}%)", .{ count, pct }) catch return 0;
+    return visibleLen(w.buffered());
+}
+
+fn measureDelta(buf: *[64]u8, m: Measurement, first_m: ?Measurement) usize {
+    var w = std.Io.Writer.fixed(buf);
+    writeDeltaPlain(&w, m, first_m) catch return 0;
+    return visibleLen(w.buffered());
+}
+
+fn writeDeltaPlain(w: *Io.Writer, m: Measurement, first_m: ?Measurement) !void {
+    if (first_m == null) {
+        try w.writeAll("0%");
+        return;
+    }
+    const f = first_m.?;
+    const half = deltaHalfWidth(m, f);
+    const diff_mean_percent = (m.mean - f.mean) * 100 / f.mean;
+    const is_sig = deltaIsSignificant(diff_mean_percent, half);
+    if (m.mean > f.mean) {
+        try w.writeAll(if (is_sig) "! " else "  ");
+        try w.writeAll("+");
+    } else {
+        try w.writeAll(if (is_sig) "* " else "  ");
+        try w.writeAll("-");
+    }
+    try w.print("{d: >5.1}% ± {d: >4.1}%", .{ @abs(diff_mean_percent), half });
+}
+
+fn deltaHalfWidth(m: Measurement, f: Measurement) f64 {
+    const z = getStatScore95(m.sample_count + f.sample_count - 2);
+    const n1: f64 = @floatFromInt(m.sample_count);
+    const n2: f64 = @floatFromInt(f.sample_count);
+    const normer = std.math.sqrt(1.0 / n1 + 1.0 / n2);
+    const numer1 = (n1 - 1) * (m.std_dev * m.std_dev);
+    const numer2 = (n2 - 1) * (f.std_dev * f.std_dev);
+    const df = n1 + n2 - 2;
+    const sp = std.math.sqrt((numer1 + numer2) / df);
+    return (z * sp * normer) * 100 / f.mean;
+}
+
+fn deltaIsSignificant(diff_mean_percent: f64, half: f64) bool {
+    if (diff_mean_percent >= 1 and (diff_mean_percent - half) >= 1) return true;
+    if (diff_mean_percent <= -1 and (diff_mean_percent + half) <= -1) return true;
+    return false;
+}
+
+fn writeUnitRightAligned(
+    terminal: Io.Terminal,
+    w: *Io.Writer,
+    vis: *usize,
+    end_vis: usize,
+    x: f64,
+    unit: Measurement.Unit,
+    color: Io.Terminal.Color,
+    color_enabled: bool,
+    buf: *[32]u8,
+) !void {
+    var fbs = std.Io.Writer.fixed(buf);
+    const len = try formatUnitVisibleLen(&fbs, x, unit);
+    try TableLayout.padVis(w, vis, end_vis - len);
+    try terminal.setColor(color);
+    fbs.end = 0;
+    try printUnit(&fbs, x, unit, 0, color_enabled);
+    try w.writeAll(fbs.buffered());
+    try terminal.setColor(.reset);
+    vis.* = end_vis;
+}
+
+fn writeUnitLeftAligned(
+    terminal: Io.Terminal,
+    w: *Io.Writer,
+    vis: *usize,
+    x: f64,
+    unit: Measurement.Unit,
+    color: Io.Terminal.Color,
+    color_enabled: bool,
+    buf: *[32]u8,
+) !void {
+    var fbs = std.Io.Writer.fixed(buf);
+    try terminal.setColor(color);
+    try printUnit(&fbs, x, unit, 0, color_enabled);
+    try w.writeAll(fbs.buffered());
+    try terminal.setColor(.reset);
+    vis.* += visibleLen(fbs.buffered());
+}
+
+fn writeDelta(
+    w: *Io.Writer,
+    terminal: Io.Terminal,
+    vis: *usize,
+    layout: TableLayout,
+    m: Measurement,
+    first_m: ?Measurement,
+    color_enabled: bool,
+) !void {
+    try TableLayout.padVis(w, vis, layout.deltaStartVis());
+    const col_start = layout.deltaStartVis();
+
+    if (first_m == null) {
+        if (color_enabled) try terminal.setColor(.dim);
+        try w.writeAll("0%");
+        if (color_enabled) try terminal.setColor(.reset);
+        vis.* = col_start + visibleLen("0%");
+        try TableLayout.padVis(w, vis, col_start + layout.delta_w);
+        return;
+    }
+    const f = first_m.?;
+    const half_val = deltaHalfWidth(m, f);
+    const diff_mean_percent = (m.mean - f.mean) * 100 / f.mean;
+    const is_sig = deltaIsSignificant(diff_mean_percent, half_val);
+
+    var tail_buf: [32]u8 = undefined;
+    var tail_w = std.Io.Writer.fixed(&tail_buf);
+    if (m.mean > f.mean) {
+        if (is_sig) {
+            try w.writeAll("! ");
+            if (color_enabled) try terminal.setColor(.bright_red);
+        } else {
+            if (color_enabled) try terminal.setColor(.dim);
+            try w.writeAll("  ");
+        }
+        try w.writeAll("+");
+    } else {
+        if (is_sig) {
+            if (color_enabled) try terminal.setColor(.bright_yellow);
+            try w.writeAll("* ");
+            if (color_enabled) try terminal.setColor(.bright_green);
+        } else {
+            if (color_enabled) try terminal.setColor(.dim);
+            try w.writeAll("  ");
+        }
+        try w.writeAll("-");
+    }
+    try tail_w.print("{d: >5.1}% ± {d: >4.1}%", .{ @abs(diff_mean_percent), half_val });
+    try w.writeAll(tail_w.buffered());
+    if (color_enabled) try terminal.setColor(.reset);
+
+    var measure_buf: [64]u8 = undefined;
+    var measure_w = std.Io.Writer.fixed(&measure_buf);
+    writeDeltaPlain(&measure_w, m, first_m) catch {};
+    vis.* = col_start + visibleLen(measure_w.buffered());
+    try TableLayout.padVis(w, vis, col_start + layout.delta_w);
+}
+
 pub fn main(init: process.Init) !void {
     const io = init.io;
     const arena = init.arena.allocator();
@@ -426,43 +803,10 @@ pub fn main(init: process.Init) !void {
             for (command.argv) |arg| try stdout_w.print(" {s}", .{arg});
             try stdout_w.writeAll("\n");
 
-            try t.setColor(.bold);
-            try stdout_w.writeAll("  measurement");
-            try stdout_w.splatByteAll(' ', 23 - "  measurement".len);
-            try t.setColor(.bright_green);
-            try stdout_w.writeAll("mean");
-            try t.setColor(.reset);
-            try t.setColor(.bold);
-            try stdout_w.writeAll(" ± ");
-            try t.setColor(.green);
-            try stdout_w.writeAll("σ");
-            try t.setColor(.reset);
-
-            try t.setColor(.bold);
-            try stdout_w.splatByteAll(' ', 12);
-            try t.setColor(.cyan);
-            try stdout_w.writeAll("min");
-            try t.setColor(.reset);
-            try t.setColor(.bold);
-            try stdout_w.writeAll(" … ");
-            try t.setColor(.magenta);
-            try stdout_w.writeAll("max");
-            try t.setColor(.reset);
-
-            try t.setColor(.bold);
-            try stdout_w.splatByteAll(' ', 20 - " outliers".len);
-            try t.setColor(.bright_yellow);
-            try stdout_w.writeAll("outliers");
-            try t.setColor(.reset);
-
-            if (commands.items.len >= 2) {
-                try t.setColor(.bold);
-                try stdout_w.splatByteAll(' ', 9);
-                try stdout_w.writeAll("delta");
-                try t.setColor(.reset);
-            }
-
-            try stdout_w.writeAll("\n");
+            const with_delta = commands.items.len >= 2;
+            const baseline: ?Command.Measurements = if (command_n == 1) null else commands.items[0].measurements;
+            const layout = TableLayout.compute(command.measurements, baseline, with_delta);
+            try TableLayout.printHeader(stdout_w, t, layout, with_delta);
 
             inline for (@typeInfo(Command.Measurements).@"struct".fields) |field| {
                 const measurement = @field(command.measurements, field.name);
@@ -470,7 +814,7 @@ pub fn main(init: process.Init) !void {
                     null
                 else
                     @field(commands.items[0].measurements, field.name);
-                try printMeasurement(t, measurement, field.name, first_measurement, commands.items.len);
+                try printMeasurement(t, layout, measurement, field.name, first_measurement, with_delta);
             }
 
             try stdout_w.flush();
@@ -723,122 +1067,63 @@ const Measurement = struct {
 
 fn printMeasurement(
     terminal: Io.Terminal,
+    layout: TableLayout,
     m: Measurement,
     name: []const u8,
     first_m: ?Measurement,
-    command_count: usize,
+    with_delta: bool,
 ) !void {
     const w = terminal.writer;
-    try w.print("  {s}", .{name});
-
-    var buf: [200]u8 = undefined;
-    var fbs: std.Io.Writer = .fixed(&buf);
-    var count: usize = 0;
-
     const color_enabled = terminal.mode != .no_color;
-    const ansi_overhead: usize = if (color_enabled) 13 else 0;
-    const spaces = 21 -| name.len;
-    try w.splatByteAll(' ', spaces);
-    try terminal.setColor(.bright_green);
-    try printUnit(&fbs, m.mean, m.unit, m.std_dev, color_enabled);
-    try w.writeAll(fbs.buffered());
-    count += fbs.end -| ansi_overhead;
-    fbs.end = 0;
-    try terminal.setColor(.reset);
-    try w.writeAll(" ± ");
-    try terminal.setColor(.green);
-    try printUnit(&fbs, m.std_dev, m.unit, 0, color_enabled);
-    try w.writeAll(fbs.buffered());
-    count += fbs.end -| ansi_overhead;
-    fbs.end = 0;
-    try terminal.setColor(.reset);
+    var vis: usize = 0;
+    var unit_buf: [32]u8 = undefined;
 
-    try w.splatByteAll(' ', 17 -| count);
-    count = 0;
+    try w.splatByteAll(' ', row_indent);
+    try w.writeAll(name);
+    vis = row_indent + visibleLen(name);
+    try TableLayout.padVis(w, &vis, layout.name_w);
 
-    try terminal.setColor(.cyan);
-    try printUnit(&fbs, @floatFromInt(m.min), m.unit, m.std_dev, color_enabled);
-    try w.writeAll(fbs.buffered());
-    count += fbs.end -| ansi_overhead;
-    fbs.end = 0;
-    try terminal.setColor(.reset);
-    try w.writeAll(" … ");
-    try terminal.setColor(.magenta);
-    try printUnit(&fbs, @floatFromInt(m.max), m.unit, m.std_dev, color_enabled);
-    try w.writeAll(fbs.buffered());
-    count += fbs.end -| ansi_overhead;
-    fbs.end = 0;
-    try terminal.setColor(.reset);
+    try TableLayout.gap(w, &vis);
+    try writeUnitRightAligned(terminal, w, &vis, layout.meanSepVis(), m.mean, m.unit, .bright_green, color_enabled, &unit_buf);
+    try w.writeAll(sep_mean);
+    vis = layout.meanSepVis() + visibleLen(sep_mean);
+    try writeUnitLeftAligned(terminal, w, &vis, m.std_dev, m.unit, .green, color_enabled, &unit_buf);
+    try TableLayout.padVis(
+        w,
+        &vis,
+        layout.name_w + col_gap + layout.mean_w + visibleLen(sep_mean) + layout.std_w,
+    );
 
-    try w.splatByteAll(' ', 17 -| count);
-    count = 0;
+    try TableLayout.gap(w, &vis);
+    try writeUnitRightAligned(terminal, w, &vis, layout.minSepVis(), @floatFromInt(m.min), m.unit, .cyan, color_enabled, &unit_buf);
+    try w.writeAll(sep_minmax);
+    vis = layout.minSepVis() + visibleLen(sep_minmax);
+    try writeUnitLeftAligned(terminal, w, &vis, @floatFromInt(m.max), m.unit, .magenta, color_enabled, &unit_buf);
+    try TableLayout.padVis(
+        w,
+        &vis,
+        layout.name_w + col_gap + layout.mean_w + visibleLen(sep_mean) + layout.std_w + col_gap + layout.min_w + visibleLen(sep_minmax) + layout.max_w,
+    );
 
+    try TableLayout.gap(w, &vis);
+    try TableLayout.padVis(w, &vis, layout.outlierStartVis());
     const outlier_percent = @as(f64, @floatFromInt(m.outlier_count)) / @as(f64, @floatFromInt(m.sample_count)) * 100;
+    var outlier_buf: [32]u8 = undefined;
+    var outlier_writer = std.Io.Writer.fixed(&outlier_buf);
+    try outlier_writer.print("{d} ({d:.0}%)", .{ m.outlier_count, outlier_percent });
     if (outlier_percent >= 10)
         try terminal.setColor(.yellow)
     else
         try terminal.setColor(.dim);
-    try fbs.print("{d: >4.0} ({d: >2.0}%)", .{ m.outlier_count, outlier_percent });
-    try w.writeAll(fbs.buffered());
-    count += fbs.end;
-    fbs.end = 0;
+    try w.writeAll(outlier_writer.buffered());
     try terminal.setColor(.reset);
+    vis = layout.outlierStartVis() + visibleLen(outlier_writer.buffered());
+    try TableLayout.padVis(w, &vis, layout.outlierStartVis() + layout.outlier_w);
 
-    try w.splatByteAll(' ', 19 - (count + 1));
-
-    // ratio
-    if (command_count > 1) {
-        if (first_m) |f| {
-            const half = blk: {
-                const z = getStatScore95(m.sample_count + f.sample_count - 2);
-                const n1: f64 = @floatFromInt(m.sample_count);
-                const n2: f64 = @floatFromInt(f.sample_count);
-                const normer = std.math.sqrt(1.0 / n1 + 1.0 / n2);
-                const numer1 = (n1 - 1) * (m.std_dev * m.std_dev);
-                const numer2 = (n2 - 1) * (f.std_dev * f.std_dev);
-                const df = n1 + n2 - 2;
-                const sp = std.math.sqrt((numer1 + numer2) / df);
-                break :blk (z * sp * normer) * 100 / f.mean;
-            };
-            const diff_mean_percent = (m.mean - f.mean) * 100 / f.mean;
-            // significant only if full interval is beyond abs 1% with the same sign
-            const is_sig = blk: {
-                if (diff_mean_percent >= 1 and (diff_mean_percent - half) >= 1) {
-                    break :blk true;
-                } else if (diff_mean_percent <= -1 and (diff_mean_percent + half) <= -1) {
-                    break :blk true;
-                } else {
-                    break :blk false;
-                }
-            };
-            if (m.mean > f.mean) {
-                if (is_sig) {
-                    try w.writeAll("! ");
-                    try terminal.setColor(.bright_red);
-                } else {
-                    try terminal.setColor(.dim);
-                    try w.writeAll("  ");
-                }
-                try w.writeAll("+");
-            } else {
-                if (is_sig) {
-                    try terminal.setColor(.bright_yellow);
-                    try w.writeAll("* ");
-                    try terminal.setColor(.bright_green);
-                } else {
-                    try terminal.setColor(.dim);
-                    try w.writeAll("  ");
-                }
-                try w.writeAll("-");
-            }
-            try fbs.print("{d: >5.1}% ± {d: >4.1}%", .{ @abs(diff_mean_percent), half });
-            try w.writeAll(fbs.buffered());
-            count += fbs.end;
-            fbs.end = 0;
-        } else {
-            try terminal.setColor(.dim);
-            try w.writeAll("0%");
-        }
+    if (with_delta) {
+        try TableLayout.gap(w, &vis);
+        try TableLayout.padVis(w, &vis, layout.deltaStartVis());
+        try writeDelta(w, terminal, &vis, layout, m, first_m, color_enabled);
     }
 
     try terminal.setColor(.reset);
@@ -847,62 +1132,24 @@ fn printMeasurement(
 
 fn printNum3SigFigs(w: *std.Io.Writer, num: f64) !void {
     if (num >= 1000) {
-        try w.print("{d: >4.0}", .{num});
+        try w.print("{d:.0}", .{num});
     } else if (num >= 100) {
-        try w.print("{d: >4.0}", .{num});
+        try w.print("{d:.0}", .{num});
     } else if (num >= 10) {
-        try w.print("{d: >3.1}", .{num});
+        try w.print("{d:.1}", .{num});
     } else {
-        try w.print("{d: >3.2}", .{num});
+        try w.print("{d:.2}", .{num});
     }
 }
 
 fn printUnit(w: *std.Io.Writer, x: f64, unit: Measurement.Unit, std_dev: f64, color_enabled: bool) !void {
     _ = std_dev;
-    const num = x;
-    var val: f64 = 0;
-    var ustr: []const u8 = "  ";
-    if (num >= 1000_000_000_000) {
-        val = num / 1000_000_000_000;
-        ustr = switch (unit) {
-            .count => "T ",
-            .nanoseconds => "ks",
-            .bytes => "TB",
-        };
-    } else if (num >= 1000_000_000) {
-        val = num / 1000_000_000;
-        ustr = switch (unit) {
-            .count => "G ",
-            .nanoseconds => "s ",
-            .bytes => "GB",
-        };
-    } else if (num >= 1000_000) {
-        val = num / 1000_000;
-        ustr = switch (unit) {
-            .count => "M ",
-            .nanoseconds => "ms",
-            .bytes => "MB",
-        };
-    } else if (num >= 1000) {
-        val = num / 1000;
-        ustr = switch (unit) {
-            .count => "K ",
-            .nanoseconds => "us",
-            .bytes => "KB",
-        };
-    } else {
-        val = num;
-        ustr = switch (unit) {
-            .count => "  ",
-            .nanoseconds => "ns",
-            .bytes => "  ",
-        };
-    }
-    try printNum3SigFigs(w, val);
+    const s = scaleUnit(x, unit);
+    try printNum3SigFigs(w, s.val);
     if (color_enabled) {
-        try w.print("\x1b[2m\x1b[37m{s}\x1b[0m", .{ustr});
+        try w.print("\x1b[2m\x1b[37m{s}\x1b[0m", .{s.suffix});
     } else {
-        try w.writeAll(ustr);
+        try w.writeAll(s.suffix);
     }
 }
 
@@ -1078,6 +1325,108 @@ test "printNum3SigFigs_largeValue_usesIntegerWidth" {
     var w = std.Io.Writer.fixed(&buf);
     try printNum3SigFigs(&w, 1234);
     try std.testing.expectEqualStrings("1234", w.buffered());
+}
+
+test "results table: separators align across rows" {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    const term = Io.Terminal{ .writer = &w, .mode = .no_color };
+
+    const wall = Measurement{
+        .q1 = 640_000,
+        .median = 659_000,
+        .q3 = 677_000,
+        .min = 638_000,
+        .max = 719_000,
+        .mean = 659_000,
+        .std_dev = 27_800,
+        .outlier_count = 0,
+        .sample_count = 8,
+        .unit = .nanoseconds,
+    };
+    const rss = Measurement{
+        .q1 = 1_150_000,
+        .median = 1_150_000,
+        .q3 = 1_150_000,
+        .min = 1_150_000,
+        .max = 1_220_000,
+        .mean = 1_160_000,
+        .std_dev = 23_200,
+        .outlier_count = 0,
+        .sample_count = 8,
+        .unit = .bytes,
+    };
+    const measurements: Command.Measurements = .{
+        .wall_time = wall,
+        .peak_rss = rss,
+        .cpu_cycles = wall,
+        .instructions = wall,
+        .cache_references = wall,
+        .cache_misses = wall,
+        .branch_misses = wall,
+    };
+    const layout = TableLayout.compute(measurements, measurements, true);
+    try TableLayout.printHeader(&w, term, layout, true);
+    try printMeasurement(term, layout, wall, "wall_time", null, true);
+    try printMeasurement(term, layout, rss, "peak_rss", wall, true);
+
+    const out = w.buffered();
+    var mean_sep: ?usize = null;
+    var min_sep: ?usize = null;
+    var outlier_start: ?usize = null;
+    var line_start: usize = 0;
+    while (line_start < out.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, out, line_start, '\n') orelse out.len;
+        const line = out[line_start..line_end];
+        const this_mean = visibleIndexOfUtf8(line, "±");
+        const this_min = visibleIndexOfUtf8(line, "…");
+        if (this_mean) |m| {
+            if (mean_sep) |prev| try std.testing.expectEqual(prev, m);
+            mean_sep = m;
+        }
+        if (this_min) |m| {
+            if (min_sep) |prev| try std.testing.expectEqual(prev, m);
+            min_sep = m;
+        }
+        if (visibleIndexOfUtf8(line, "outliers")) |start| {
+            if (outlier_start) |prev| try std.testing.expectEqual(prev, start);
+            outlier_start = start;
+        } else if (visibleIndexOfUtf8(line, "0 (0%)")) |start| {
+            if (outlier_start) |prev| try std.testing.expectEqual(prev, start);
+            outlier_start = start;
+        }
+        if (line_end == out.len) break;
+        line_start = line_end + 1;
+    }
+    try std.testing.expect(mean_sep != null);
+    try std.testing.expect(min_sep != null);
+    try std.testing.expect(outlier_start != null);
+}
+
+test "scaleUnit nanoseconds uses minutes and hours" {
+    const one_min: f64 = 60.0 * 1_000_000_000.0;
+    const one_hour: f64 = 3600.0 * 1_000_000_000.0;
+    const s_min = scaleUnit(one_min, .nanoseconds);
+    try std.testing.expectEqualStrings("m ", s_min.suffix);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), s_min.val, 0.001);
+    const s_hour = scaleUnit(one_hour, .nanoseconds);
+    try std.testing.expectEqualStrings("h ", s_hour.suffix);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), s_hour.val, 0.001);
+    const s_sec = scaleUnit(5.0 * 1_000_000_000.0, .nanoseconds);
+    try std.testing.expectEqualStrings("s ", s_sec.suffix);
+    try std.testing.expectApproxEqAbs(@as(f64, 5.0), s_sec.val, 0.001);
+}
+
+fn visibleIndexOfUtf8(haystack: []const u8, needle: []const u8) ?usize {
+    const byte_idx = std.mem.indexOf(u8, haystack, needle) orelse return null;
+    var vis: usize = 0;
+    var i: usize = 0;
+    while (i < byte_idx) {
+        const cp_len = std.unicode.utf8CodepointSequenceLength(haystack[i]) catch 1;
+        i += cp_len;
+        vis += 1;
+    }
+    return vis;
 }
 
 fn checkSummarizeFieldInvariants(n: u8, samples: []const Sample, scratch: []Sample) !void {
