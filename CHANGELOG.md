@@ -7,6 +7,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog covers the poop lineage starting at v0.3.0 and tracks zebrac-specific changes after [0.5.0] section.
 
+## [0.5.5] - Unreleased
+
+### Added
+
+- Progress bar layout tests in `src/progress.zig` (property checks, render smoke); CI runs them via a dedicated `build.zig` test target
+- Results table alignment test for color mode (`escape_codes`)
+
+### Changed
+
+- Progress bar writes to **stderr**; results table stays on **stdout** (piped stdout is clean JSON/table only)
+- Unit formatting uses one plain-text path; color applied via `Io.Terminal.setColor` only (no embedded ANSI in measured widths)
+
+### Fixed
+
+- Progress bar usize underflow at 100% fill (ReleaseSmall could hang or corrupt the row)
+- Progress bar erase in `--color never`: use EL (`\x1b[2K\r`) so the benchmark header is not left with stale bar characters
+- Final progress frame renders at 100% before the bar is cleared
+- Colored results table misalignment: `σ` / min / max columns drifted because ANSI bytes were counted as column width
+
 ## [0.5.4] - 2026-06-23
 
 ### Added

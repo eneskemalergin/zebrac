@@ -283,12 +283,16 @@ fn scaleUnit(x: f64, unit: Measurement.Unit) UnitScaled {
     } };
 }
 
-fn formatUnitVisibleLen(w: *std.Io.Writer, x: f64, unit: Measurement.Unit) !usize {
+fn formatUnitPlain(w: *std.Io.Writer, x: f64, unit: Measurement.Unit) !void {
     const s = scaleUnit(x, unit);
     try printNum3SigFigs(w, s.val);
-    const n = w.end;
     try w.writeAll(s.suffix);
-    return n + s.suffix.len;
+}
+
+fn formatUnitVisibleLen(w: *std.Io.Writer, x: f64, unit: Measurement.Unit) !usize {
+    const prev = w.end;
+    try formatUnitPlain(w, x, unit);
+    return w.end - prev;
 }
 
 fn measureUnit(buf: *[32]u8, x: f64, unit: Measurement.Unit) usize {
@@ -357,13 +361,14 @@ fn writeUnitRightAligned(
     color_enabled: bool,
     buf: *[32]u8,
 ) !void {
+    const s = scaleUnit(x, unit);
     var fbs = std.Io.Writer.fixed(buf);
     const len = try formatUnitVisibleLen(&fbs, x, unit);
     try TableLayout.padVis(w, vis, end_vis - len);
     try terminal.setColor(color);
-    fbs.end = 0;
-    try printUnit(&fbs, x, unit, 0, color_enabled);
-    try w.writeAll(fbs.buffered());
+    try printNum3SigFigs(w, s.val);
+    if (color_enabled) try terminal.setColor(.dim);
+    try w.writeAll(s.suffix);
     try terminal.setColor(.reset);
     vis.* = end_vis;
 }
@@ -378,12 +383,15 @@ fn writeUnitLeftAligned(
     color_enabled: bool,
     buf: *[32]u8,
 ) !void {
+    const s = scaleUnit(x, unit);
     var fbs = std.Io.Writer.fixed(buf);
+    const len = try formatUnitVisibleLen(&fbs, x, unit);
     try terminal.setColor(color);
-    try printUnit(&fbs, x, unit, 0, color_enabled);
-    try w.writeAll(fbs.buffered());
+    try printNum3SigFigs(w, s.val);
+    if (color_enabled) try terminal.setColor(.dim);
+    try w.writeAll(s.suffix);
     try terminal.setColor(.reset);
-    vis.* += visibleLen(fbs.buffered());
+    vis.* += len;
 }
 
 fn writeDelta(
@@ -453,6 +461,10 @@ pub fn main(init: process.Init) !void {
     var stdout_buffer: [1024]u8 = undefined;
     var stdout_writer = Io.File.stdout().writerStreaming(io, &stdout_buffer);
     const stdout_w = &stdout_writer.interface;
+
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr_writer = Io.File.stderr().writerStreaming(io, &stderr_buffer);
+    const stderr_w = &stderr_writer.interface;
 
     var commands: std.ArrayList(Command) = .empty;
     var max_nano_seconds: u64 = std.time.ns_per_s * 5;
@@ -610,7 +622,7 @@ pub fn main(init: process.Init) !void {
                 .ansi => .escape_codes,
             },
         };
-        bar = try progress.ProgressBar.init(io, arena, stdout_w, terminal.?.mode);
+        bar = try progress.ProgressBar.init(io, arena, stderr_w, terminal.?.mode, Io.File.stderr());
     }
     defer if (bar) |*b| b.deinit();
 
@@ -767,7 +779,11 @@ pub fn main(init: process.Init) !void {
         }
 
         if (!quiet) {
+            bar.?.estimate = bar.?.current;
+            try bar.?.render(io);
             try bar.?.clear(io);
+            try stderr_w.writeAll("\n");
+            try stderr_w.flush();
             bar.?.current = 0;
             bar.?.estimate = 1;
         }
@@ -1184,17 +1200,6 @@ fn printNum3SigFigs(w: *std.Io.Writer, num: f64) !void {
     }
 }
 
-fn printUnit(w: *std.Io.Writer, x: f64, unit: Measurement.Unit, std_dev: f64, color_enabled: bool) !void {
-    _ = std_dev;
-    const s = scaleUnit(x, unit);
-    try printNum3SigFigs(w, s.val);
-    if (color_enabled) {
-        try w.print("\x1b[2m\x1b[37m{s}\x1b[0m", .{s.suffix});
-    } else {
-        try w.writeAll(s.suffix);
-    }
-}
-
 // Gets either the T or Z score for 95% confidence.
 // If no `df` variable is provided, Z score is provided.
 pub fn getStatScore95(df: ?u64) f64 {
@@ -1450,9 +1455,17 @@ test "printNum3SigFigs_largeValue_usesIntegerWidth" {
 }
 
 test "results table: separators align across rows" {
+    try tableSeparatorAlignmentTest(.no_color);
+}
+
+test "results table: separators align with color" {
+    try tableSeparatorAlignmentTest(.escape_codes);
+}
+
+fn tableSeparatorAlignmentTest(mode: Io.Terminal.Mode) !void {
     var buf: [4096]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    const term = Io.Terminal{ .writer = &w, .mode = .no_color };
+    const term = Io.Terminal{ .writer = &w, .mode = mode };
 
     const wall = Measurement{
         .q1 = 640_000,
@@ -1540,15 +1553,26 @@ test "scaleUnit nanoseconds uses minutes and hours" {
 }
 
 fn visibleIndexOfUtf8(haystack: []const u8, needle: []const u8) ?usize {
-    const byte_idx = std.mem.indexOf(u8, haystack, needle) orelse return null;
     var vis: usize = 0;
     var i: usize = 0;
-    while (i < byte_idx) {
-        const cp_len = std.unicode.utf8CodepointSequenceLength(haystack[i]) catch 1;
-        i += cp_len;
-        vis += 1;
+    while (i < haystack.len) {
+        if (std.mem.startsWith(u8, haystack[i..], needle)) return vis;
+        advanceVisibleColumn(haystack, &i, &vis);
     }
-    return vis;
+    return null;
+}
+
+fn advanceVisibleColumn(s: []const u8, i: *usize, vis: *usize) void {
+    if (i.* >= s.len) return;
+    if (s[i.*] == '\x1b' and i.* + 1 < s.len and s[i.* + 1] == '[') {
+        i.* += 2;
+        while (i.* < s.len and s[i.*] != 'm') i.* += 1;
+        if (i.* < s.len) i.* += 1;
+        return;
+    }
+    const cp_len = std.unicode.utf8CodepointSequenceLength(s[i.*]) catch 1;
+    i.* += cp_len;
+    vis.* += 1;
 }
 
 fn checkSummarizeFieldInvariants(n: u8, samples: []const Sample, scratch: []Sample) !void {

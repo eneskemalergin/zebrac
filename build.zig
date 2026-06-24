@@ -35,8 +35,20 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_tests.step);
 
+    const progress_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/progress.zig"),
+        .target = target,
+        .optimize = .Debug,
+    });
+    const progress_tests = b.addTest(.{
+        .root_module = progress_test_mod,
+    });
+    const run_progress_tests = b.addRunArtifact(progress_tests);
+    test_step.dependOn(&run_progress_tests.step);
+
     const ci = b.step("ci", "Tests plus ReleaseSmall cross-builds (same as GitHub Actions build job)");
     ci.dependOn(&run_exe_tests.step);
+    ci.dependOn(&run_progress_tests.step);
     const ci_targets = [_]std.Target.Query{
         .{ .cpu_arch = .x86, .os_tag = .linux },
         .{ .cpu_arch = .x86_64, .os_tag = .linux },
