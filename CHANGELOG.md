@@ -7,7 +7,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog covers the poop lineage starting at v0.3.0 and tracks zebrac-specific changes after [0.5.0] section.
 
-## [Unreleased]
+## 0.5.4 - Unreleased
+
+### Added
+
+- `--version` flag; help text moved to `src/help.zig`
+
+### Changed
+
+- `--help` rewritten: metrics, sampling, quoting, poop credit, shorter missing-arg errors
 
 ## [0.5.3] - 2026-06-01
 

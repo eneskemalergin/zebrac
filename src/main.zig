@@ -6,27 +6,9 @@ const fd_t = std.posix.fd_t;
 const assert = std.debug.assert;
 const progress = @import("progress.zig");
 const argv_parse = @import("argv_parse.zig");
+const help = @import("help.zig");
 const MAX_SAMPLES = 10000;
 const max_stderr_bytes = 1024 * 1024;
-
-const usage_text =
-    \\Usage: zebrac [options] <command1> ... <commandN>
-    \\
-    \\Compares the performance of the provided commands.
-    \\
-    \\Sampling:
-    \\  -d, --duration <ms>    sampling duration per command (default: 5000)
-    \\  -i, --min-samples <n>  minimum samples per command (default: 5)
-    \\  -a, --max-samples <n>  maximum samples per command (default: 10000)
-    \\  -w, --warmup <n>       warmup runs before measurement (default: 3)
-    \\
-    \\Output:
-    \\  --color <when>         color mode: auto, never, ansi (default: auto)
-    \\  -f, --allow-failures   benchmark despite non-zero exit codes
-    \\  --json [<path>]        write results as JSON (default: zebrac-results.json)
-    \\  -q, --quiet            suppress terminal output
-    \\
-;
 
 const PerfMeasurement = struct {
     name: []const u8,
@@ -125,13 +107,17 @@ pub fn main(init: process.Init) !void {
                 .sample_count = undefined,
             });
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            try stdout_w.writeAll(usage_text);
+            try stdout_w.writeAll(help.usage_text);
+            try stdout_w.flush();
+            return process.cleanExit(io);
+        } else if (std.mem.eql(u8, arg, "--version")) {
+            try stdout_w.print("zebrac {s}\n", .{help.version});
             try stdout_w.flush();
             return process.cleanExit(io);
         } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--duration")) {
             arg_i += 1;
             if (arg_i >= args.len) {
-                std.debug.print("'{s}' requires a duration in milliseconds.\n{s}", .{ arg, usage_text });
+                std.debug.print("'{s}' requires a duration in milliseconds.\n{s}", .{ arg, help.short_usage });
                 process.exit(1);
             }
             const next = args[arg_i];
@@ -145,7 +131,7 @@ pub fn main(init: process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--color")) {
             arg_i += 1;
             if (arg_i >= args.len) {
-                std.debug.print("'{s}' requires a mode; options are 'auto', 'never', and 'ansi'.\n{s}", .{ arg, usage_text });
+                std.debug.print("'{s}' requires a mode; options are 'auto', 'never', and 'ansi'.\n{s}", .{ arg, help.short_usage });
                 process.exit(1);
             }
             const next = args[arg_i];
@@ -174,7 +160,7 @@ pub fn main(init: process.Init) !void {
         } else if (std.mem.eql(u8, arg, "-i") or std.mem.eql(u8, arg, "--min-samples")) {
             arg_i += 1;
             if (arg_i >= args.len) {
-                std.debug.print("'{s}' requires a number.\n{s}", .{ arg, usage_text });
+                std.debug.print("'{s}' requires a number.\n{s}", .{ arg, help.short_usage });
                 process.exit(1);
             }
             min_samples = std.fmt.parseInt(u64, args[arg_i], 10) catch |err| {
@@ -184,7 +170,7 @@ pub fn main(init: process.Init) !void {
         } else if (std.mem.eql(u8, arg, "-a") or std.mem.eql(u8, arg, "--max-samples")) {
             arg_i += 1;
             if (arg_i >= args.len) {
-                std.debug.print("'{s}' requires a number.\n{s}", .{ arg, usage_text });
+                std.debug.print("'{s}' requires a number.\n{s}", .{ arg, help.short_usage });
                 process.exit(1);
             }
             max_samples = std.fmt.parseInt(u64, args[arg_i], 10) catch |err| {
@@ -195,7 +181,7 @@ pub fn main(init: process.Init) !void {
         } else if (std.mem.eql(u8, arg, "-w") or std.mem.eql(u8, arg, "--warmup")) {
             arg_i += 1;
             if (arg_i >= args.len) {
-                std.debug.print("'{s}' requires a number.\n{s}", .{ arg, usage_text });
+                std.debug.print("'{s}' requires a number.\n{s}", .{ arg, help.short_usage });
                 process.exit(1);
             }
             warmup = std.fmt.parseInt(usize, args[arg_i], 10) catch |err| {
@@ -203,13 +189,13 @@ pub fn main(init: process.Init) !void {
                 process.exit(1);
             };
         } else {
-            std.debug.print("unrecognized argument: '{s}'\n{s}", .{ arg, usage_text });
+            std.debug.print("unrecognized argument: '{s}'\n{s}", .{ arg, help.usage_text });
             process.exit(1);
         }
     }
 
     if (commands.items.len == 0) {
-        try stdout_w.writeAll(usage_text);
+        try stdout_w.writeAll(help.usage_text);
         try stdout_w.flush();
         process.exit(1);
     }
