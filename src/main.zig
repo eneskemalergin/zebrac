@@ -681,36 +681,19 @@ pub fn main(init: process.Init) !void {
                 .argv = command.argv,
                 .stdin = .inherit,
                 .stdout = .ignore,
-                .stderr = .pipe,
+                .stderr = if (allow_failures) .pipe else .ignore,
                 .request_resource_usage_statistics = true,
             });
 
-            var stderr_pipe_buf: [4096]u8 = undefined;
-            var child_stderr = child.stderr.?.readerStreaming(io, &stderr_pipe_buf);
-
-            var stderr_list: std.ArrayList(u8) = .empty;
-            try stderr_list.ensureTotalCapacity(arena, 4096);
-            var stderr_capture = Io.Writer.Allocating.fromArrayList(arena, &stderr_list);
+            var stderr_bytes: []const u8 = "";
             var stderr_truncated = false;
-
-            while (true) {
-                _ = child_stderr.interface.stream(&stderr_capture.writer, .unlimited) catch |err| switch (err) {
-                    error.ReadFailed => return child_stderr.err.?,
-                    error.WriteFailed => {
-                        stderr_truncated = true;
-                        _ = try child_stderr.interface.discardRemaining();
-                        break;
-                    },
-                    error.EndOfStream => break,
-                };
-                if (stderr_list.items.len >= max_stderr_bytes) {
-                    stderr_list.items.len = max_stderr_bytes;
-                    stderr_truncated = true;
-                    _ = try child_stderr.interface.discardRemaining();
-                    break;
-                }
+            if (allow_failures) {
+                var stderr_pipe_buf: [4096]u8 = undefined;
+                var child_stderr = child.stderr.?.readerStreaming(io, &stderr_pipe_buf);
+                const captured = try captureChildStderr(arena, &child_stderr);
+                stderr_bytes = captured.bytes;
+                stderr_truncated = captured.truncated;
             }
-            stderr_list = stderr_capture.toArrayList();
 
             const term = child.wait(io) catch |err| {
                 std.debug.print("\nerror: Couldn't execute {s}: {t}\n", .{ command.argv[0], err });
@@ -725,31 +708,21 @@ pub fn main(init: process.Init) !void {
                     if (code != 0 and !allow_failures) {
                         if (!quiet)
                             bar.?.clear(io) catch {};
-                        std.debug.print("\nerror: Benchmark {d} command '{s}' failed with exit code {d}:\n", .{
+                        std.debug.print("\nerror: Benchmark {d} command '{s}' failed with exit code {d}\n", .{
                             command_n,
                             command.raw_cmd,
                             code,
                         });
-                        if (stderr_truncated) {
-                            std.debug.print(
-                                \\────────────── truncated stderr ──────────────
-                                \\{s}
-                                \\──────────────────────────────────────────────
-                                \\
-                            ,
-                                .{stderr_list.items},
-                            );
-                        } else {
-                            std.debug.print(
-                                \\─────────────────── stderr ───────────────────
-                                \\{s}
-                                \\──────────────────────────────────────────────
-                                \\
-                            ,
-                                .{stderr_list.items},
-                            );
-                        }
+                        std.debug.print("hint: pass --allow-failures to capture stderr from failing runs\n", .{});
                         process.exit(1);
+                    }
+                    if (code != 0 and allow_failures) {
+                        std.debug.print("\nnote: sample {d} for '{s}' exited {d}\n", .{
+                            sample_index + 1,
+                            command.raw_cmd,
+                            code,
+                        });
+                        printCapturedStderr(stderr_bytes, stderr_truncated);
                     }
                 },
                 else => {
@@ -961,6 +934,62 @@ fn closePerfFds(fds: []fd_t) void {
             _ = std.os.linux.close(fd.*);
             fd.* = -1;
         }
+    }
+}
+
+const StderrCapture = struct {
+    bytes: []const u8,
+    truncated: bool,
+};
+
+// Only used with --allow-failures. Drains the child pipe so the process can exit cleanly.
+fn captureChildStderr(
+    arena: std.mem.Allocator,
+    child_stderr: *Io.File.Reader,
+) !StderrCapture {
+    var stderr_list: std.ArrayList(u8) = .empty;
+    try stderr_list.ensureTotalCapacity(arena, 4096);
+    var stderr_capture = Io.Writer.Allocating.fromArrayList(arena, &stderr_list);
+    var truncated = false;
+    while (true) {
+        _ = child_stderr.interface.stream(&stderr_capture.writer, .unlimited) catch |err| switch (err) {
+            error.ReadFailed => return child_stderr.err.?,
+            error.WriteFailed => {
+                truncated = true;
+                _ = try child_stderr.interface.discardRemaining();
+                break;
+            },
+            error.EndOfStream => break,
+        };
+        if (stderr_list.items.len >= max_stderr_bytes) {
+            stderr_list.items.len = max_stderr_bytes;
+            truncated = true;
+            _ = try child_stderr.interface.discardRemaining();
+            break;
+        }
+    }
+    return .{
+        .bytes = stderr_capture.toArrayList().items,
+        .truncated = truncated,
+    };
+}
+
+fn printCapturedStderr(bytes: []const u8, truncated: bool) void {
+    if (bytes.len == 0 and !truncated) return;
+    if (truncated) {
+        std.debug.print(
+            \\────────────── truncated stderr ──────────────
+            \\{s}
+            \\──────────────────────────────────────────────
+            \\
+        , .{bytes});
+    } else {
+        std.debug.print(
+            \\─────────────────── stderr ───────────────────
+            \\{s}
+            \\──────────────────────────────────────────────
+            \\
+        , .{bytes});
     }
 }
 
@@ -1364,6 +1393,19 @@ test "printJsonOutput writes schema envelope and config" {
 test "perf fds: one open group per command (manual strace)" {
     // strace -e perf_event_open -c zebrac --quiet --min-samples 20 --warmup 0 /bin/true
     // One command: 5 opens. Two commands: 10. Not 5 * sample_count.
+    return error.SkipZigTest;
+}
+
+test "stderr ignored unless allow_failures (manual strace)" {
+    // strace -e pipe2,read -c zebrac --quiet --min-samples 20 --warmup 0 /bin/true
+    // Default: no per-sample pipe/read on child stderr. With -f: pipe + drain on measured runs.
+    return error.SkipZigTest;
+}
+
+test "allow_failures with failing command (manual)" {
+    // zig build -Doptimize=ReleaseSmall, then:
+    // zebrac --quiet --json -f --min-samples 2 --max-samples 2 --warmup 0 '/bin/sh -c "echo marker >&2; exit 1"'
+    // Exit 0; stderr shows marker and "note: sample"; JSON has sample_count 2.
     return error.SkipZigTest;
 }
 

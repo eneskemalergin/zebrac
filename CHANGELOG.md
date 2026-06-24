@@ -19,6 +19,7 @@ zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog cov
 - Progress bar writes to **stderr**; results table stays on **stdout** (piped stdout is clean JSON/table only)
 - Unit formatting uses one plain-text path; color applied via `Io.Terminal.setColor` only (no embedded ANSI in measured widths)
 - Perf counter fds: one `perf_event_open` group per command (after warmup), not per sample, should reduce syscalls on fast benchmarks
+- Child stderr: `.ignore` on measured runs by default; pipe and capture only with `--allow-failures`
 
 ### Fixed
 
