@@ -9,6 +9,35 @@ pub const version = "0.5.3";
 /// Maximum line length for help prose. Change this one constant to re-wrap.
 pub const wrap_width: usize = 78;
 
+/// Hard upper bound for `--max-samples` (also referenced in help text).
+pub const max_samples_cap: u64 = 10_000;
+
+pub const SampleLimitsError = error{
+    MaxSamplesZero,
+    MinSamplesExceedsMax,
+};
+
+pub fn validateSampleLimits(min_samples: u64, max_samples: u64) SampleLimitsError!void {
+    if (max_samples == 0) return error.MaxSamplesZero;
+    if (min_samples > max_samples) return error.MinSamplesExceedsMax;
+}
+
+pub fn sampleLimitsErrorMessage(err: SampleLimitsError, min_samples: u64, max_samples: u64) []const u8 {
+    _ = min_samples;
+    _ = max_samples;
+    return switch (err) {
+        error.MaxSamplesZero => "--max-samples must be at least 1",
+        error.MinSamplesExceedsMax => "--min-samples cannot be greater than --max-samples",
+    };
+}
+
+/// Stderr only. Printed after measurement, before results tables on stdout.
+pub fn printRunNotes(notes: []const []const u8) void {
+    if (notes.len == 0) return;
+    std.debug.print("note:\n", .{});
+    for (notes) |line| std.debug.print("  {s}\n", .{line});
+}
+
 /// Shown when a flag is missing a value. Full help is too noisy for that case.
 pub const short_usage =
     \\Usage: zebrac [options] <command> [<command> ...]
@@ -18,20 +47,20 @@ pub const short_usage =
 ;
 
 const usage_rest =
-    \\Linux-only. Compares commands by spawning them over and over.
-    \\Reports wall time, peak RSS, and five hardware perf counters.
+    \\Linux only. Runs your command in a loop and reads perf counters.
+    \\Wall time, peak RSS, five hardware counters per sample.
     \\
     \\Fork of poop by Andrew Kelley: https://github.com/andrewrk/poop
-    \\Most of the measurement and stats code is upstream. zebrac adds
-    \\shell-like quoting, JSON export, warmup runs, and min/max sample limits.
+    \\Measurement and stats mostly upstream. zebrac adds quoting, JSON
+    \\export, warmup runs, and min/max sample flags.
     \\
     \\Usage:
     \\  zebrac [options] <command> [<command> ...]
     \\
     \\Commands:
-    \\  Each <command> is one program plus args, as a single string. No
-    \\  /bin/sh (same as poop). zebrac splits command strings with a small
-    \\  lexer (see Quoting). poop did not; quote paths that contain spaces.
+    \\  One program plus args, written as a single string. No /bin/sh
+    \\  (same as poop). zebrac splits the string itself (see Quoting).
+    \\  poop could not handle spaced paths; quote them here.
     \\
     \\  Two or more commands: first is the baseline, rest show delta %.
     \\
@@ -45,11 +74,12 @@ const usage_rest =
     \\  branch_misses    perf hardware counter
     \\
     \\Sampling:
-    \\  Warmup runs first (no counters, not counted; zebrac-only). Then
-    \\  measured runs until min-samples AND --duration are both satisfied,
-    \\  or max-samples is hit (hard cap 10000). Fast commands rack up many
-    \\  samples in the time window. Slow ones may run past the duration to
-    \\  reach min-samples.
+    \\  Warmup first (no counters, not counted). Then measured runs until
+    \\  min-samples and --duration are both met, or max-samples stops it
+    \\  (hard cap 10000). /bin/true at 500 ms can still yield hundreds of
+    \\  samples. A slow command may run past the duration to reach min.
+    \\  min-samples above max-samples: exit before spawn. A clamp note
+    \\  (if any) prints on stderr once, before the results table.
     \\
     \\Options:
     \\  Sampling:
@@ -68,19 +98,19 @@ const usage_rest =
     \\    -h, --help               show this help
     \\    --version                show version
     \\
-    \\Quoting (command strings only, not zebrac flags; zebrac-only):
+    \\Quoting (command strings, not zebrac flags):
     \\  'literal'     no escapes inside
     \\  "literal"     no escapes inside
     \\  foo\ bar      backslash escapes the next character (outside quotes)
-    \\  No $VAR, no backticks, no globs, no pipes. Direct exec only.
+    \\  No $VAR, backticks, globs, or pipes. Direct exec.
     \\
     \\  Examples:
     \\    zebrac './build/my app' './build/my app --release'
     \\    zebrac "curl -s https://example.com"
     \\
-    \\Comparison output (needs two or more commands; from poop):
-    \\  Deltas vs the first command. Uses a 95% CI; marks a change only if
-    \\  the interval clears +/-1% (stops noise from looking important):
+    \\Comparison (two or more commands; delta logic from poop):
+    \\  Vs the first command. 95% CI, but only marks a change when the
+    \\  interval clears +/-1% (tiny shifts stay dim):
     \\    ! +N%   likely slower
     \\    * -N%   likely faster
     \\    dim     probably noise
@@ -90,9 +120,8 @@ const usage_rest =
     \\  CLICOLOR_FORCE    if set (even empty), forces color in auto mode
     \\
     \\Requirements:
-    \\  Linux with perf_event_open. Not macOS, not Windows. If counters
-    \\  fail on first run, check perf_event_paranoid; the error message
-    \\  prints a sysctl hint.
+    \\  Linux, perf_event_open. Not macOS or Windows. If counters fail,
+    \\  check perf_event_paranoid; the error prints a sysctl hint.
     \\
     \\Examples:
     \\  zebrac ./app-old ./app-new
@@ -161,4 +190,16 @@ test "short_usage: points to full help" {
 test "version: non-empty semver shape" {
     try std.testing.expect(version.len >= 5);
     try std.testing.expect(std.mem.indexOf(u8, version, ".") != null);
+}
+
+test "validateSampleLimits: accepts defaults" {
+    try validateSampleLimits(5, max_samples_cap);
+}
+
+test "validateSampleLimits: rejects min above max" {
+    try std.testing.expectError(error.MinSamplesExceedsMax, validateSampleLimits(100, 10));
+}
+
+test "validateSampleLimits: rejects zero max" {
+    try std.testing.expectError(error.MaxSamplesZero, validateSampleLimits(5, 0));
 }

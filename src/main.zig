@@ -7,7 +7,6 @@ const assert = std.debug.assert;
 const progress = @import("progress.zig");
 const argv_parse = @import("argv_parse.zig");
 const help = @import("help.zig");
-const MAX_SAMPLES = 10000;
 const max_stderr_bytes = 1024 * 1024;
 
 const PerfMeasurement = struct {
@@ -85,7 +84,8 @@ pub fn main(init: process.Init) !void {
     var json_path: ?[]const u8 = null;
     var quiet = false;
     var min_samples: u64 = 5;
-    var max_samples: u64 = MAX_SAMPLES;
+    var max_samples: u64 = help.max_samples_cap;
+    var max_samples_clamped_from: ?u64 = null;
     var warmup: usize = 3;
 
     var arg_i: usize = 1;
@@ -173,11 +173,16 @@ pub fn main(init: process.Init) !void {
                 std.debug.print("'{s}' requires a number.\n{s}", .{ arg, help.short_usage });
                 process.exit(1);
             }
-            max_samples = std.fmt.parseInt(u64, args[arg_i], 10) catch |err| {
+            const parsed_max = std.fmt.parseInt(u64, args[arg_i], 10) catch |err| {
                 std.debug.print("unable to parse --max-samples argument '{s}': {t}\n", .{ args[arg_i], err });
                 process.exit(1);
             };
-            if (max_samples > MAX_SAMPLES) max_samples = MAX_SAMPLES;
+            if (parsed_max > help.max_samples_cap) {
+                max_samples_clamped_from = parsed_max;
+                max_samples = help.max_samples_cap;
+            } else {
+                max_samples = parsed_max;
+            }
         } else if (std.mem.eql(u8, arg, "-w") or std.mem.eql(u8, arg, "--warmup")) {
             arg_i += 1;
             if (arg_i >= args.len) {
@@ -198,6 +203,18 @@ pub fn main(init: process.Init) !void {
         try stdout_w.writeAll(help.usage_text);
         try stdout_w.flush();
         process.exit(1);
+    }
+
+    help.validateSampleLimits(min_samples, max_samples) catch |err| {
+        std.debug.print("error: {s}\n", .{help.sampleLimitsErrorMessage(err, min_samples, max_samples)});
+        process.exit(1);
+    };
+
+    var run_notes: std.ArrayList([]const u8) = .empty;
+    if (max_samples_clamped_from) |requested| {
+        try run_notes.append(arena, try std.fmt.allocPrint(arena, "--max-samples {d} capped at {d}", .{
+            requested, help.max_samples_cap,
+        }));
     }
 
     var bar: ?progress.ProgressBar = null;
@@ -394,7 +411,11 @@ pub fn main(init: process.Init) !void {
             process.exit(1);
         };
         command.sample_count = all_samples.len;
+    }
 
+    help.printRunNotes(run_notes.items);
+
+    for (commands.items, 1..) |*command, command_n| {
         if (terminal) |t| {
             try t.setColor(.bold);
             try stdout_w.print("Benchmark {d}", .{command_n});

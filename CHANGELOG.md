@@ -16,6 +16,8 @@ zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog cov
 ### Changed
 
 - `--help` rewritten: metrics, sampling, quoting, poop credit, shorter missing-arg errors
+- Sample limit validation: reject `min > max` and `max == 0` before run; clamp note on stderr
+- Results tables print after all commands finish measuring (notes stay off stdout)
 
 ## [0.5.3] - 2026-06-01
 
