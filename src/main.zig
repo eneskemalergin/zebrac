@@ -1,3 +1,4 @@
+//! Loop commands, sample perf counters and rusage, emit a stats table or JSON.
 const std = @import("std");
 const Io = std.Io;
 const process = std.process;
@@ -660,6 +661,9 @@ pub fn main(init: process.Init) !void {
             }
         }
 
+        openPerfGroup(&perf_fds);
+        defer closePerfFds(&perf_fds);
+
         const first_start: Io.Timestamp = .now(io, .awake);
         var sample_index: usize = 0;
         while ((sample_index < min_samples or
@@ -667,8 +671,6 @@ pub fn main(init: process.Init) !void {
             sample_index < max_samples) : (sample_index += 1)
         {
             if (!quiet) try bar.?.render(io);
-            openPerfGroup(&perf_fds);
-            defer closePerfFds(&perf_fds);
 
             _ = std.os.linux.ioctl(perf_fds[0], PERF.EVENT_IOC.DISABLE, PERF.IOC_FLAG_GROUP);
             _ = std.os.linux.ioctl(perf_fds[0], PERF.EVENT_IOC.RESET, PERF.IOC_FLAG_GROUP);
@@ -987,6 +989,8 @@ fn printPerfOpenError(err: std.posix.PerfEventOpenError, counter_name: []const u
 }
 
 fn openPerfGroup(fds: *[perf_measurements.len]fd_t) void {
+    // One perf group per command. Opening all five fds every sample was pure syscall tax.
+    // Each sample: DISABLE, RESET, spawn child, read counters, DISABLE again.
     for (perf_measurements, fds) |measurement, *perf_fd| {
         var attr: std.os.linux.perf_event_attr = .{
             .type = PERF.TYPE.HARDWARE,
@@ -1200,8 +1204,7 @@ fn printNum3SigFigs(w: *std.Io.Writer, num: f64) !void {
     }
 }
 
-// Gets either the T or Z score for 95% confidence.
-// If no `df` variable is provided, Z score is provided.
+/// 95% critical value for compare deltas. Pass `df` for Student-t; `null` uses the normal approximation (1.96).
 pub fn getStatScore95(df: ?u64) f64 {
     if (df) |dff| {
         const dfv: usize = @intCast(dff);
@@ -1356,6 +1359,12 @@ test "printJsonOutput writes schema envelope and config" {
     try std.testing.expectEqualStrings("/bin/true", parsed.value.results[0].command);
     try std.testing.expectEqual(@as(f64, 2), parsed.value.results[0].wall_time.mean);
     try std.testing.expectEqualStrings("nanoseconds", parsed.value.results[0].wall_time.unit);
+}
+
+test "perf fds: one open group per command (manual strace)" {
+    // strace -e perf_event_open -c zebrac --quiet --min-samples 20 --warmup 0 /bin/true
+    // One command: 5 opens. Two commands: 10. Not 5 * sample_count.
+    return error.SkipZigTest;
 }
 
 test "getStatScore95_dfZero_usesZScore" {

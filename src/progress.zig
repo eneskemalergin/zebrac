@@ -1,3 +1,4 @@
+//! Progress bar on stderr during sampling. Fixed-width layout for tests.
 const std = @import("std");
 const Io = std.Io;
 
@@ -57,8 +58,7 @@ const ColorCodes = struct {
                 .magenta = "",
                 .cyan = "",
                 .reset = "",
-                // Erase line (not color). `\r` alone leaves stale bar chars when the next
-                // Progress bar is on stderr; results table on stdout.
+                // `\r` alone leaves stale bar glyphs. EL clears the row. Bar on stderr, table on stdout.
                 .erase_line = "\x1b[2K\r",
             },
             .escape_codes => .{
@@ -101,7 +101,7 @@ pub const BarLayout = struct {
     }
 };
 
-/// Maps run progress to bar segments. Caps at 100% when `current >= estimate`.
+/// Maps run progress to bar segments. Cap at 100% so a full bar cannot underflow `empty_bars`.
 pub fn computeBarLayout(bar_width: usize, current: u64, estimate: u64) BarLayout {
     if (bar_width == 0) {
         return .{

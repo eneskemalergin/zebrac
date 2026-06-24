@@ -3,7 +3,7 @@
 
 const std = @import("std");
 
-/// Bump with each release. Also appears in the help header and (later) JSON output.
+/// Bump each release. Help header and JSON `zebrac_version` both read this.
 pub const version = "0.5.4";
 
 /// Maximum line length for help prose. Change this one constant to re-wrap.
