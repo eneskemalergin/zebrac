@@ -826,7 +826,15 @@ pub fn main(init: process.Init) !void {
         var file = try std.Io.Dir.cwd().createFile(io, path, .{});
         defer file.close(io);
         var file_writer = file.writerStreaming(io, &file_buf);
-        try printJsonOutput(&file_writer.interface, commands.items);
+        const json_config = JsonRunConfig{
+            .duration_ms = max_nano_seconds / std.time.ns_per_ms,
+            .min_samples = min_samples,
+            .max_samples = max_samples,
+            .max_samples_requested = max_samples_clamped_from,
+            .warmup = warmup,
+            .allow_failures = allow_failures,
+        };
+        try printJsonOutput(&file_writer.interface, commands.items, json_config);
         try file_writer.flush();
         if (!quiet) try stdout_w.print("results written to {s}\n", .{path});
     }
@@ -834,12 +842,29 @@ pub fn main(init: process.Init) !void {
     try stdout_w.flush();
 }
 
-fn printJsonOutput(w: *Io.Writer, commands: []Command) !void {
+const json_schema_version = 1;
+
+const JsonRunConfig = struct {
+    duration_ms: u64,
+    min_samples: u64,
+    max_samples: u64,
+    max_samples_requested: ?u64,
+    warmup: usize,
+    allow_failures: bool,
+};
+
+fn printJsonOutput(w: *Io.Writer, commands: []Command, config: JsonRunConfig) !void {
     var s = std.json.Stringify{
         .writer = w,
         .options = .{ .whitespace = .indent_2 },
     };
     try s.beginObject();
+    try s.objectField("schema_version");
+    try s.write(json_schema_version);
+    try s.objectField("zebrac_version");
+    try s.write(help.version);
+    try s.objectField("config");
+    try writeJsonConfig(&s, config);
     try s.objectField("results");
     try s.beginArray();
     for (commands) |cmd| {
@@ -867,6 +892,23 @@ fn printJsonOutput(w: *Io.Writer, commands: []Command) !void {
         try s.endObject();
     }
     try s.endArray();
+    try s.endObject();
+}
+
+fn writeJsonConfig(s: *std.json.Stringify, config: JsonRunConfig) !void {
+    try s.beginObject();
+    try s.objectField("duration_ms");
+    try s.write(config.duration_ms);
+    try s.objectField("min_samples");
+    try s.write(config.min_samples);
+    try s.objectField("max_samples");
+    try s.write(config.max_samples);
+    try s.objectField("max_samples_requested");
+    try s.write(config.max_samples_requested);
+    try s.objectField("warmup");
+    try s.write(config.warmup);
+    try s.objectField("allow_failures");
+    try s.write(config.allow_failures);
     try s.endObject();
 }
 
@@ -1229,6 +1271,86 @@ fn sampleWith(comptime field: []const u8, value: u64) Sample {
     };
     @field(s, field) = value;
     return s;
+}
+
+fn testMeasurement(unit: Measurement.Unit) Measurement {
+    return .{
+        .q1 = 1,
+        .median = 2,
+        .q3 = 3,
+        .min = 1,
+        .max = 3,
+        .mean = 2,
+        .std_dev = 0,
+        .outlier_count = 0,
+        .sample_count = 2,
+        .unit = unit,
+    };
+}
+
+test "printJsonOutput writes schema envelope and config" {
+    var buf: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+
+    const wall = testMeasurement(.nanoseconds);
+    const measurements: Command.Measurements = .{
+        .wall_time = wall,
+        .peak_rss = testMeasurement(.bytes),
+        .cpu_cycles = testMeasurement(.count),
+        .instructions = testMeasurement(.count),
+        .cache_references = testMeasurement(.count),
+        .cache_misses = testMeasurement(.count),
+        .branch_misses = testMeasurement(.count),
+    };
+    var commands = [_]Command{.{
+        .raw_cmd = "/bin/true",
+        .argv = &.{"/bin/true"},
+        .measurements = measurements,
+        .sample_count = 2,
+    }};
+    const config = JsonRunConfig{
+        .duration_ms = 500,
+        .min_samples = 2,
+        .max_samples = help.max_samples_cap,
+        .max_samples_requested = 50_000,
+        .warmup = 1,
+        .allow_failures = false,
+    };
+
+    try printJsonOutput(&w, &commands, config);
+
+    const Parsed = struct {
+        schema_version: u32,
+        zebrac_version: []const u8,
+        config: struct {
+            duration_ms: u64,
+            min_samples: u64,
+            max_samples: u64,
+            max_samples_requested: ?u64,
+            warmup: usize,
+            allow_failures: bool,
+        },
+        results: []struct {
+            command: []const u8,
+            sample_count: usize,
+            wall_time: struct { mean: f64, unit: []const u8 },
+        },
+    };
+
+    const parsed = try std.json.parseFromSlice(Parsed, std.testing.allocator, w.buffered(), .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(json_schema_version, parsed.value.schema_version);
+    try std.testing.expectEqualStrings(help.version, parsed.value.zebrac_version);
+    try std.testing.expectEqual(@as(u64, 500), parsed.value.config.duration_ms);
+    try std.testing.expectEqual(@as(u64, 2), parsed.value.config.min_samples);
+    try std.testing.expectEqual(@as(?u64, 50_000), parsed.value.config.max_samples_requested);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.results.len);
+    try std.testing.expectEqualStrings("/bin/true", parsed.value.results[0].command);
+    try std.testing.expectEqual(@as(f64, 2), parsed.value.results[0].wall_time.mean);
+    try std.testing.expectEqualStrings("nanoseconds", parsed.value.results[0].wall_time.unit);
 }
 
 test "getStatScore95_dfZero_usesZScore" {

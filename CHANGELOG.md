@@ -12,6 +12,7 @@ zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog cov
 ### Added
 
 - `--version` flag; help text moved to `src/help.zig`
+- JSON output: `schema_version`, `zebrac_version`, and `config` (sampling flags) alongside `results`
 
 ### Changed
 

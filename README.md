@@ -1,4 +1,4 @@
-<!-- markdownlint-disable MD033 MD036 MD041 -->
+<!-- markdownlint-disable MD033 MD036 MD038 MD041 -->
 <p align="center">
   <img src="assets/zebrac-logo-v2.svg" alt="zebrac logo" width="280">
 </p>
@@ -21,7 +21,6 @@
   <b>zebrac</b> is a fork of <a href="https://github.com/andrewrk/poop">poop</a>. Adds JSON output, warmup runs, configurable sample limits, shell-like quoting, cross-compilation, and tests.<br>
   <a href="CHANGELOG.md">CHANGELOG</a>
 </p>
-
 
 ---
 
@@ -136,10 +135,13 @@ Median in the results table uses the upper middle value when the sample count is
 
 The `--json` flag writes structured results to a file alongside the terminal output. Default path is `zebrac-results.json`. Custom path with `--json ./path/to/file.json`.
 
+The root object includes `schema_version`, `zebrac_version`, `config` (sampling flags used for the run), and `results`. When you pass multiple commands, `results[0]` is the baseline for CLI deltas.
+
 ```bash
 zebrac --json --duration 3000 './myapp'
 # terminal output shows, then: results written to zebrac-results.json
 jq '.results[0].wall_time.mean' zebrac-results.json
+jq '.config.warmup' zebrac-results.json
 ```
 
 Parse in Python:
@@ -148,6 +150,7 @@ Parse in Python:
 import json
 data = json.load(open('zebrac-results.json'))
 mean = data['results'][0]['wall_time']['mean']
+warmup = data['config']['warmup']
 ```
 
 Each measurement includes `mean`, `std_dev`, `min`, `max`, `median`, `q1`, `q3`, `outlier_count`, `sample_count`, and `unit`.
