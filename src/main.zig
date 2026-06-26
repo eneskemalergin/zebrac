@@ -27,6 +27,7 @@ const Command = struct {
     argv: []const []const u8,
     measurements: Measurements,
     sample_count: usize,
+    failed_sample_count: u64,
 
     const Measurements = struct {
         wall_time: Measurement,
@@ -568,6 +569,7 @@ pub fn main(init: process.Init) !void {
                 .argv = try cmd_argv.toOwnedSlice(arena),
                 .measurements = undefined,
                 .sample_count = undefined,
+                .failed_sample_count = 0,
             });
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             try stdout_w.writeAll(help.usage_text);
@@ -792,6 +794,7 @@ pub fn main(init: process.Init) !void {
                         process.exit(1);
                     }
                     if (code != 0 and allow_failures) {
+                        command.failed_sample_count += 1;
                         std.debug.print("\nnote: sample {d} for '{s}' exited {d}\n", .{
                             sample_index + 1,
                             command.raw_cmd,
@@ -866,6 +869,9 @@ pub fn main(init: process.Init) !void {
             try stdout_w.print("Benchmark {d}", .{command_n});
             try t.setColor(.dim);
             try stdout_w.print(" ({d} runs)", .{command.sample_count});
+            if (command.failed_sample_count > 0) {
+                try stdout_w.print(", {d} failed", .{command.failed_sample_count});
+            }
             try t.setColor(.reset);
             try stdout_w.writeAll(":");
             for (command.argv) |arg| try stdout_w.print(" {s}", .{arg});
@@ -943,6 +949,8 @@ fn printJsonOutput(w: *Io.Writer, commands: []Command, config: JsonRunConfig) !v
         try s.write(cmd.raw_cmd);
         try s.objectField("sample_count");
         try s.write(cmd.sample_count);
+        try s.objectField("failed_sample_count");
+        try s.write(cmd.failed_sample_count);
         try s.objectField("argv");
         try s.write(cmd.argv);
         inline for (@typeInfo(Command.Measurements).@"struct".fields) |field| {
@@ -1414,7 +1422,8 @@ test "printJsonOutput writes schema envelope and config" {
         .raw_cmd = "/bin/true",
         .argv = &.{"/bin/true"},
         .measurements = measurements,
-        .sample_count = 2,
+        .sample_count = 5,
+        .failed_sample_count = 2,
     }};
     const config = JsonRunConfig{
         .duration_ms = 500,
@@ -1441,6 +1450,7 @@ test "printJsonOutput writes schema envelope and config" {
         results: []struct {
             command: []const u8,
             sample_count: usize,
+            failed_sample_count: u64,
             wall_time: struct { mean: f64, unit: []const u8 },
             minor_faults: struct { mean: f64, unit: []const u8 },
             major_faults: struct { mean: f64, unit: []const u8 },
@@ -1459,6 +1469,8 @@ test "printJsonOutput writes schema envelope and config" {
     try std.testing.expectEqual(@as(?u64, 50_000), parsed.value.config.max_samples_requested);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.results.len);
     try std.testing.expectEqualStrings("/bin/true", parsed.value.results[0].command);
+    try std.testing.expectEqual(@as(usize, 5), parsed.value.results[0].sample_count);
+    try std.testing.expectEqual(@as(u64, 2), parsed.value.results[0].failed_sample_count);
     try std.testing.expectEqual(@as(f64, 2), parsed.value.results[0].wall_time.mean);
     try std.testing.expectEqualStrings("nanoseconds", parsed.value.results[0].wall_time.unit);
     try std.testing.expectEqual(@as(f64, 2), parsed.value.results[0].minor_faults.mean);

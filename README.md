@@ -69,7 +69,7 @@ Output:
   --color <mode>           auto, never, or ansi [auto]
   -q, --quiet              no progress bar or results table
   --json [<path>]          write results JSON [zebrac-results.json]
-  -f, --allow-failures     keep going if a command exits non-zero
+  -f, --allow-failures     keep going on non-zero exit; failed runs stay in means; table and JSON show failed count
 
 Information:
   -h, --help               show full usage
@@ -172,7 +172,7 @@ JSON is a **summary archive** for CI and tooling (`mean`, `std_dev`, quartiles, 
 
 The `--json` flag writes structured results to a file alongside the terminal output. Default path is `zebrac-results.json`. Custom path with `--json ./path/to/file.json`.
 
-The root object includes `schema_version`, `zebrac_version`, `config` (sampling flags used for the run), and `results` — one object per command with summarized metrics in **raw units** (nanoseconds, bytes, counts). JSON has **no** compare deltas, significance, or baseline index; those appear only in the CLI table when you pass two or more commands (first command is the baseline there).
+The root object includes `schema_version`, `zebrac_version`, `config` (sampling flags used for the run), and `results`, an array of objects per command with `sample_count`, `failed_sample_count` (non-zero only when `-f` was used and some runs exited non-zero), and summarized metrics in **raw units** (nanoseconds, bytes, counts). JSON has **no** compare deltas, significance, or baseline index; those appear only in the CLI table when you pass two or more commands (first command is the baseline there).
 
 ```bash
 zebrac --json --duration 3000 './myapp'

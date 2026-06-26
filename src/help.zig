@@ -100,7 +100,8 @@ const usage_rest =
     \\    -q, --quiet              no progress bar or results table
     \\    --json [<path>]          write results JSON [zebrac-results.json]
     \\                             (summaries only; no compare deltas)
-    \\    -f, --allow-failures     keep going if a command exits non-zero
+    \\    -f, --allow-failures     keep going on non-zero exit; failed runs stay
+    \\                             in means; table and JSON show failed count
     \\
     \\  Information:
     \\    -h, --help               show this help
