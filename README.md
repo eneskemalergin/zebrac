@@ -11,7 +11,7 @@
   <a href="https://github.com/eneskemalergin/zebrac/actions/workflows/ci.yml">
     <img src="https://github.com/eneskemalergin/zebrac/actions/workflows/ci.yml/badge.svg?style=flat-square" alt="CI">
   </a>
-  <img src="https://img.shields.io/badge/version-v0.5.4-8A2BE2?style=flat-square" alt="v0.5.4">
+  <img src="https://img.shields.io/badge/version-v0.5.6-8A2BE2?style=flat-square" alt="v0.5.6">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/license-MIT-4B9D6E?style=flat-square" alt="MIT">
   <img src="https://img.shields.io/badge/linux-x86__64%20%7C%20aarch64%20%7C%20riscv64-1793D1?style=flat-square" alt="Linux">
@@ -54,9 +54,9 @@ Linux only. Full reference: run `zebrac --help` after building (source of truth 
 
 **Commands:** one quoted string per program (no `/bin/sh`). Two or more commands: first is the baseline, rest show delta %.
 
-**Measured each run:** `wall_time`, `peak_rss`, `minor_faults`, `major_faults` (table row hidden when always zero), and five perf hardware counters (`cpu_cycles`, `instructions`, `cache_references`, `cache_misses`, `branch_misses`).
+**Measured each run:** `wall_time`, `peak_rss`, `minor_faults`, `major_faults` (table row hidden when `max` is 0; JSON always includes the field), and five perf hardware counters (`cpu_cycles`, `instructions`, `cache_references`, `cache_misses`, `branch_misses`).
 
-**Sampling:** warmup runs first (unmeasured), then samples until both `--duration` and `--min-samples` are satisfied, or `--max-samples` (cap 10000) stops the run. Rejects `min > max` or `max == 0` before spawn.
+**Sampling:** warmup runs first (unmeasured), then samples until both `--duration` and `--min-samples` are satisfied, or `--max-samples` (cap 10000) stops the run. Rejects `min < 1`, `max == 0`, or `min > max` before spawn.
 
 ```text
 Sampling:
@@ -137,9 +137,9 @@ zig build
 ./zig-out/bin/zebrac --help
 ```
 
-Default `zig build` produces a stripped **ReleaseSmall** binary (~250 KB on x86_64). For debugging: `zig build -Doptimize=Debug`. Other modes: `-Doptimize=ReleaseSafe` or `ReleaseFast`.
+Default `zig build` produces a stripped **ReleaseSmall** binary (~290 KB on x86_64; size varies by Zig version). For debugging: `zig build -Doptimize=Debug`. Other modes: `-Doptimize=ReleaseSafe` or `ReleaseFast`.
 
-Run unit tests: `zig build test` (includes JSON envelope test, lexer/stats fuzz, and stress tests). Match the GitHub Actions check job: `zig fmt --check build.zig src/` and `zig build test`. Match the build job: `zig build ci` (tests + all four ReleaseSmall cross-compiles). Optional LLVM fuzzing: `zig build test --fuzz` when your Zig toolchain supports it.
+Match CI: the **check** job runs `zig fmt --check build.zig src/` and `zig build test`; the **build** job cross-compiles ReleaseSmall for x86, x86_64, aarch64, and riscv64 Linux. Locally, `zig build ci` runs tests plus those four cross-builds in one step. Optional LLVM fuzzing: `zig build test --fuzz` when your Zig toolchain supports it.
 
 Cross-compile for aarch64, x86_64, x86, and riscv64 Linux:
 
@@ -149,11 +149,30 @@ zig build release
 
 Median in the results table uses the upper middle value when the sample count is even (index `n/2` after sorting).
 
+## Output semantics
+
+CLI table and `--json` export answer different questions. Keep the roles separate:
+
+| Concern                           | CLI table                | JSON v1 (`--json`)   |
+| --------------------------------- | ------------------------ | -------------------- |
+| Compare deltas vs first command   | Yes (`delta` column)     | No                   |
+| Significance / CI on delta        | Yes (`±` half-width)     | No                   |
+| Per-run raw samples               | No                       | No                   |
+| Display scaling (ns/us/ms, KB/MB) | Yes                      | No (raw base units)  |
+| Outliers                          | Count + % in table       | `outlier_count` only |
+| Baseline command                  | Implicit (first operand) | Not recorded         |
+
+**σ column** is the per-command sample standard deviation (spread within one run set). **Delta ±** is a separate pooled two-sample compare interval (CLI only).
+
+**Equal means:** compare delta shows bare `0%` with no `±` band when the difference is zero and compare is defined; too few samples or a ~zero baseline yields `n/a`.
+
+JSON is a **summary archive** for CI and tooling (`mean`, `std_dev`, quartiles, etc.). Recompute compare semantics yourself or wait for schema v2 (planned). Full detail: `zebrac --help` (Comparison and Sampling sections).
+
 ## Tooling Usage
 
 The `--json` flag writes structured results to a file alongside the terminal output. Default path is `zebrac-results.json`. Custom path with `--json ./path/to/file.json`.
 
-The root object includes `schema_version`, `zebrac_version`, `config` (sampling flags used for the run), and `results`. When you pass multiple commands, `results[0]` is the baseline for CLI deltas.
+The root object includes `schema_version`, `zebrac_version`, `config` (sampling flags used for the run), and `results` — one object per command with summarized metrics in **raw units** (nanoseconds, bytes, counts). JSON has **no** compare deltas, significance, or baseline index; those appear only in the CLI table when you pass two or more commands (first command is the baseline there).
 
 ```bash
 zebrac --json --duration 3000 './myapp'

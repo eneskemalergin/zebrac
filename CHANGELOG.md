@@ -7,11 +7,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog covers the poop lineage starting at v0.3.0 and tracks zebrac-specific changes after [0.5.0] section.
 
-## [0.5.6] - Unreleased
+## [0.5.6] - 2026-06-25
 
 ### Fixed
 
 - Compare delta shows `0%` without a minus when means are equal (P1 #2); no compare CI on zero-diff; skips pooled half-width calc when `|diff%| < 1e-9`
+- Reject `--min-samples 0` before spawn (audit P3 #33); same rule as `--max-samples`
+
+### Changed
+
+- `help.version`, README badge, and JSON `zebrac_version` aligned to `0.5.6`
+- Help Comparison section documents σ vs delta `±`, zero-diff `0%`, and when `n/a` applies
+- Help and README document `major_faults` table hide vs JSON always emit (audit note F)
+- README Output semantics: CLI vs JSON v1 parity; JSON has no compare deltas
+- README binary size (~290 KB ReleaseSmall x86_64) and CI instructions match `.github/workflows/ci.yml`
+
+### Removed
+
+- SkipZigTest strace/manual placeholders from `src/main.zig` (use gitignored `tools/` for spawn smoke)
 
 ## [0.5.5] - 2026-06-24
 

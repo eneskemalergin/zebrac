@@ -4,7 +4,7 @@
 const std = @import("std");
 
 /// Bump each release. Help header and JSON `zebrac_version` both read this.
-pub const version = "0.5.4";
+pub const version = "0.5.6";
 
 /// Maximum line length for help prose. Change this one constant to re-wrap.
 pub const wrap_width: usize = 78;
@@ -13,11 +13,13 @@ pub const wrap_width: usize = 78;
 pub const max_samples_cap: u64 = 10_000;
 
 pub const SampleLimitsError = error{
+    MinSamplesZero,
     MaxSamplesZero,
     MinSamplesExceedsMax,
 };
 
 pub fn validateSampleLimits(min_samples: u64, max_samples: u64) SampleLimitsError!void {
+    if (min_samples == 0) return error.MinSamplesZero;
     if (max_samples == 0) return error.MaxSamplesZero;
     if (min_samples > max_samples) return error.MinSamplesExceedsMax;
 }
@@ -26,6 +28,7 @@ pub fn sampleLimitsErrorMessage(err: SampleLimitsError, min_samples: u64, max_sa
     _ = min_samples;
     _ = max_samples;
     return switch (err) {
+        error.MinSamplesZero => "--min-samples must be at least 1",
         error.MaxSamplesZero => "--max-samples must be at least 1",
         error.MinSamplesExceedsMax => "--min-samples cannot be greater than --max-samples",
     };
@@ -68,7 +71,8 @@ const usage_rest =
     \\  wall_time        elapsed time, nanoseconds
     \\  peak_rss         peak resident set size, bytes
     \\  minor_faults     page faults not requiring disk I/O
-    \\  major_faults     page faults requiring disk I/O (hidden when always zero)
+    \\  major_faults     page faults requiring disk I/O (table row hidden
+    \\                   when max is 0; always present in --json output)
     \\  cpu_cycles       perf hardware counter
     \\  instructions     perf hardware counter
     \\  cache_references perf hardware counter
@@ -80,8 +84,9 @@ const usage_rest =
     \\  min-samples and --duration are both met, or max-samples stops it
     \\  (hard cap 10000). /bin/true at 500 ms can still yield hundreds of
     \\  samples. A slow command may run past the duration to reach min.
-    \\  min-samples above max-samples: exit before spawn. A clamp note
-    \\  (if any) prints on stderr once, before the results table.
+    \\  min/max-samples must be at least 1; min above max: exit before
+    \\  spawn. A clamp note (if any) prints on stderr once, before the
+    \\  results table.
     \\
     \\Options:
     \\  Sampling:
@@ -94,6 +99,7 @@ const usage_rest =
     \\    --color <mode>           auto, never, or ansi [auto]
     \\    -q, --quiet              no progress bar or results table
     \\    --json [<path>]          write results JSON [zebrac-results.json]
+    \\                             (summaries only; no compare deltas)
     \\    -f, --allow-failures     keep going if a command exits non-zero
     \\
     \\  Information:
@@ -205,6 +211,10 @@ test "validateSampleLimits: accepts defaults" {
 
 test "validateSampleLimits: rejects min above max" {
     try std.testing.expectError(error.MinSamplesExceedsMax, validateSampleLimits(100, 10));
+}
+
+test "validateSampleLimits: rejects zero min" {
+    try std.testing.expectError(error.MinSamplesZero, validateSampleLimits(0, 10));
 }
 
 test "validateSampleLimits: rejects zero max" {
