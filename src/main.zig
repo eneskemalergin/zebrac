@@ -4,7 +4,6 @@ const Io = std.Io;
 const process = std.process;
 const PERF = std.os.linux.PERF;
 const fd_t = std.posix.fd_t;
-const assert = std.debug.assert;
 const progress = @import("progress.zig");
 const argv_parse = @import("argv_parse.zig");
 const help = @import("help.zig");
@@ -460,7 +459,6 @@ fn writeDelta(
     first_m: ?Measurement,
     color_enabled: bool,
 ) !void {
-    try TableLayout.padVis(w, vis, layout.deltaStartVis());
     const col_start = layout.deltaStartVis();
 
     if (first_m == null) {
@@ -486,9 +484,7 @@ fn writeDelta(
         try writeZeroDiffDeltaPlain(w, m, f);
         if (color_enabled) try terminal.setColor(.reset);
         var measure_buf: [64]u8 = undefined;
-        var measure_w = std.Io.Writer.fixed(&measure_buf);
-        try writeDeltaPlain(&measure_w, m, first_m);
-        vis.* = col_start + visibleLen(measure_w.buffered());
+        vis.* = col_start + measureDelta(&measure_buf, m, first_m);
         try TableLayout.padVis(w, vis, col_start + layout.delta_w);
         return;
     }
@@ -502,8 +498,6 @@ fn writeDelta(
     };
     const is_sig = deltaIsSignificant(diff_mean_percent, half_val);
 
-    var tail_buf: [32]u8 = undefined;
-    var tail_w = std.Io.Writer.fixed(&tail_buf);
     if (m.mean > f.mean) {
         if (is_sig) {
             try w.writeAll("! ");
@@ -524,14 +518,11 @@ fn writeDelta(
         }
         try w.writeAll("-");
     }
-    try tail_w.print("{d: >5.1}% ± {d: >4.1}%", .{ @abs(diff_mean_percent), half_val });
-    try w.writeAll(tail_w.buffered());
+    try w.print("{d: >5.1}% ± {d: >4.1}%", .{ @abs(diff_mean_percent), half_val });
     if (color_enabled) try terminal.setColor(.reset);
 
     var measure_buf: [64]u8 = undefined;
-    var measure_w = std.Io.Writer.fixed(&measure_buf);
-    try writeDeltaPlain(&measure_w, m, first_m);
-    vis.* = col_start + visibleLen(measure_w.buffered());
+    vis.* = col_start + measureDelta(&measure_buf, m, first_m);
     try TableLayout.padVis(w, vis, col_start + layout.delta_w);
 }
 
@@ -1300,9 +1291,7 @@ fn printMeasurement(
 }
 
 fn printNum3SigFigs(w: *std.Io.Writer, num: f64) !void {
-    if (num >= 1000) {
-        try w.print("{d:.0}", .{num});
-    } else if (num >= 100) {
+    if (num >= 100) {
         try w.print("{d:.0}", .{num});
     } else if (num >= 10) {
         try w.print("{d:.1}", .{num});
@@ -1476,25 +1465,6 @@ test "printJsonOutput writes schema envelope and config" {
     try std.testing.expectEqualStrings("count", parsed.value.results[0].minor_faults.unit);
     try std.testing.expectEqual(@as(f64, 2), parsed.value.results[0].major_faults.mean);
     try std.testing.expectEqualStrings("count", parsed.value.results[0].major_faults.unit);
-}
-
-test "perf fds: one open group per command (manual strace)" {
-    // strace -e perf_event_open -c zebrac --quiet --min-samples 20 --warmup 0 /bin/true
-    // One command: 5 opens. Two commands: 10. Not 5 * sample_count.
-    return error.SkipZigTest;
-}
-
-test "stderr ignored unless allow_failures (manual strace)" {
-    // strace -e pipe2,read -c zebrac --quiet --min-samples 20 --warmup 0 /bin/true
-    // Default: no per-sample pipe/read on child stderr. With -f: pipe + drain on measured runs.
-    return error.SkipZigTest;
-}
-
-test "allow_failures with failing command (manual)" {
-    // zig build -Doptimize=ReleaseSmall, then:
-    // zebrac --quiet --json -f --min-samples 2 --max-samples 2 --warmup 0 '/bin/sh -c "echo marker >&2; exit 1"'
-    // Exit 0; stderr shows marker and "note: sample"; JSON has sample_count 2.
-    return error.SkipZigTest;
 }
 
 test "getStatScore95_dfZero_usesZScore" {

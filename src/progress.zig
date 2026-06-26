@@ -27,7 +27,7 @@ const half_bar_left = "╸";
 const half_bar_right = "╺";
 const WIDTH_PADDING: usize = 100;
 
-pub fn getScreenWidth(io: Io, file: Io.File) usize {
+fn getScreenWidth(io: Io, file: Io.File) usize {
     var winsize: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
     const err = (io.operate(.{ .device_io_control = .{
         .file = file,
@@ -102,7 +102,7 @@ pub const BarLayout = struct {
 };
 
 /// Maps run progress to bar segments. Cap at 100% so a full bar cannot underflow `empty_bars`.
-pub fn computeBarLayout(bar_width: usize, current: u64, estimate: u64) BarLayout {
+fn computeBarLayout(bar_width: usize, current: u64, estimate: u64) BarLayout {
     if (bar_width == 0) {
         return .{
             .bar_width = 0,
@@ -233,7 +233,7 @@ pub const ProgressBar = struct {
 };
 
 /// Format a single progress line into `buf` (fixed terminal width for tests and previews).
-pub fn formatPreviewLine(
+fn formatPreviewLine(
     buf: []u8,
     mode: Io.Terminal.Mode,
     term_cols: usize,
