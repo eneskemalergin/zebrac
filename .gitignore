@@ -18,5 +18,6 @@ zig-*/
 ref/
 data/
 plan/
+tools/
 # assets/
 experiments/

@@ -110,9 +110,12 @@ const usage_rest =
     \\    zebrac './build/my app' './build/my app --release'
     \\    zebrac "curl -s https://example.com"
     \\
-    \\Comparison (two or more commands; delta logic from poop):
-    \\  Vs the first command. 95% CI, but only marks a change when the
-    \\  interval clears +/-1% (tiny shifts stay dim):
+\\Comparison (two or more commands; delta logic from poop):
+\\  Vs the first command. σ is spread within one command; delta ± is
+\\  compare uncertainty (nonzero diffs only). Equal means: 0% with no
+\\  ± band. Too few samples or ~zero baseline mean: n/a.
+\\  95% CI on deltas; marks a change only when the interval clears
+\\  +/-1% (tiny shifts stay dim):
     \\    ! +N%   likely slower
     \\    * -N%   likely faster
     \\    dim     probably noise

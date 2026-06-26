@@ -7,7 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog covers the poop lineage starting at v0.3.0 and tracks zebrac-specific changes after [0.5.0] section.
 
-## [0.6.0] - Unreleased
+## [0.5.6] - Unreleased
+
+### Fixed
+
+- Compare delta shows `0%` without a minus when means are equal (P1 #2); no compare CI on zero-diff; skips pooled half-width calc when `|diff%| < 1e-9`
 
 ## [0.5.5] - 2026-06-24
 
