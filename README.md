@@ -54,7 +54,7 @@ Linux only. Full reference: run `zebrac --help` after building (source of truth 
 
 **Commands:** one quoted string per program (no `/bin/sh`). Two or more commands: first is the baseline, rest show delta %.
 
-**Measured each run:** `wall_time`, `peak_rss`, `minor_faults`, `major_faults` (table row hidden when `max` is 0; JSON always includes the field), and five perf hardware counters (`cpu_cycles`, `instructions`, `cache_references`, `cache_misses`, `branch_misses`).
+**Measured each run:** `wall_time`, `peak_rss`, `minor_faults`, `major_faults` (table row hidden when `max` is 0; JSON always includes the field), and five perf hardware counters (`cpu_cycles`, `instructions`, `cache_references`, `cache_misses`, `branch_misses`). With `-f`, `wall_time` ends when the child exits; post-exit stderr drain for the first failure note is excluded, and later failing samples do not pipe stderr.
 
 **Sampling:** warmup runs first (unmeasured), then samples until both `--duration` and `--min-samples` are satisfied, or `--max-samples` (cap 10000) stops the run. Rejects `min < 1`, `max == 0`, or `min > max` before spawn. With `-f`, non-zero exit on a measured run does not stop the benchmark; see **Output semantics** and `zebrac --help` (Sampling).
 
@@ -128,7 +128,7 @@ Not supported: `$VAR`, `` `cmd` ``, globs, `|`, `>`, `&`. UTF-8 paths work as by
 
 ## Build from Source
 
-Tested with [Zig](https://ziglang.org/) 0.16.0 (bundled in this repo).
+Tested with [Zig](https://ziglang.org/) 0.16.0 (download into `zig-0.16.0/` at repo root, gitignored).
 
 ```bash
 git clone https://github.com/eneskemalergin/zebrac

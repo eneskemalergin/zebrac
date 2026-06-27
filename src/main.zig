@@ -745,14 +745,20 @@ pub fn main(init: process.Init) !void {
         var sample_index: usize = 0;
         var failure_stderr_verbose_shown = false;
         var suppressed_failure_notes: u64 = 0;
+        var perf_ioctl_warned = false;
         while ((sample_index < min_samples or
             first_start.untilNow(io, .awake).toNanoseconds() < max_nano_seconds) and
-            sample_index < max_samples) : (sample_index += 1)
+            sample_index < max_samples)
         {
             if (!quiet) try bar.?.render(io);
 
-            _ = std.os.linux.ioctl(perf_fds[0], PERF.EVENT_IOC.DISABLE, PERF.IOC_FLAG_GROUP);
-            _ = std.os.linux.ioctl(perf_fds[0], PERF.EVENT_IOC.RESET, PERF.IOC_FLAG_GROUP);
+            resetPerfGroupBeforeSample(perf_fds[0]) catch |err| {
+                if (!perf_ioctl_warned) {
+                    printPerfIoctlSkipWarn(err, command.raw_cmd);
+                    perf_ioctl_warned = true;
+                }
+                continue;
+            };
 
             const start: Io.Timestamp = .now(io, .awake);
 
@@ -793,7 +799,14 @@ pub fn main(init: process.Init) !void {
                 duration = start.untilNow(io, .awake);
             }
 
-            _ = std.os.linux.ioctl(perf_fds[0], PERF.EVENT_IOC.DISABLE, PERF.IOC_FLAG_GROUP);
+            disablePerfGroupAfterSample(perf_fds[0]) catch |err| {
+                if (!perf_ioctl_warned) {
+                    printPerfIoctlSkipWarn(err, command.raw_cmd);
+                    perf_ioctl_warned = true;
+                }
+                continue;
+            };
+
             const usage = child.resource_usage_statistics;
             const peak_rss = usage.getMaxRss() orelse 0;
             const faults = readPageFaults(usage);
@@ -844,9 +857,11 @@ pub fn main(init: process.Init) !void {
                 .branch_misses = try readPerfFd(perf_fds[4]),
             });
 
+            sample_index += 1;
+
             if (!quiet) {
                 bar.?.estimate = est_total: {
-                    const cur_samples: u64 = sample_index + 1;
+                    const cur_samples: u64 = sample_index;
                     var ns_per_sample: u64 = @intCast(@divTrunc((first_start.untilNow(io, .awake).toNanoseconds()), cur_samples));
                     if (ns_per_sample == 0) ns_per_sample = 1;
                     const estimate = std.math.divCeil(u64, max_nano_seconds, ns_per_sample) catch unreachable;
@@ -1228,6 +1243,51 @@ fn printCapturedStderr(bytes: []const u8, truncated: bool) void {
             \\
         , .{bytes});
     }
+}
+
+const PerfSampleResetError = error{
+    BadLeaderFd,
+    DisableFailed,
+    ResetFailed,
+};
+
+const PerfSampleDisableError = error{
+    BadLeaderFd,
+    DisableFailed,
+};
+
+fn perfGroupIoctl(leader_fd: fd_t, request: u32) (error{ BadLeaderFd, IoctlFailed })!void {
+    if (leader_fd == -1) return error.BadLeaderFd;
+    const rc = std.os.linux.ioctl(leader_fd, request, PERF.IOC_FLAG_GROUP);
+    switch (std.os.linux.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.IoctlFailed,
+    }
+}
+
+fn resetPerfGroupBeforeSample(leader_fd: fd_t) PerfSampleResetError!void {
+    if (leader_fd == -1) return error.BadLeaderFd;
+    perfGroupIoctl(leader_fd, PERF.EVENT_IOC.DISABLE) catch return error.DisableFailed;
+    perfGroupIoctl(leader_fd, PERF.EVENT_IOC.RESET) catch return error.ResetFailed;
+}
+
+fn disablePerfGroupAfterSample(leader_fd: fd_t) PerfSampleDisableError!void {
+    if (leader_fd == -1) return error.BadLeaderFd;
+    perfGroupIoctl(leader_fd, PERF.EVENT_IOC.DISABLE) catch return error.DisableFailed;
+}
+
+fn printPerfIoctlSkipWarn(err: anyerror, command: []const u8) void {
+    const detail: []const u8 = switch (err) {
+        error.BadLeaderFd => "perf group leader is not open",
+        error.DisableFailed => "PERF_EVENT_IOC.DISABLE failed",
+        error.ResetFailed => "PERF_EVENT_IOC.RESET failed",
+        error.IoctlFailed => "perf ioctl failed",
+        else => "perf ioctl failed",
+    };
+    std.debug.print(
+        "\nwarn: skipping measured sample for '{s}': {s}; remaining samples continue\n",
+        .{ command, detail },
+    );
 }
 
 fn printPerfOpenError(err: std.posix.PerfEventOpenError, counter_name: []const u8) noreturn {
@@ -1653,6 +1713,26 @@ test "StderrCaptureBuf caps append and resets" {
     buf.reset();
     try std.testing.expectEqual(@as(usize, 0), buf.len);
     try std.testing.expect(!buf.truncated);
+}
+
+test "resetPerfGroupBeforeSample rejects closed leader fd" {
+    try std.testing.expectError(error.BadLeaderFd, resetPerfGroupBeforeSample(-1));
+    try std.testing.expectError(error.BadLeaderFd, disablePerfGroupAfterSample(-1));
+}
+
+test "resetPerfGroupBeforeSample fails on non-perf fd" {
+    var pipefd: [2]i32 = undefined;
+    const pr = std.os.linux.pipe(&pipefd);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(pr));
+    defer {
+        _ = std.os.linux.close(pipefd[0]);
+        _ = std.os.linux.close(pipefd[1]);
+    }
+    resetPerfGroupBeforeSample(pipefd[0]) catch |err| switch (err) {
+        error.DisableFailed, error.ResetFailed => return,
+        else => return err,
+    };
+    return error.TestUnexpectedError;
 }
 
 test "getStatScore95_dfZero_usesZScore" {
