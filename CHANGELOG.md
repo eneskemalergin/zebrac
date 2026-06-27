@@ -13,6 +13,10 @@ zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog cov
 
 - `failed_sample_count` per command in JSON `results[]` (always present); table header `(N runs, M failed)` when `M > 0`, else `(N runs)`; failed measured runs still contribute to means; warmup not counted
 
+### Changed
+
+- With `-f` / `--allow-failures`, `wall_time` ends when the child exits; draining stderr for failure notes happens after timing and is not included in `wall_time`
+
 ## [0.5.6] - 2026-06-25
 
 ### Fixed

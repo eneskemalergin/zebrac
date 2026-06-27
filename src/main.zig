@@ -762,19 +762,23 @@ pub fn main(init: process.Init) !void {
 
             var stderr_bytes: []const u8 = "";
             var stderr_truncated = false;
+            var term: process.Child.Term = undefined;
+            var duration: Io.Duration = undefined;
+
             if (allow_failures) {
-                var stderr_pipe_buf: [4096]u8 = undefined;
-                var child_stderr = child.stderr.?.readerStreaming(io, &stderr_pipe_buf);
-                const captured = try captureChildStderr(arena, &child_stderr);
-                stderr_bytes = captured.bytes;
-                stderr_truncated = captured.truncated;
+                const measured = try waitChildAndCaptureStderr(io, &child, start, arena);
+                term = measured.term;
+                duration = measured.duration;
+                stderr_bytes = measured.capture.bytes;
+                stderr_truncated = measured.capture.truncated;
+            } else {
+                term = child.wait(io) catch |err| {
+                    std.debug.print("\nerror: Couldn't execute {s}: {t}\n", .{ command.argv[0], err });
+                    process.exit(1);
+                };
+                duration = start.untilNow(io, .awake);
             }
 
-            const term = child.wait(io) catch |err| {
-                std.debug.print("\nerror: Couldn't execute {s}: {t}\n", .{ command.argv[0], err });
-                process.exit(1);
-            };
-            const duration = start.untilNow(io, .awake);
             _ = std.os.linux.ioctl(perf_fds[0], PERF.EVENT_IOC.DISABLE, PERF.IOC_FLAG_GROUP);
             const usage = child.resource_usage_statistics;
             const peak_rss = usage.getMaxRss() orelse 0;
@@ -1023,35 +1027,154 @@ const StderrCapture = struct {
     truncated: bool,
 };
 
-// Only used with --allow-failures. Drains the child pipe so the process can exit cleanly.
-fn captureChildStderr(
+fn posixWaitStatusToTerm(status: u32) process.Child.Term {
+    const W = std.os.linux.W;
+    return if (W.IFEXITED(status))
+        .{ .exited = W.EXITSTATUS(status) }
+    else if (W.IFSIGNALED(status))
+        .{ .signal = W.TERMSIG(status) }
+    else if (W.IFSTOPPED(status))
+        .{ .stopped = W.STOPSIG(status) }
+    else
+        .{ .unknown = status };
+}
+
+fn closeChildPipes(child: *process.Child) void {
+    if (child.stdin) |stdin_file| {
+        _ = std.os.linux.close(stdin_file.handle);
+        child.stdin = null;
+    }
+    if (child.stdout) |stdout_file| {
+        _ = std.os.linux.close(stdout_file.handle);
+        child.stdout = null;
+    }
+    if (child.stderr) |stderr_file| {
+        _ = std.os.linux.close(stderr_file.handle);
+        child.stderr = null;
+    }
+    child.id = null;
+}
+
+fn appendStderrBytes(
     arena: std.mem.Allocator,
-    child_stderr: *Io.File.Reader,
-) !StderrCapture {
-    var stderr_list: std.ArrayList(u8) = .empty;
-    try stderr_list.ensureTotalCapacity(arena, 4096);
-    var stderr_capture = Io.Writer.Allocating.fromArrayList(arena, &stderr_list);
-    var truncated = false;
+    list: *std.ArrayList(u8),
+    data: []const u8,
+    truncated: *bool,
+) !void {
+    if (truncated.*) return;
+    const room = max_stderr_bytes -| list.items.len;
+    if (room == 0) {
+        truncated.* = true;
+        return;
+    }
+    const take = @min(data.len, room);
+    try list.appendSlice(arena, data[0..take]);
+    if (take < data.len) truncated.* = true;
+}
+
+fn readStderrFd(
+    stderr_fd: fd_t,
+    list: *std.ArrayList(u8),
+    arena: std.mem.Allocator,
+    truncated: *bool,
+) !void {
+    var buf: [4096]u8 = undefined;
     while (true) {
-        _ = child_stderr.interface.stream(&stderr_capture.writer, .unlimited) catch |err| switch (err) {
-            error.ReadFailed => return child_stderr.err.?,
-            error.WriteFailed => {
-                truncated = true;
-                _ = try child_stderr.interface.discardRemaining();
-                break;
-            },
-            error.EndOfStream => break,
+        const n = std.posix.read(stderr_fd, &buf) catch |err| switch (err) {
+            error.WouldBlock => return,
+            else => return err,
         };
-        if (stderr_list.items.len >= max_stderr_bytes) {
-            stderr_list.items.len = max_stderr_bytes;
-            truncated = true;
-            _ = try child_stderr.interface.discardRemaining();
-            break;
+        if (n == 0) return;
+        try appendStderrBytes(arena, list, buf[0..n], truncated);
+        if (truncated.* and list.items.len >= max_stderr_bytes) {
+            list.items.len = max_stderr_bytes;
+            discardStderrRemainder(stderr_fd);
+            return;
         }
     }
+}
+
+fn discardStderrRemainder(stderr_fd: fd_t) void {
+    var buf: [4096]u8 = undefined;
+    while (std.posix.read(stderr_fd, &buf)) |_| {} else |_| return;
+}
+
+/// Under `-f`: reap the child, end wall time at exit, then drain stderr (post-exit
+/// drain is not counted). Interleaves stderr reads while the child runs so a full
+/// pipe cannot deadlock `wait`.
+fn waitChildAndCaptureStderr(
+    io: Io,
+    child: *process.Child,
+    start: Io.Timestamp,
+    arena: std.mem.Allocator,
+) !struct { term: process.Child.Term, duration: Io.Duration, capture: StderrCapture } {
+    const stderr_fd = child.stderr.?.handle;
+    const pid: std.os.linux.pid_t = @intCast(child.id.?);
+
+    var stderr_list: std.ArrayList(u8) = .empty;
+    try stderr_list.ensureTotalCapacity(arena, 4096);
+    var truncated = false;
+
+    const initial_flags: u32 = blk: {
+        const r = std.os.linux.fcntl(stderr_fd, std.os.linux.F.GETFL, 0);
+        switch (std.os.linux.errno(r)) {
+            .SUCCESS => break :blk @intCast(r),
+            else => |err| {
+                std.debug.print("\nerror: fcntl on child stderr: {t}\n", .{err});
+                process.exit(1);
+            },
+        }
+    };
+    const nonblock: u32 = @bitCast(std.os.linux.O{ .NONBLOCK = true });
+    _ = std.os.linux.fcntl(stderr_fd, std.os.linux.F.SETFL, initial_flags | nonblock);
+
+    var term: process.Child.Term = undefined;
+    var duration: Io.Duration = undefined;
+
+    var child_done = false;
+    while (!child_done) {
+        try readStderrFd(stderr_fd, &stderr_list, arena, &truncated);
+
+        var status: u32 = undefined;
+        var ru: std.os.linux.rusage = undefined;
+        const ru_ptr: ?*std.os.linux.rusage = if (child.request_resource_usage_statistics) &ru else null;
+
+        const w = std.os.linux.wait4(pid, &status, std.os.linux.W.NOHANG, ru_ptr);
+        switch (std.os.linux.errno(w)) {
+            .SUCCESS => {
+                if (w == 0) {
+                    std.Thread.yield() catch {};
+                    continue;
+                }
+                duration = start.untilNow(io, .awake);
+                term = posixWaitStatusToTerm(status);
+                if (child.request_resource_usage_statistics) child.resource_usage_statistics.rusage = ru;
+                child_done = true;
+            },
+            .INTR => continue,
+            else => |err| {
+                std.debug.print("\nerror: wait for child: {t}\n", .{err});
+                process.exit(1);
+            },
+        }
+    }
+
+    _ = std.os.linux.fcntl(stderr_fd, std.os.linux.F.SETFL, initial_flags);
+    if (!truncated) {
+        readStderrFd(stderr_fd, &stderr_list, arena, &truncated) catch {};
+    } else {
+        discardStderrRemainder(stderr_fd);
+    }
+
+    closeChildPipes(child);
+
     return .{
-        .bytes = stderr_capture.toArrayList().items,
-        .truncated = truncated,
+        .term = term,
+        .duration = duration,
+        .capture = .{
+            .bytes = stderr_list.items,
+            .truncated = truncated,
+        },
     };
 }
 
