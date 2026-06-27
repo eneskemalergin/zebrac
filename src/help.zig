@@ -88,6 +88,12 @@ const usage_rest =
     \\  spawn. A clamp note (if any) prints on stderr once, before the
     \\  results table.
     \\
+    \\  -f (--allow-failures): non-zero exit on a measured run does not
+    \\  stop the benchmark. Failed runs stay in means. Warmup is not
+    \\  counted in failed_sample_count. First failure prints captured
+    \\  stderr on stderr; later failures summarize there. Table header
+    \\  and --json report failed_sample_count.
+    \\
     \\Options:
     \\  Sampling:
     \\    -d, --duration <ms>      sampling time budget per command [5000]
@@ -100,9 +106,7 @@ const usage_rest =
     \\    -q, --quiet              no progress bar or results table
     \\    --json [<path>]          write results JSON [zebrac-results.json]
     \\                             (summaries only; no compare deltas)
-    \\    -f, --allow-failures     keep going on non-zero exit (measured runs; not
-    \\                             warmup); failures in means; table header (N runs,
-    \\                             M failed) when M > 0; JSON field always
+    \\    -f, --allow-failures     keep sampling on non-zero exit
     \\
     \\  Information:
     \\    -h, --help               show this help

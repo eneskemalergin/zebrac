@@ -17,6 +17,10 @@ zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog cov
 
 - With `-f` / `--allow-failures`, `wall_time` ends when the child exits; draining stderr for failure notes happens after timing and is not included in `wall_time`
 
+### Fixed
+
+- Under `-f`, only the first failing sample prints full stderr; later failures summarize as `N more failed samples` (stderr omitted)
+
 ## [0.5.6] - 2026-06-25
 
 ### Fixed

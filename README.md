@@ -56,7 +56,7 @@ Linux only. Full reference: run `zebrac --help` after building (source of truth 
 
 **Measured each run:** `wall_time`, `peak_rss`, `minor_faults`, `major_faults` (table row hidden when `max` is 0; JSON always includes the field), and five perf hardware counters (`cpu_cycles`, `instructions`, `cache_references`, `cache_misses`, `branch_misses`).
 
-**Sampling:** warmup runs first (unmeasured), then samples until both `--duration` and `--min-samples` are satisfied, or `--max-samples` (cap 10000) stops the run. Rejects `min < 1`, `max == 0`, or `min > max` before spawn.
+**Sampling:** warmup runs first (unmeasured), then samples until both `--duration` and `--min-samples` are satisfied, or `--max-samples` (cap 10000) stops the run. Rejects `min < 1`, `max == 0`, or `min > max` before spawn. With `-f`, non-zero exit on a measured run does not stop the benchmark; see **Output semantics** and `zebrac --help` (Sampling).
 
 ```text
 Sampling:
@@ -69,7 +69,7 @@ Output:
   --color <mode>           auto, never, or ansi [auto]
   -q, --quiet              no progress bar or results table
   --json [<path>]          write results JSON [zebrac-results.json]
-  -f, --allow-failures     keep going on non-zero exit (measured runs; not warmup); failures in means; table `(N runs, M failed)` when needed; JSON `failed_sample_count` always
+  -f, --allow-failures     keep sampling on non-zero exit
 
 Information:
   -h, --help               show full usage

@@ -741,6 +741,8 @@ pub fn main(init: process.Init) !void {
 
         const first_start: Io.Timestamp = .now(io, .awake);
         var sample_index: usize = 0;
+        var failure_stderr_verbose_shown = false;
+        var suppressed_failure_notes: u64 = 0;
         while ((sample_index < min_samples or
             first_start.untilNow(io, .awake).toNanoseconds() < max_nano_seconds) and
             sample_index < max_samples) : (sample_index += 1)
@@ -799,12 +801,17 @@ pub fn main(init: process.Init) !void {
                     }
                     if (code != 0 and allow_failures) {
                         command.failed_sample_count += 1;
-                        std.debug.print("\nnote: sample {d} for '{s}' exited {d}\n", .{
-                            sample_index + 1,
-                            command.raw_cmd,
-                            code,
-                        });
-                        printCapturedStderr(stderr_bytes, stderr_truncated);
+                        if (!failure_stderr_verbose_shown) {
+                            failure_stderr_verbose_shown = true;
+                            std.debug.print("\nnote: sample {d} for '{s}' exited {d}\n", .{
+                                sample_index + 1,
+                                command.raw_cmd,
+                                code,
+                            });
+                            printCapturedStderr(stderr_bytes, stderr_truncated);
+                        } else {
+                            suppressed_failure_notes += 1;
+                        }
                     }
                 },
                 else => {
@@ -834,6 +841,19 @@ pub fn main(init: process.Init) !void {
                     break :est_total @intCast(@min(max_samples, @max(cur_samples, estimate, min_samples)));
                 };
                 bar.?.current += 1;
+            }
+        }
+
+        if (suppressed_failure_notes > 0) {
+            if (suppressed_failure_notes == 1) {
+                std.debug.print("\nnote: 1 more failed sample for '{s}' (stderr omitted)\n", .{
+                    command.raw_cmd,
+                });
+            } else {
+                std.debug.print("\nnote: {d} more failed samples for '{s}' (stderr omitted)\n", .{
+                    suppressed_failure_notes,
+                    command.raw_cmd,
+                });
             }
         }
 
