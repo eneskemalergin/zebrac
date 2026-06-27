@@ -705,11 +705,6 @@ pub fn main(init: process.Init) !void {
     var perf_fds: [perf_measurements.len]fd_t = @splat(-1);
 
     var stderr_capture_buf: ?StderrCaptureBuf = null;
-    if (allow_failures) {
-        stderr_capture_buf = .{
-            .storage = try arena.alloc(u8, max_stderr_bytes),
-        };
-    }
 
     for (commands.items, 1..) |*command, command_n| {
         var samples: std.ArrayList(Sample) = .empty;
@@ -761,11 +756,13 @@ pub fn main(init: process.Init) !void {
 
             const start: Io.Timestamp = .now(io, .awake);
 
+            const capture_failure_stderr = allow_failures and !failure_stderr_verbose_shown;
+
             var child = try process.spawn(io, .{
                 .argv = command.argv,
                 .stdin = .inherit,
                 .stdout = .ignore,
-                .stderr = if (allow_failures) .pipe else .ignore,
+                .stderr = if (capture_failure_stderr) .pipe else .ignore,
                 .request_resource_usage_statistics = true,
             });
 
@@ -774,7 +771,12 @@ pub fn main(init: process.Init) !void {
             var term: process.Child.Term = undefined;
             var duration: Io.Duration = undefined;
 
-            if (allow_failures) {
+            if (capture_failure_stderr) {
+                if (stderr_capture_buf == null) {
+                    stderr_capture_buf = .{
+                        .storage = try arena.alloc(u8, max_stderr_bytes),
+                    };
+                }
                 const capture_buf = &stderr_capture_buf.?;
                 capture_buf.reset();
                 const measured = try waitChildAndCaptureStderr(io, &child, start, capture_buf);
@@ -1635,6 +1637,22 @@ test "printJsonOutput writes schema envelope and config" {
     try std.testing.expectEqualStrings("count", parsed.value.results[0].minor_faults.unit);
     try std.testing.expectEqual(@as(f64, 2), parsed.value.results[0].major_faults.mean);
     try std.testing.expectEqualStrings("count", parsed.value.results[0].major_faults.unit);
+}
+
+test "StderrCaptureBuf caps append and resets" {
+    var storage: [8]u8 = undefined;
+    var buf: StderrCaptureBuf = .{ .storage = &storage };
+    buf.append("abc");
+    try std.testing.expectEqual(@as(usize, 3), buf.len);
+    try std.testing.expect(!buf.truncated);
+    buf.append("defghij");
+    try std.testing.expect(buf.truncated);
+    try std.testing.expectEqual(@as(usize, 8), buf.len);
+    const view = buf.view();
+    try std.testing.expectEqualStrings("abcdefgh", view.bytes);
+    buf.reset();
+    try std.testing.expectEqual(@as(usize, 0), buf.len);
+    try std.testing.expect(!buf.truncated);
 }
 
 test "getStatScore95_dfZero_usesZScore" {

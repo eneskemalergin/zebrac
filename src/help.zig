@@ -91,8 +91,9 @@ const usage_rest =
     \\  -f (--allow-failures): non-zero exit on a measured run does not
     \\  stop the benchmark. Failed runs stay in means. Warmup is not
     \\  counted in failed_sample_count. First failure prints captured
-    \\  stderr on stderr; later failures summarize there. Table header
-    \\  and --json report failed_sample_count.
+    \\  stderr on stderr; later failures summarize there. After that note,
+    \\  later samples do not pipe stderr (normal wait). Table header and
+    \\  --json report failed_sample_count.
     \\
     \\Options:
     \\  Sampling:
