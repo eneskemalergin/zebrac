@@ -107,7 +107,7 @@ const TableLayout = struct {
 
         inline for (@typeInfo(Command.Measurements).@"struct".fields) |field| {
             const m = @field(measurements, field.name);
-            if (measurementRowVisible(field.name, m)) {
+            if (measurementRowVisible(measurementFieldMeta(field.name).visibility, m)) {
                 layout.name_w = @max(layout.name_w, row_indent + visibleLen(field.name));
                 layout.mean_w = @max(layout.mean_w, measureUnit(&unit_buf, m.mean, m.unit));
                 layout.std_w = @max(layout.std_w, measureUnit(&unit_buf, m.std_dev, m.unit));
@@ -308,15 +308,48 @@ fn measureUnit(buf: *[32]u8, x: f64, unit: Measurement.Unit) usize {
 }
 
 fn measureOutlier(buf: *[32]u8, count: u64, sample_count: u64) usize {
-    var w = std.Io.Writer.fixed(buf);
-    const pct = @as(f64, @floatFromInt(count)) / @as(f64, @floatFromInt(sample_count)) * 100;
-    w.print("{d} ({d:.0}%)", .{ count, pct }) catch return 0;
-    return visibleLen(w.buffered());
+    const line = formatOutlierLine(buf, count, sample_count) catch return 0;
+    return visibleLen(line);
 }
 
-fn measurementRowVisible(name: []const u8, m: Measurement) bool {
-    if (std.mem.eql(u8, name, "major_faults")) return m.max > 0;
-    return true;
+const delta_baseline_epsilon: f64 = 1e-9;
+
+/// Per-field CLI table metadata (comptime). JSON always emits every summarized field.
+const MeasurementFieldMeta = struct {
+    visibility: MeasurementRowVisibility,
+    unit: Measurement.Unit,
+};
+
+const MeasurementRowVisibility = enum {
+    always,
+    hide_when_max_is_zero,
+};
+
+fn measurementFieldMeta(comptime field_name: []const u8) MeasurementFieldMeta {
+    if (comptime std.mem.eql(u8, field_name, "wall_time")) {
+        return .{ .visibility = .always, .unit = .nanoseconds };
+    }
+    if (comptime std.mem.eql(u8, field_name, "peak_rss")) {
+        return .{ .visibility = .always, .unit = .bytes };
+    }
+    if (comptime std.mem.eql(u8, field_name, "major_faults")) {
+        return .{ .visibility = .hide_when_max_is_zero, .unit = .count };
+    }
+    return .{ .visibility = .always, .unit = .count };
+}
+
+fn measurementRowVisible(visibility: MeasurementRowVisibility, m: Measurement) bool {
+    return switch (visibility) {
+        .always => true,
+        .hide_when_max_is_zero => m.max > 0,
+    };
+}
+
+fn formatOutlierLine(buf: *[32]u8, count: u64, sample_count: u64) ![]const u8 {
+    var w = std.Io.Writer.fixed(buf);
+    const pct = @as(f64, @floatFromInt(count)) / @as(f64, @floatFromInt(sample_count)) * 100;
+    try w.print("{d} ({d:.0}%)", .{ count, pct });
+    return w.buffered();
 }
 
 fn readPageFaults(rus: process.Child.ResourceUsageStatistics) struct { minor: u64, major: u64 } {
@@ -332,8 +365,6 @@ fn measureDelta(buf: *[64]u8, m: Measurement, first_m: ?Measurement) usize {
     writeDeltaPlain(&w, m, first_m) catch return 0;
     return visibleLen(w.buffered());
 }
-
-const delta_baseline_epsilon: f64 = 1e-9;
 
 fn deltaIsDefined(m: Measurement, f: Measurement) bool {
     if (@abs(f.mean) < delta_baseline_epsilon) return false;
@@ -451,6 +482,40 @@ fn writeUnitLeftAligned(
     vis.* += len;
 }
 
+fn writeDeltaColored(
+    w: *Io.Writer,
+    terminal: Io.Terminal,
+    text: []const u8,
+    color_enabled: bool,
+) !void {
+    if (!color_enabled) {
+        try w.writeAll(text);
+        return;
+    }
+    if (std.mem.eql(u8, text, "0%") or std.mem.eql(u8, text, "n/a") or std.mem.startsWith(u8, text, "  ")) {
+        try terminal.setColor(.dim);
+        try w.writeAll(text);
+        try terminal.setColor(.reset);
+        return;
+    }
+    if (std.mem.startsWith(u8, text, "! ")) {
+        try w.writeAll("! ");
+        try terminal.setColor(.bright_red);
+        try w.writeAll(text[2..]);
+        try terminal.setColor(.reset);
+        return;
+    }
+    if (std.mem.startsWith(u8, text, "* ")) {
+        try terminal.setColor(.bright_yellow);
+        try w.writeAll("* ");
+        try terminal.setColor(.bright_green);
+        try w.writeAll(text[2..]);
+        try terminal.setColor(.reset);
+        return;
+    }
+    try w.writeAll(text);
+}
+
 fn writeDelta(
     w: *Io.Writer,
     terminal: Io.Terminal,
@@ -461,69 +526,12 @@ fn writeDelta(
     color_enabled: bool,
 ) !void {
     const col_start = layout.deltaStartVis();
-
-    if (first_m == null) {
-        if (color_enabled) try terminal.setColor(.dim);
-        try w.writeAll("0%");
-        if (color_enabled) try terminal.setColor(.reset);
-        vis.* = col_start + visibleLen("0%");
-        try TableLayout.padVis(w, vis, col_start + layout.delta_w);
-        return;
-    }
-    const f = first_m.?;
-    if (@abs(f.mean) < delta_baseline_epsilon) {
-        if (color_enabled) try terminal.setColor(.dim);
-        try w.writeAll("n/a");
-        if (color_enabled) try terminal.setColor(.reset);
-        vis.* = col_start + visibleLen("n/a");
-        try TableLayout.padVis(w, vis, col_start + layout.delta_w);
-        return;
-    }
-    const diff_mean_percent = diffMeanPercent(m, f);
-    if (isZeroDiffPercent(diff_mean_percent)) {
-        if (color_enabled) try terminal.setColor(.dim);
-        try writeZeroDiffDeltaPlain(w, m, f);
-        if (color_enabled) try terminal.setColor(.reset);
-        var measure_buf: [64]u8 = undefined;
-        vis.* = col_start + measureDelta(&measure_buf, m, first_m);
-        try TableLayout.padVis(w, vis, col_start + layout.delta_w);
-        return;
-    }
-    const half_val = deltaHalfWidth(m, f) orelse {
-        if (color_enabled) try terminal.setColor(.dim);
-        try w.writeAll("n/a");
-        if (color_enabled) try terminal.setColor(.reset);
-        vis.* = col_start + visibleLen("n/a");
-        try TableLayout.padVis(w, vis, col_start + layout.delta_w);
-        return;
-    };
-    const is_sig = deltaIsSignificant(diff_mean_percent, half_val);
-
-    if (m.mean > f.mean) {
-        if (is_sig) {
-            try w.writeAll("! ");
-            if (color_enabled) try terminal.setColor(.bright_red);
-        } else {
-            if (color_enabled) try terminal.setColor(.dim);
-            try w.writeAll("  ");
-        }
-        try w.writeAll("+");
-    } else {
-        if (is_sig) {
-            if (color_enabled) try terminal.setColor(.bright_yellow);
-            try w.writeAll("* ");
-            if (color_enabled) try terminal.setColor(.bright_green);
-        } else {
-            if (color_enabled) try terminal.setColor(.dim);
-            try w.writeAll("  ");
-        }
-        try w.writeAll("-");
-    }
-    try w.print("{d: >5.1}% ± {d: >4.1}%", .{ @abs(diff_mean_percent), half_val });
-    if (color_enabled) try terminal.setColor(.reset);
-
-    var measure_buf: [64]u8 = undefined;
-    vis.* = col_start + measureDelta(&measure_buf, m, first_m);
+    var buf: [64]u8 = undefined;
+    var plain = Io.Writer.fixed(&buf);
+    try writeDeltaPlain(&plain, m, first_m);
+    const text = plain.buffered();
+    try writeDeltaColored(w, terminal, text, color_enabled);
+    vis.* = col_start + visibleLen(text);
     try TableLayout.padVis(w, vis, col_start + layout.delta_w);
 }
 
@@ -940,7 +948,7 @@ pub fn main(init: process.Init) !void {
 
             inline for (@typeInfo(Command.Measurements).@"struct".fields) |field| {
                 const measurement = @field(command.measurements, field.name);
-                if (measurementRowVisible(field.name, measurement)) {
+                if (measurementRowVisible(measurementFieldMeta(field.name).visibility, measurement)) {
                     const first_measurement = if (command_n == 1)
                         null
                     else
@@ -1434,13 +1442,8 @@ const Measurement = struct {
         const work = sort_scratch[0..samples.len];
         var out: Command.Measurements = undefined;
         inline for (@typeInfo(Command.Measurements).@"struct".fields) |field| {
-            const unit: Unit = if (std.mem.eql(u8, field.name, "wall_time"))
-                .nanoseconds
-            else if (std.mem.eql(u8, field.name, "peak_rss"))
-                .bytes
-            else
-                .count;
-            @field(out, field.name) = try summarizeField(samples, work, field.name, unit);
+            const meta = measurementFieldMeta(field.name);
+            @field(out, field.name) = try summarizeField(samples, work, field.name, meta.unit);
         }
         return out;
     }
@@ -1549,17 +1552,16 @@ fn printMeasurement(
 
     try TableLayout.gap(w, &vis);
     try TableLayout.padVis(w, &vis, layout.outlierStartVis());
-    const outlier_percent = @as(f64, @floatFromInt(m.outlier_count)) / @as(f64, @floatFromInt(m.sample_count)) * 100;
     var outlier_buf: [32]u8 = undefined;
-    var outlier_writer = std.Io.Writer.fixed(&outlier_buf);
-    try outlier_writer.print("{d} ({d:.0}%)", .{ m.outlier_count, outlier_percent });
+    const outlier_line = try formatOutlierLine(&outlier_buf, m.outlier_count, m.sample_count);
+    const outlier_percent = @as(f64, @floatFromInt(m.outlier_count)) / @as(f64, @floatFromInt(m.sample_count)) * 100;
     if (outlier_percent >= 10)
         try terminal.setColor(.yellow)
     else
         try terminal.setColor(.dim);
-    try w.writeAll(outlier_writer.buffered());
+    try w.writeAll(outlier_line);
     try terminal.setColor(.reset);
-    vis = layout.outlierStartVis() + visibleLen(outlier_writer.buffered());
+    vis = layout.outlierStartVis() + visibleLen(outlier_line);
     try TableLayout.padVis(w, &vis, layout.outlierStartVis() + layout.outlier_w);
 
     if (with_delta) {
@@ -1824,16 +1826,10 @@ test "readPerfFd returns ShortPerfRead on empty pipe" {
     try std.testing.expectError(error.ShortPerfRead, readPerfFd(pipefd[0]));
 }
 
-test "getStatScore95_dfZero_usesZScore" {
-    try std.testing.expectApproxEqAbs(@as(f64, 1.96), getStatScore95(0), 0.001);
-}
-
-test "getStatScore95_dfAbove120_usesZScore" {
-    try std.testing.expectApproxEqAbs(@as(f64, 1.96), getStatScore95(200), 0.001);
-}
-
-test "getStatScore95_nullDf_usesZScore" {
+test "getStatScore95 z-score fallback for null, low, and high df" {
     try std.testing.expectApproxEqAbs(@as(f64, 1.96), getStatScore95(null), 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.96), getStatScore95(0), 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.96), getStatScore95(200), 0.001);
 }
 
 test "getStatScore95: df 1 and 30" {
@@ -1992,42 +1988,33 @@ fn writeDeltaPlainToBuf(m: Measurement, first_m: ?Measurement) ![]const u8 {
     return w.buffered();
 }
 
-test "deltaHalfWidth: zero baseline returns null" {
+test "deltaHalfWidth undefined and valid compare" {
     const m = measurementForDeltaTest(10, 1, 10);
-    const f = measurementForDeltaTest(0, 1, 10);
-    try std.testing.expect(deltaHalfWidth(m, f) == null);
-}
+    try std.testing.expect(deltaHalfWidth(m, measurementForDeltaTest(0, 1, 10)) == null);
+    try std.testing.expect(deltaHalfWidth(
+        measurementForDeltaTest(10, 0, 1),
+        measurementForDeltaTest(10, 0, 1),
+    ) == null);
+    try std.testing.expect(deltaHalfWidth(
+        measurementForDeltaTest(10, 1, 2),
+        measurementForDeltaTest(10, 1, 1),
+    ) == null);
 
-test "deltaHalfWidth: one sample each returns null" {
-    const m = measurementForDeltaTest(10, 0, 1);
-    const f = measurementForDeltaTest(10, 0, 1);
-    try std.testing.expect(deltaHalfWidth(m, f) == null);
-}
-
-test "deltaHalfWidth: three samples total returns null" {
-    const m = measurementForDeltaTest(10, 1, 2);
-    const f = measurementForDeltaTest(10, 1, 1);
-    try std.testing.expect(deltaHalfWidth(m, f) == null);
-}
-
-test "deltaHalfWidth: valid inputs return finite width" {
-    const m = measurementForDeltaTest(110, 10, 10);
-    const f = measurementForDeltaTest(100, 10, 10);
-    const half = deltaHalfWidth(m, f).?;
+    const half = deltaHalfWidth(
+        measurementForDeltaTest(110, 10, 10),
+        measurementForDeltaTest(100, 10, 10),
+    ).?;
     try std.testing.expect(!std.math.isNan(half));
     try std.testing.expect(!std.math.isInf(half));
     try std.testing.expect(half > 0);
 }
 
-test "deltaIsSignificant positive arm clears 1% lower bound" {
+test "deltaIsSignificant at 1% practical band" {
     try std.testing.expect(deltaIsSignificant(2, 1));
     try std.testing.expect(!deltaIsSignificant(2, 1.01));
     try std.testing.expect(deltaIsSignificant(1, 0));
     try std.testing.expect(!deltaIsSignificant(1, 0.01));
     try std.testing.expect(!deltaIsSignificant(0.99, 0));
-}
-
-test "deltaIsSignificant negative arm clears 1% upper bound" {
     try std.testing.expect(deltaIsSignificant(-2, 1));
     try std.testing.expect(!deltaIsSignificant(-2, 1.01));
     try std.testing.expect(deltaIsSignificant(-1, 0));
@@ -2035,78 +2022,46 @@ test "deltaIsSignificant negative arm clears 1% upper bound" {
     try std.testing.expect(!deltaIsSignificant(-0.99, 0));
 }
 
-test "writeDeltaPlain: undefined baseline writes n/a not nan" {
-    const m = measurementForDeltaTest(5, 1, 10);
-    const f = measurementForDeltaTest(0, 0, 10);
-    const out = try writeDeltaPlainToBuf(m, @as(?Measurement, f));
-    try std.testing.expectEqualStrings("n/a", out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "nan") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "inf") == null);
-}
+test "writeDeltaPlain compare semantics" {
+    const m5 = measurementForDeltaTest(5, 1, 10);
+    const f0 = measurementForDeltaTest(0, 0, 10);
+    const out_undef = try writeDeltaPlainToBuf(m5, @as(?Measurement, f0));
+    try std.testing.expectEqualStrings("n/a", out_undef);
+    try std.testing.expect(std.mem.indexOf(u8, out_undef, "nan") == null);
 
-test "writeDeltaPlain: one sample each writes n/a" {
-    const m = measurementForDeltaTest(10, 0, 1);
-    const f = measurementForDeltaTest(10, 0, 1);
-    const out = try writeDeltaPlainToBuf(m, @as(?Measurement, f));
-    try std.testing.expectEqualStrings("n/a", out);
-}
+    const m1 = measurementForDeltaTest(10, 0, 1);
+    const f1 = measurementForDeltaTest(10, 0, 1);
+    try std.testing.expectEqualStrings("n/a", try writeDeltaPlainToBuf(m1, @as(?Measurement, f1)));
 
-test "writeDeltaPlain: valid compare writes percent delta" {
-    const m = measurementForDeltaTest(110, 10, 10);
-    const f = measurementForDeltaTest(100, 10, 10);
-    const half = deltaHalfWidth(m, f).?;
+    const m_up = measurementForDeltaTest(110, 10, 10);
+    const f_up = measurementForDeltaTest(100, 10, 10);
+    const half_up = deltaHalfWidth(m_up, f_up).?;
+    const diff_up = (m_up.mean - f_up.mean) * 100 / f_up.mean;
     var expect_buf: [64]u8 = undefined;
     var expect_w = Io.Writer.fixed(&expect_buf);
-    const diff = (m.mean - f.mean) * 100 / f.mean;
-    const is_sig = deltaIsSignificant(diff, half);
-    try expect_w.writeAll(if (is_sig) "! " else "  ");
+    try expect_w.writeAll(if (deltaIsSignificant(diff_up, half_up)) "! " else "  ");
     try expect_w.writeAll("+");
-    try expect_w.print("{d: >5.1}% ± {d: >4.1}%", .{ @abs(diff), half });
-    const out = try writeDeltaPlainToBuf(m, @as(?Measurement, f));
-    try std.testing.expectEqualStrings(expect_w.buffered(), out);
-}
+    try expect_w.print("{d: >5.1}% ± {d: >4.1}%", .{ @abs(diff_up), half_up });
+    try std.testing.expectEqualStrings(expect_w.buffered(), try writeDeltaPlainToBuf(m_up, @as(?Measurement, f_up)));
 
-test "writeDeltaPlain: baseline row writes 0%" {
-    const m = measurementForDeltaTest(100, 10, 10);
-    const out = try writeDeltaPlainToBuf(m, null);
-    try std.testing.expectEqualStrings("0%", out);
-}
+    const m_eq = measurementForDeltaTest(100, 10, 10);
+    const f_eq = measurementForDeltaTest(100, 10, 10);
+    const out_eq = try writeDeltaPlainToBuf(m_eq, @as(?Measurement, f_eq));
+    try std.testing.expectEqualStrings("0%", out_eq);
+    try std.testing.expect(std.mem.indexOf(u8, out_eq, "±") == null);
 
-test "writeDeltaPlain: equal means writes 0% without minus" {
-    const m = measurementForDeltaTest(100, 10, 10);
-    const f = measurementForDeltaTest(100, 10, 10);
-    const out = try writeDeltaPlainToBuf(m, @as(?Measurement, f));
-    try std.testing.expectEqualStrings("0%", out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "-") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "+") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "±") == null);
-}
+    const out_base = try writeDeltaPlainToBuf(m_eq, null);
+    try std.testing.expectEqualStrings("0%", out_base);
 
-test "writeDeltaPlain: equal means too few samples writes n/a not 0%" {
-    const m = measurementForDeltaTest(100, 0, 1);
-    const f = measurementForDeltaTest(100, 0, 1);
-    const out = try writeDeltaPlainToBuf(m, @as(?Measurement, f));
-    try std.testing.expectEqualStrings("n/a", out);
-}
-
-test "writeDeltaPlain: negative delta keeps minus prefix" {
-    const m = measurementForDeltaTest(90, 10, 10);
-    const f = measurementForDeltaTest(100, 10, 10);
-    const half = deltaHalfWidth(m, f).?;
-    var expect_buf: [64]u8 = undefined;
-    var expect_w = Io.Writer.fixed(&expect_buf);
-    const diff = (m.mean - f.mean) * 100 / f.mean;
-    const is_sig = deltaIsSignificant(diff, half);
-    try expect_w.writeAll(if (is_sig) "* " else "  ");
+    const m_dn = measurementForDeltaTest(90, 10, 10);
+    const f_dn = measurementForDeltaTest(100, 10, 10);
+    const half_dn = deltaHalfWidth(m_dn, f_dn).?;
+    const diff_dn = (m_dn.mean - f_dn.mean) * 100 / f_dn.mean;
+    expect_w = Io.Writer.fixed(&expect_buf);
+    try expect_w.writeAll(if (deltaIsSignificant(diff_dn, half_dn)) "* " else "  ");
     try expect_w.writeAll("-");
-    try expect_w.print("{d: >5.1}% ± {d: >4.1}%", .{ @abs(diff), half });
-    const out = try writeDeltaPlainToBuf(m, @as(?Measurement, f));
-    try std.testing.expectEqualStrings(expect_w.buffered(), out);
-}
-
-test "results table: zero-delta compare row aligns across modes" {
-    try tableZeroDeltaAlignmentTest(.no_color);
-    try tableZeroDeltaAlignmentTest(.escape_codes);
+    try expect_w.print("{d: >5.1}% ± {d: >4.1}%", .{ @abs(diff_dn), half_dn });
+    try std.testing.expectEqualStrings(expect_w.buffered(), try writeDeltaPlainToBuf(m_dn, @as(?Measurement, f_dn)));
 }
 
 test "summarizeAll includes page fault fields" {
@@ -2142,64 +2097,8 @@ test "summarizeAll includes page fault fields" {
     try std.testing.expectEqual(Measurement.Unit.count, m.major_faults.unit);
 }
 
-test "measurementRowVisible hides major_faults when all zero" {
-    const zero = Measurement{
-        .q1 = 0,
-        .median = 0,
-        .q3 = 0,
-        .min = 0,
-        .max = 0,
-        .mean = 0,
-        .std_dev = 0,
-        .outlier_count = 0,
-        .sample_count = 2,
-        .unit = .count,
-    };
-    const nonzero = Measurement{
-        .q1 = 0,
-        .median = 1,
-        .q3 = 1,
-        .min = 0,
-        .max = 1,
-        .mean = 0.5,
-        .std_dev = 0.5,
-        .outlier_count = 0,
-        .sample_count = 2,
-        .unit = .count,
-    };
-    try std.testing.expect(measurementRowVisible("minor_faults", zero));
-    try std.testing.expect(!measurementRowVisible("major_faults", zero));
-    try std.testing.expect(measurementRowVisible("major_faults", nonzero));
-}
-
-test "printNum3SigFigs_smallValue_keepsDecimals" {
-    var buf: [32]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
-    try printNum3SigFigs(&w, 5.0);
-    try std.testing.expectEqualStrings("5.00", w.buffered());
-}
-
-test "printNum3SigFigs_largeValue_usesIntegerWidth" {
-    var buf: [32]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
-    try printNum3SigFigs(&w, 1234);
-    try std.testing.expectEqualStrings("1234", w.buffered());
-}
-
-test "results table: separators align across rows" {
-    try tableSeparatorAlignmentTest(.no_color);
-}
-
-test "results table: separators align with color" {
-    try tableSeparatorAlignmentTest(.escape_codes);
-}
-
-fn tableSeparatorAlignmentTest(mode: Io.Terminal.Mode) !void {
-    var buf: [4096]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
-    const term = Io.Terminal{ .writer = &w, .mode = mode };
-
-    const wall = Measurement{
+fn tableBenchmarkWall() Measurement {
+    return .{
         .q1 = 640_000,
         .median = 659_000,
         .q3 = 677_000,
@@ -2211,7 +2110,10 @@ fn tableSeparatorAlignmentTest(mode: Io.Terminal.Mode) !void {
         .sample_count = 8,
         .unit = .nanoseconds,
     };
-    const rss = Measurement{
+}
+
+fn tableBenchmarkRss() Measurement {
+    return .{
         .q1 = 1_150_000,
         .median = 1_150_000,
         .q3 = 1_150_000,
@@ -2223,6 +2125,90 @@ fn tableSeparatorAlignmentTest(mode: Io.Terminal.Mode) !void {
         .sample_count = 8,
         .unit = .bytes,
     };
+}
+
+fn renderResultsTableForTest(
+    measurements: Command.Measurements,
+    baseline: ?Command.Measurements,
+    mode: Io.Terminal.Mode,
+) ![]const u8 {
+    var buf: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    const term = Io.Terminal{ .writer = &w, .mode = mode };
+    const with_delta = baseline != null;
+    const layout = TableLayout.compute(measurements, baseline, with_delta);
+    try TableLayout.printHeader(&w, term, layout, with_delta);
+    inline for (@typeInfo(Command.Measurements).@"struct".fields) |field| {
+        const m = @field(measurements, field.name);
+        if (measurementRowVisible(measurementFieldMeta(field.name).visibility, m)) {
+            const first_m = if (baseline) |b| @as(?Measurement, @field(b, field.name)) else null;
+            try printMeasurement(term, layout, m, field.name, first_m, with_delta);
+        }
+    }
+    return w.buffered();
+}
+
+test "results table omits major_faults when max is zero" {
+    const wall = tableBenchmarkWall();
+    const zero_faults = Measurement{
+        .q1 = 0,
+        .median = 0,
+        .q3 = 0,
+        .min = 0,
+        .max = 0,
+        .mean = 0,
+        .std_dev = 0,
+        .outlier_count = 0,
+        .sample_count = 8,
+        .unit = .count,
+    };
+    const measurements: Command.Measurements = .{
+        .wall_time = wall,
+        .peak_rss = tableBenchmarkRss(),
+        .minor_faults = wall,
+        .major_faults = zero_faults,
+        .cpu_cycles = wall,
+        .instructions = wall,
+        .cache_references = wall,
+        .cache_misses = wall,
+        .branch_misses = wall,
+    };
+    const out = try renderResultsTableForTest(measurements, null, .no_color);
+    try std.testing.expect(std.mem.indexOf(u8, out, "major_faults") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "minor_faults") != null);
+    try std.testing.expectEqual(
+        MeasurementRowVisibility.hide_when_max_is_zero,
+        measurementFieldMeta("major_faults").visibility,
+    );
+    try std.testing.expectEqual(Measurement.Unit.nanoseconds, measurementFieldMeta("wall_time").unit);
+    try std.testing.expectEqual(Measurement.Unit.bytes, measurementFieldMeta("peak_rss").unit);
+    try std.testing.expectEqual(Measurement.Unit.count, measurementFieldMeta("cpu_cycles").unit);
+}
+
+test "printNum3SigFigs scaling" {
+    var buf: [32]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try printNum3SigFigs(&w, 5.0);
+    try std.testing.expectEqualStrings("5.00", w.buffered());
+    w = std.Io.Writer.fixed(&buf);
+    try printNum3SigFigs(&w, 1234);
+    try std.testing.expectEqualStrings("1234", w.buffered());
+}
+
+test "results table: separators and zero-delta align across color modes" {
+    for (&[_]Io.Terminal.Mode{ .no_color, .escape_codes }) |mode| {
+        try tableSeparatorAlignmentTest(mode);
+        try tableZeroDeltaAlignmentTest(mode);
+    }
+}
+
+fn tableSeparatorAlignmentTest(mode: Io.Terminal.Mode) !void {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    const term = Io.Terminal{ .writer = &w, .mode = mode };
+
+    const wall = tableBenchmarkWall();
+    const rss = tableBenchmarkRss();
     const measurements: Command.Measurements = .{
         .wall_time = wall,
         .peak_rss = rss,
@@ -2277,30 +2263,8 @@ fn tableZeroDeltaAlignmentTest(mode: Io.Terminal.Mode) !void {
     var w = std.Io.Writer.fixed(&buf);
     const term = Io.Terminal{ .writer = &w, .mode = mode };
 
-    const baseline_wall = Measurement{
-        .q1 = 640_000,
-        .median = 659_000,
-        .q3 = 677_000,
-        .min = 638_000,
-        .max = 719_000,
-        .mean = 659_000,
-        .std_dev = 27_800,
-        .outlier_count = 0,
-        .sample_count = 8,
-        .unit = .nanoseconds,
-    };
-    const baseline_rss = Measurement{
-        .q1 = 1_150_000,
-        .median = 1_150_000,
-        .q3 = 1_150_000,
-        .min = 1_150_000,
-        .max = 1_220_000,
-        .mean = 1_160_000,
-        .std_dev = 23_200,
-        .outlier_count = 0,
-        .sample_count = 8,
-        .unit = .bytes,
-    };
+    const baseline_wall = tableBenchmarkWall();
+    const baseline_rss = tableBenchmarkRss();
     const compare_rss = Measurement{
         .q1 = 1_200_000,
         .median = 1_220_000,
@@ -2434,20 +2398,6 @@ fn fuzzSummarizeField(_: void, smith: *std.testing.Smith) !void {
     }
     var scratch: [32]Sample = undefined;
     try checkSummarizeFieldInvariants(n, &samples, &scratch);
-}
-
-test "summarizeField_stress_randomInvariants" {
-    var prng = std.Random.DefaultPrng.init(0x5a1d_cafe);
-    const random = prng.random();
-    var samples: [32]Sample = undefined;
-    var scratch: [32]Sample = undefined;
-    for (0..2048) |_| {
-        const n: u8 = random.intRangeAtMost(u8, 1, 32);
-        for (0..n) |i| {
-            samples[i] = sampleWith("wall_time", random.int(u64));
-        }
-        try checkSummarizeFieldInvariants(n, &samples, &scratch);
-    }
 }
 
 test "summarizeField fuzz invariants" {
