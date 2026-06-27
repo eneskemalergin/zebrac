@@ -26,6 +26,18 @@ const bar_char = "━";
 const half_bar_left = "╸";
 const half_bar_right = "╺";
 const WIDTH_PADDING: usize = 100;
+const progress_run_suffix = " runs ";
+
+/// True when the progress bar should run during sampling (`!quiet` and stdout is a TTY).
+pub fn samplingShowsProgressBar(quiet: bool, stdout_is_tty: bool) bool {
+    return !quiet and stdout_is_tty;
+}
+
+/// Heuristic for tests and smoke: progress lines contain a run count and percent field.
+pub fn outputLooksLikeProgressLine(buf: []const u8) bool {
+    return std.mem.indexOf(u8, buf, progress_run_suffix) != null and
+        std.mem.indexOf(u8, buf, "%") != null;
+}
 
 fn getScreenWidth(io: Io, file: Io.File) usize {
     var winsize: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
@@ -137,7 +149,7 @@ pub const ProgressBar = struct {
     current: u64,
     estimate: u64,
     writer: *Io.Writer,
-    screen: Io.File,
+    term_cols: usize,
     colors: ColorCodes,
     buf: Io.Writer.Allocating,
     last_rendered: Io.Timestamp,
@@ -149,15 +161,15 @@ pub const ProgressBar = struct {
         mode: Io.Terminal.Mode,
         screen: Io.File,
     ) !ProgressBar {
-        const width = getScreenWidth(io, screen);
-        const buf: Io.Writer.Allocating = try .initCapacity(allocator, width + WIDTH_PADDING);
+        const term_cols = getScreenWidth(io, screen);
+        const buf: Io.Writer.Allocating = try .initCapacity(allocator, term_cols + WIDTH_PADDING);
         return .{
             .spinner = .init(),
             .last_rendered = .now(io, .awake),
             .current = 0,
             .estimate = 1,
             .writer = writer,
-            .screen = screen,
+            .term_cols = term_cols,
             .colors = ColorCodes.init(mode),
             .buf = buf,
         };
@@ -180,9 +192,9 @@ pub const ProgressBar = struct {
         const bar_width = term_cols - Spinner.frame1.len - " 10000 runs ".len - " 100% ".len;
         const layout = computeBarLayout(bar_width, current, estimate);
 
-        try bw.print("{s}{s}{s} {d: >5} runs ", .{
+        try bw.print("{s}{s}{s} {d: >5}{s}", .{
             colors.cyan, spinner_frame, colors.reset,
-            current,
+            current, progress_run_suffix,
         });
 
         try bw.print("{s}", .{colors.pink});
@@ -212,7 +224,7 @@ pub const ProgressBar = struct {
         }
         try self.clear(io);
         self.last_rendered = now;
-        const width = getScreenWidth(io, self.screen);
+        const width = self.term_cols;
         if (width < 23) return;
         try self.buf.ensureTotalCapacity(width + WIDTH_PADDING);
         const bw = &self.buf.writer;
@@ -420,7 +432,26 @@ test "render at 100 percent completes without hang" {
     try bar.render(io);
     const line = out_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, line, " 100% ") != null);
-    try std.testing.expectEqual(countSubstring(line, bar_char), barSlotCount(getScreenWidth(io, Io.File.stdout())));
+    try std.testing.expectEqual(countSubstring(line, bar_char), barSlotCount(bar.term_cols));
+}
+
+test "init caches terminal width for render" {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    var out_buf: [8192]u8 = undefined;
+    var out_writer = Io.Writer.fixed(&out_buf);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var bar = try ProgressBar.init(io, arena.allocator(), &out_writer, .no_color, Io.File.stdout());
+    defer bar.deinit();
+    const at_init = bar.term_cols;
+    try std.testing.expect(at_init >= 23);
+    bar.last_rendered = Io.Timestamp.zero;
+    bar.current = 1;
+    bar.estimate = 2;
+    try bar.render(io);
+    try std.testing.expectEqual(at_init, bar.term_cols);
+    try std.testing.expect(std.mem.indexOf(u8, out_writer.buffered(), "     1 runs ") != null);
 }
 
 test "render with escape_codes mode" {
@@ -437,4 +468,37 @@ test "render with escape_codes mode" {
     bar.estimate = 100;
     try bar.render(io);
     try std.testing.expect(std.mem.indexOf(u8, out_writer.buffered(), "\x1b[") != null);
+}
+
+test "samplingShowsProgressBar respects quiet and stdout tty" {
+    try std.testing.expect(!samplingShowsProgressBar(true, true));
+    try std.testing.expect(!samplingShowsProgressBar(true, false));
+    try std.testing.expect(samplingShowsProgressBar(false, true));
+    try std.testing.expect(!samplingShowsProgressBar(false, false));
+}
+
+test "outputLooksLikeProgressLine detects bar output" {
+    try std.testing.expect(outputLooksLikeProgressLine("     3 runs 100%"));
+    try std.testing.expect(!outputLooksLikeProgressLine("Benchmark 1 (3 runs): /bin/true"));
+    try std.testing.expect(!outputLooksLikeProgressLine(""));
+}
+
+test "render throttled skips second write" {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    var out_buf: [4096]u8 = undefined;
+    var out_writer = Io.Writer.fixed(&out_buf);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var bar = try ProgressBar.init(io, arena.allocator(), &out_writer, .no_color, Io.File.stdout());
+    defer bar.deinit();
+    bar.last_rendered = Io.Timestamp.zero;
+    bar.current = 2;
+    bar.estimate = 5;
+    try bar.render(io);
+    const after_first = out_writer.end;
+    try std.testing.expect(after_first > 0);
+    bar.last_rendered = .now(io, .awake);
+    try bar.render(io);
+    try std.testing.expectEqual(after_first, out_writer.end);
 }

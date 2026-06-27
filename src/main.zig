@@ -682,6 +682,8 @@ pub fn main(init: process.Init) !void {
         }));
     }
 
+    const stdout_is_tty = Io.File.stdout().isTty(io) catch false;
+
     var bar: ?progress.ProgressBar = null;
     var terminal: ?Io.Terminal = null;
     if (!quiet) {
@@ -698,6 +700,8 @@ pub fn main(init: process.Init) !void {
                 .ansi => .escape_codes,
             },
         };
+    }
+    if (progress.samplingShowsProgressBar(quiet, stdout_is_tty)) {
         bar = try progress.ProgressBar.init(io, arena, stderr_w, terminal.?.mode, Io.File.stderr());
     }
     defer if (bar) |*b| b.deinit();
@@ -752,8 +756,6 @@ pub fn main(init: process.Init) !void {
             first_start.untilNow(io, .awake).toNanoseconds() < max_nano_seconds) and
             sample_index < max_samples)
         {
-            if (!quiet) try bar.?.render(io);
-
             resetPerfGroupBeforeSample(perf_fds[0]) catch |err| {
                 onPerfIoctlSkip(err, command.raw_cmd, &perf_ioctl_warned, &perf_ioctl_skips, perf_ioctl_skip_limit);
                 continue;
@@ -810,8 +812,8 @@ pub fn main(init: process.Init) !void {
             switch (term) {
                 .exited => |code| {
                     if (code != 0 and !allow_failures) {
-                        if (!quiet)
-                            bar.?.clear(io) catch {};
+                        if (bar) |*b|
+                            b.clear(io) catch {};
                         std.debug.print("\nerror: Benchmark {d} command '{s}' failed with exit code {d}\n", .{
                             command_n,
                             command.raw_cmd,
@@ -857,15 +859,16 @@ pub fn main(init: process.Init) !void {
 
             sample_index += 1;
 
-            if (!quiet) {
-                bar.?.estimate = est_total: {
+            if (bar) |*b| {
+                b.estimate = est_total: {
                     const cur_samples: u64 = sample_index;
                     var ns_per_sample: u64 = @intCast(@divTrunc((first_start.untilNow(io, .awake).toNanoseconds()), cur_samples));
                     if (ns_per_sample == 0) ns_per_sample = 1;
                     const estimate = std.math.divCeil(u64, max_nano_seconds, ns_per_sample) catch unreachable;
                     break :est_total @intCast(@min(max_samples, @max(cur_samples, estimate, min_samples)));
                 };
-                bar.?.current += 1;
+                b.current += 1;
+                try b.render(io);
             }
         }
 
@@ -882,14 +885,14 @@ pub fn main(init: process.Init) !void {
             }
         }
 
-        if (!quiet) {
-            bar.?.estimate = bar.?.current;
-            try bar.?.render(io);
-            try bar.?.clear(io);
+        if (bar) |*b| {
+            b.estimate = b.current;
+            try b.render(io);
+            try b.clear(io);
             try stderr_w.writeAll("\n");
             try stderr_w.flush();
-            bar.?.current = 0;
-            bar.?.estimate = 1;
+            b.current = 0;
+            b.estimate = 1;
         }
 
         const all_samples = samples.items;

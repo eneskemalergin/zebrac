@@ -86,7 +86,8 @@ const usage_rest =
     \\  samples. A slow command may run past the duration to reach min.
     \\  min/max-samples must be at least 1; min above max: exit before
     \\  spawn. A clamp note (if any) prints on stderr once, before the
-    \\  results table.
+    \\  results table. Piped stdout (not a TTY) skips the progress bar
+    \\  during sampling; the results table still prints unless -q.
     \\
     \\  -f (--allow-failures): non-zero exit on a measured run does not
     \\  stop the benchmark. Failed runs stay in means. Warmup is not

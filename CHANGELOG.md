@@ -16,6 +16,8 @@ zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog cov
 ### Changed
 
 - With `-f` / `--allow-failures`, `wall_time` ends when the child exits; draining stderr for failure notes happens after timing and is not included in `wall_time`
+- Progress bar renders after each measured sample (not before spawn); terminal width is cached at bar init
+- Piped stdout automatically skips the progress bar during sampling (same as `--quiet` for stderr animation); results table still prints unless `-q`
 
 ### Fixed
 
