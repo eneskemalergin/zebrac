@@ -19,7 +19,9 @@ zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog cov
 
 ### Fixed
 
-- Check perf group `DISABLE` / `RESET` ioctl results; warn once per command and skip the measured sample instead of recording unreliable counters
+- Check perf group `DISABLE` / `RESET` ioctl results; warn once per command and skip the measured sample instead of recording unreliable counters; abort the command after repeated ioctl failures
+- Report a clear stderr hint when a perf counter read returns fewer than eight bytes (`ShortPerfRead`)
+- Open perf group leader with `disabled=true` and child counters with `disabled=false` per `perf_event_open(2)`
 - Under `-f`, only the first failing sample prints full stderr; later failures summarize as `N more failed samples` (stderr omitted)
 - Under `-f`, reuse one stderr capture buffer per run instead of retaining each sample in the arena
 - Under `-f`, after the first failure stderr note, later samples use `stderr: .ignore` and normal `child.wait` (no per-sample pipe drain); 1 MiB capture buffer allocated only if a failure note is needed

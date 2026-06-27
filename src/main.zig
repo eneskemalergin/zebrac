@@ -746,6 +746,8 @@ pub fn main(init: process.Init) !void {
         var failure_stderr_verbose_shown = false;
         var suppressed_failure_notes: u64 = 0;
         var perf_ioctl_warned = false;
+        var perf_ioctl_skips: u32 = 0;
+        const perf_ioctl_skip_limit = perfIoctlSkipLimit(max_samples);
         while ((sample_index < min_samples or
             first_start.untilNow(io, .awake).toNanoseconds() < max_nano_seconds) and
             sample_index < max_samples)
@@ -753,10 +755,7 @@ pub fn main(init: process.Init) !void {
             if (!quiet) try bar.?.render(io);
 
             resetPerfGroupBeforeSample(perf_fds[0]) catch |err| {
-                if (!perf_ioctl_warned) {
-                    printPerfIoctlSkipWarn(err, command.raw_cmd);
-                    perf_ioctl_warned = true;
-                }
+                onPerfIoctlSkip(err, command.raw_cmd, &perf_ioctl_warned, &perf_ioctl_skips, perf_ioctl_skip_limit);
                 continue;
             };
 
@@ -800,10 +799,7 @@ pub fn main(init: process.Init) !void {
             }
 
             disablePerfGroupAfterSample(perf_fds[0]) catch |err| {
-                if (!perf_ioctl_warned) {
-                    printPerfIoctlSkipWarn(err, command.raw_cmd);
-                    perf_ioctl_warned = true;
-                }
+                onPerfIoctlSkip(err, command.raw_cmd, &perf_ioctl_warned, &perf_ioctl_skips, perf_ioctl_skip_limit);
                 continue;
             };
 
@@ -845,16 +841,18 @@ pub fn main(init: process.Init) !void {
                 },
             }
 
+            const perf_values = try readSamplePerfCounters(&perf_fds);
+
             try samples.append(arena, .{
                 .wall_time = @intCast(duration.toNanoseconds()),
                 .peak_rss = peak_rss,
                 .minor_faults = faults.minor,
                 .major_faults = faults.major,
-                .cpu_cycles = try readPerfFd(perf_fds[0]),
-                .instructions = try readPerfFd(perf_fds[1]),
-                .cache_references = try readPerfFd(perf_fds[2]),
-                .cache_misses = try readPerfFd(perf_fds[3]),
-                .branch_misses = try readPerfFd(perf_fds[4]),
+                .cpu_cycles = perf_values[0],
+                .instructions = perf_values[1],
+                .cache_references = perf_values[2],
+                .cache_misses = perf_values[3],
+                .branch_misses = perf_values[4],
             });
 
             sample_index += 1;
@@ -1290,6 +1288,44 @@ fn printPerfIoctlSkipWarn(err: anyerror, command: []const u8) void {
     );
 }
 
+fn perfIoctlSkipLimit(max_samples: u64) u32 {
+    const scaled = max_samples *| 2;
+    return @intCast(@max(@as(u32, 32), @min(scaled, 1024)));
+}
+
+fn onPerfIoctlSkip(
+    err: anyerror,
+    command: []const u8,
+    perf_ioctl_warned: *bool,
+    perf_ioctl_skips: *u32,
+    skip_limit: u32,
+) void {
+    if (!perf_ioctl_warned.*) {
+        printPerfIoctlSkipWarn(err, command);
+        perf_ioctl_warned.* = true;
+    }
+    perf_ioctl_skips.* +%= 1;
+    if (perf_ioctl_skips.* >= skip_limit) {
+        std.debug.print(
+            "\nerror: perf ioctl failed {d} times for '{s}'; aborting command\n",
+            .{ perf_ioctl_skips.*, command },
+        );
+        process.exit(1);
+    }
+}
+
+fn printShortPerfReadError(counter_name: []const u8) noreturn {
+    std.debug.print(
+        "\nerror: incomplete read from perf counter '{s}' (expected {d} bytes)\n",
+        .{ counter_name, @sizeOf(usize) },
+    );
+    std.debug.print(
+        \\hint: perf counter was reset or closed before the value could be read; close other perf tools or try again
+        \\
+    , .{});
+    process.exit(1);
+}
+
 fn printPerfOpenError(err: std.posix.PerfEventOpenError, counter_name: []const u8) noreturn {
     std.debug.print("\nerror: cannot open perf counter '{s}': ", .{counter_name});
     switch (err) {
@@ -1314,26 +1350,41 @@ fn printPerfOpenError(err: std.posix.PerfEventOpenError, counter_name: []const u
     process.exit(1);
 }
 
+fn perfEventAttrForGroupMember(config: PERF.COUNT.HW, is_leader: bool) std.os.linux.perf_event_attr {
+    return .{
+        .type = PERF.TYPE.HARDWARE,
+        .config = @intFromEnum(config),
+        .flags = .{
+            .disabled = is_leader,
+            .exclude_kernel = true,
+            .exclude_hv = true,
+            .inherit = true,
+            .enable_on_exec = true,
+        },
+    };
+}
+
 fn openPerfGroup(fds: *[perf_measurements.len]fd_t) void {
     // One perf group per command. Opening all five fds every sample was pure syscall tax.
     // Each sample: DISABLE, RESET, spawn child, read counters, DISABLE again.
-    for (perf_measurements, fds) |measurement, *perf_fd| {
-        var attr: std.os.linux.perf_event_attr = .{
-            .type = PERF.TYPE.HARDWARE,
-            .config = @intFromEnum(measurement.config),
-            .flags = .{
-                .disabled = true,
-                .exclude_kernel = true,
-                .exclude_hv = true,
-                .inherit = true,
-                .enable_on_exec = true,
-            },
-        };
+    for (perf_measurements, fds, 0..) |measurement, *perf_fd, i| {
+        var attr = perfEventAttrForGroupMember(measurement.config, i == 0);
         perf_fd.* = std.posix.perf_event_open(&attr, 0, -1, fds[0], PERF.FLAG.FD_CLOEXEC) catch |err| {
             closePerfFds(fds);
             printPerfOpenError(err, measurement.name);
         };
     }
+}
+
+fn readSamplePerfCounters(fds: *const [perf_measurements.len]fd_t) ![perf_measurements.len]usize {
+    var values: [perf_measurements.len]usize = undefined;
+    for (0..perf_measurements.len) |i| {
+        values[i] = readPerfFd(fds[i]) catch |err| switch (err) {
+            error.ShortPerfRead => printShortPerfReadError(perf_measurements[i].name),
+            else => return err,
+        };
+    }
+    return values;
 }
 
 fn readPerfFd(fd: fd_t) !usize {
@@ -1733,6 +1784,41 @@ test "resetPerfGroupBeforeSample fails on non-perf fd" {
         else => return err,
     };
     return error.TestUnexpectedError;
+}
+
+test "disablePerfGroupAfterSample fails on non-perf fd" {
+    var pipefd: [2]i32 = undefined;
+    const pr = std.os.linux.pipe(&pipefd);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(pr));
+    defer {
+        _ = std.os.linux.close(pipefd[0]);
+        _ = std.os.linux.close(pipefd[1]);
+    }
+    try std.testing.expectError(error.DisableFailed, disablePerfGroupAfterSample(pipefd[0]));
+}
+
+test "perfIoctlSkipLimit scales with max_samples" {
+    try std.testing.expectEqual(@as(u32, 32), perfIoctlSkipLimit(5));
+    try std.testing.expectEqual(@as(u32, 40), perfIoctlSkipLimit(20));
+    try std.testing.expectEqual(@as(u32, 1024), perfIoctlSkipLimit(10_000));
+}
+
+test "perf group leader opens disabled, children enabled" {
+    const leader = perfEventAttrForGroupMember(PERF.COUNT.HW.CPU_CYCLES, true);
+    const child = perfEventAttrForGroupMember(PERF.COUNT.HW.INSTRUCTIONS, false);
+    try std.testing.expect(leader.flags.disabled);
+    try std.testing.expect(!child.flags.disabled);
+    try std.testing.expect(leader.flags.enable_on_exec);
+    try std.testing.expect(child.flags.enable_on_exec);
+}
+
+test "readPerfFd returns ShortPerfRead on empty pipe" {
+    var pipefd: [2]i32 = undefined;
+    const pr = std.os.linux.pipe(&pipefd);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(pr));
+    _ = std.os.linux.close(pipefd[1]);
+    defer _ = std.os.linux.close(pipefd[0]);
+    try std.testing.expectError(error.ShortPerfRead, readPerfFd(pipefd[0]));
 }
 
 test "getStatScore95_dfZero_usesZScore" {
