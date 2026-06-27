@@ -704,6 +704,13 @@ pub fn main(init: process.Init) !void {
 
     var perf_fds: [perf_measurements.len]fd_t = @splat(-1);
 
+    var stderr_capture_buf: ?StderrCaptureBuf = null;
+    if (allow_failures) {
+        stderr_capture_buf = .{
+            .storage = try arena.alloc(u8, max_stderr_bytes),
+        };
+    }
+
     for (commands.items, 1..) |*command, command_n| {
         var samples: std.ArrayList(Sample) = .empty;
         try samples.ensureTotalCapacity(arena, @intCast(max_samples));
@@ -768,11 +775,14 @@ pub fn main(init: process.Init) !void {
             var duration: Io.Duration = undefined;
 
             if (allow_failures) {
-                const measured = try waitChildAndCaptureStderr(io, &child, start, arena);
+                const capture_buf = &stderr_capture_buf.?;
+                capture_buf.reset();
+                const measured = try waitChildAndCaptureStderr(io, &child, start, capture_buf);
                 term = measured.term;
                 duration = measured.duration;
-                stderr_bytes = measured.capture.bytes;
-                stderr_truncated = measured.capture.truncated;
+                const capture = capture_buf.view();
+                stderr_bytes = capture.bytes;
+                stderr_truncated = capture.truncated;
             } else {
                 term = child.wait(io) catch |err| {
                     std.debug.print("\nerror: Couldn't execute {s}: {t}\n", .{ command.argv[0], err });
@@ -1047,6 +1057,37 @@ const StderrCapture = struct {
     truncated: bool,
 };
 
+const StderrCaptureBuf = struct {
+    storage: []u8,
+    len: usize = 0,
+    truncated: bool = false,
+
+    fn reset(self: *StderrCaptureBuf) void {
+        self.len = 0;
+        self.truncated = false;
+    }
+
+    fn append(self: *StderrCaptureBuf, data: []const u8) void {
+        if (self.truncated) return;
+        const room = self.storage.len -| self.len;
+        if (room == 0) {
+            self.truncated = true;
+            return;
+        }
+        const take = @min(data.len, room);
+        @memcpy(self.storage[self.len..][0..take], data[0..take]);
+        self.len += take;
+        if (take < data.len) self.truncated = true;
+    }
+
+    fn view(self: *const StderrCaptureBuf) StderrCapture {
+        return .{
+            .bytes = self.storage[0..self.len],
+            .truncated = self.truncated,
+        };
+    }
+};
+
 fn posixWaitStatusToTerm(status: u32) process.Child.Term {
     const W = std.os.linux.W;
     return if (W.IFEXITED(status))
@@ -1075,39 +1116,17 @@ fn closeChildPipes(child: *process.Child) void {
     child.id = null;
 }
 
-fn appendStderrBytes(
-    arena: std.mem.Allocator,
-    list: *std.ArrayList(u8),
-    data: []const u8,
-    truncated: *bool,
-) !void {
-    if (truncated.*) return;
-    const room = max_stderr_bytes -| list.items.len;
-    if (room == 0) {
-        truncated.* = true;
-        return;
-    }
-    const take = @min(data.len, room);
-    try list.appendSlice(arena, data[0..take]);
-    if (take < data.len) truncated.* = true;
-}
-
-fn readStderrFd(
-    stderr_fd: fd_t,
-    list: *std.ArrayList(u8),
-    arena: std.mem.Allocator,
-    truncated: *bool,
-) !void {
-    var buf: [4096]u8 = undefined;
+fn readStderrFd(stderr_fd: fd_t, buf: *StderrCaptureBuf) !void {
+    var scratch: [4096]u8 = undefined;
     while (true) {
-        const n = std.posix.read(stderr_fd, &buf) catch |err| switch (err) {
+        const n = std.posix.read(stderr_fd, &scratch) catch |err| switch (err) {
             error.WouldBlock => return,
             else => return err,
         };
         if (n == 0) return;
-        try appendStderrBytes(arena, list, buf[0..n], truncated);
-        if (truncated.* and list.items.len >= max_stderr_bytes) {
-            list.items.len = max_stderr_bytes;
+        buf.append(scratch[0..n]);
+        if (buf.truncated and buf.len >= max_stderr_bytes) {
+            buf.len = max_stderr_bytes;
             discardStderrRemainder(stderr_fd);
             return;
         }
@@ -1126,14 +1145,10 @@ fn waitChildAndCaptureStderr(
     io: Io,
     child: *process.Child,
     start: Io.Timestamp,
-    arena: std.mem.Allocator,
-) !struct { term: process.Child.Term, duration: Io.Duration, capture: StderrCapture } {
+    capture_buf: *StderrCaptureBuf,
+) !struct { term: process.Child.Term, duration: Io.Duration } {
     const stderr_fd = child.stderr.?.handle;
     const pid: std.os.linux.pid_t = @intCast(child.id.?);
-
-    var stderr_list: std.ArrayList(u8) = .empty;
-    try stderr_list.ensureTotalCapacity(arena, 4096);
-    var truncated = false;
 
     const initial_flags: u32 = blk: {
         const r = std.os.linux.fcntl(stderr_fd, std.os.linux.F.GETFL, 0);
@@ -1153,7 +1168,7 @@ fn waitChildAndCaptureStderr(
 
     var child_done = false;
     while (!child_done) {
-        try readStderrFd(stderr_fd, &stderr_list, arena, &truncated);
+        try readStderrFd(stderr_fd, capture_buf);
 
         var status: u32 = undefined;
         var ru: std.os.linux.rusage = undefined;
@@ -1180,8 +1195,8 @@ fn waitChildAndCaptureStderr(
     }
 
     _ = std.os.linux.fcntl(stderr_fd, std.os.linux.F.SETFL, initial_flags);
-    if (!truncated) {
-        readStderrFd(stderr_fd, &stderr_list, arena, &truncated) catch {};
+    if (!capture_buf.truncated) {
+        readStderrFd(stderr_fd, capture_buf) catch {};
     } else {
         discardStderrRemainder(stderr_fd);
     }
@@ -1191,10 +1206,6 @@ fn waitChildAndCaptureStderr(
     return .{
         .term = term,
         .duration = duration,
-        .capture = .{
-            .bytes = stderr_list.items,
-            .truncated = truncated,
-        },
     };
 }
 

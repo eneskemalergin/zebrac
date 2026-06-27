@@ -20,6 +20,7 @@ zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog cov
 ### Fixed
 
 - Under `-f`, only the first failing sample prints full stderr; later failures summarize as `N more failed samples` (stderr omitted)
+- Under `-f`, reuse one stderr capture buffer per run instead of retaining each sample in the arena
 
 ## [0.5.6] - 2026-06-25
 
