@@ -85,8 +85,8 @@ const usage_rest =
     \\  (hard cap 10000). /bin/true at 500 ms can still yield hundreds of
     \\  samples. A slow command may run past the duration to reach min.
     \\  min/max-samples must be at least 1; min above max: exit before
-    \\  spawn. A clamp note (if any) prints on stderr once, before the
-    \\  results table. Piped stdout (not a TTY) skips the progress bar
+    \\  spawn. Notes (clamp, high outlier rate, --warmup 0) print on stderr once
+    \\  before the results table. Piped stdout (not a TTY) skips the progress bar
     \\  during sampling; the results table still prints unless -q.
     \\
     \\  -f (--allow-failures): non-zero exit on a measured run does not
@@ -109,8 +109,12 @@ const usage_rest =
     \\    --color <mode>           auto, never, or ansi [auto]
     \\    -q, --quiet              no progress bar or results table
     \\    --json [<path>]          write results JSON [zebrac-results.json]
+    \\    --json=<path>            same as --json <path>
     \\                             (summaries only; no compare deltas)
     \\    -f, --allow-failures     keep sampling on non-zero exit
+    \\
+    \\  Operand separator:
+    \\    --                       end options; following args are commands
     \\
     \\  Information:
     \\    -h, --help               show this help

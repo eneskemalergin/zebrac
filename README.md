@@ -139,7 +139,7 @@ zig build
 
 Default `zig build` produces a stripped **ReleaseSmall** binary (~290 KB on x86_64; size varies by Zig version). For debugging: `zig build -Doptimize=Debug`. Other modes: `-Doptimize=ReleaseSafe` or `ReleaseFast`.
 
-Match CI: the **check** job runs `zig fmt --check build.zig src/` and `zig build test`; the **build** job cross-compiles ReleaseSmall for x86, x86_64, aarch64, and riscv64 Linux. Locally, `zig build ci` runs tests plus those four cross-builds in one step. Optional LLVM fuzzing: `zig build test --fuzz` when your Zig toolchain supports it.
+Match CI: the **check** job runs `zig fmt --check build.zig src/` and `zig build test`; the **build** job cross-compiles ReleaseSmall for x86, x86_64, aarch64, and riscv64 Linux and runs a one-line smoke on the x86_64 artifact (`zebrac --quiet --min-samples 2 /bin/true`). Locally, `zig build ci` runs tests plus those four cross-builds in one step. `zig build test --fuzz` is maintainer-only (not CI); run it when your Zig toolchain supports fuzzing.
 
 Cross-compile for aarch64, x86_64, x86, and riscv64 Linux:
 

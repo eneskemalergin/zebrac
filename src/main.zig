@@ -314,6 +314,9 @@ fn measureOutlier(buf: *[32]u8, count: u64, sample_count: u64) usize {
 
 const delta_baseline_epsilon: f64 = 1e-9;
 
+/// Table yellow outlier column and stderr hint both use this rate (percent).
+const outlier_highlight_threshold_percent: f64 = 10.0;
+
 /// Per-field CLI table metadata (comptime). JSON always emits every summarized field.
 const MeasurementFieldMeta = struct {
     visibility: MeasurementRowVisibility,
@@ -535,6 +538,55 @@ fn writeDelta(
     try TableLayout.padVis(w, vis, col_start + layout.delta_w);
 }
 
+fn jsonPathFromEqualsArg(arg: []const u8) ?[]const u8 {
+    const prefix = "--json=";
+    if (!std.mem.startsWith(u8, arg, prefix)) return null;
+    const path = arg[prefix.len..];
+    if (path.len == 0) return "zebrac-results.json";
+    return path;
+}
+
+fn appendCommandOperand(
+    arena: std.mem.Allocator,
+    commands: *std.ArrayList(Command),
+    raw_cmd: []const u8,
+) !void {
+    var cmd_argv: std.ArrayList([]const u8) = .empty;
+    argv_parse.parseCommandLine(arena, &cmd_argv, raw_cmd) catch |err| {
+        std.debug.print("could not parse command '{s}': {s}\n", .{
+            raw_cmd,
+            argv_parse.errorMessage(err),
+        });
+        process.exit(1);
+    };
+    try commands.append(arena, .{
+        .raw_cmd = raw_cmd,
+        .argv = try cmd_argv.toOwnedSlice(arena),
+        .measurements = undefined,
+        .sample_count = undefined,
+        .failed_sample_count = 0,
+    });
+}
+
+fn measurementsHaveHighOutlierRate(m: Command.Measurements) bool {
+    inline for (@typeInfo(Command.Measurements).@"struct".fields) |field| {
+        const meas = @field(m, field.name);
+        if (meas.sample_count != 0) {
+            const pct = @as(f64, @floatFromInt(meas.outlier_count)) /
+                @as(f64, @floatFromInt(meas.sample_count)) * 100;
+            if (pct >= outlier_highlight_threshold_percent) return true;
+        }
+    }
+    return false;
+}
+
+fn anyCommandHighOutlierRate(commands: []const Command) bool {
+    for (commands) |cmd| {
+        if (measurementsHaveHighOutlierRate(cmd.measurements)) return true;
+    }
+    return false;
+}
+
 pub fn main(init: process.Init) !void {
     const io = init.io;
     const arena = init.arena.allocator();
@@ -560,25 +612,20 @@ pub fn main(init: process.Init) !void {
     var max_samples_clamped_from: ?u64 = null;
     var warmup: usize = 3;
 
+    var parse_flags = true;
     var arg_i: usize = 1;
     while (arg_i < args.len) : (arg_i += 1) {
         const arg = args[arg_i];
-        if (!std.mem.startsWith(u8, arg, "-")) {
-            var cmd_argv: std.ArrayList([]const u8) = .empty;
-            argv_parse.parseCommandLine(arena, &cmd_argv, arg) catch |err| {
-                std.debug.print("could not parse command '{s}': {s}\n", .{
-                    arg,
-                    argv_parse.errorMessage(err),
-                });
-                process.exit(1);
-            };
-            try commands.append(arena, .{
-                .raw_cmd = arg,
-                .argv = try cmd_argv.toOwnedSlice(arena),
-                .measurements = undefined,
-                .sample_count = undefined,
-                .failed_sample_count = 0,
-            });
+        if (!parse_flags or !std.mem.startsWith(u8, arg, "-")) {
+            try appendCommandOperand(arena, &commands, arg);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--")) {
+            parse_flags = false;
+            continue;
+        }
+        if (jsonPathFromEqualsArg(arg)) |path| {
+            json_path = path;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             try stdout_w.writeAll(help.usage_text);
             try stdout_w.flush();
@@ -921,6 +968,13 @@ pub fn main(init: process.Init) !void {
         command.sample_count = all_samples.len;
     }
 
+    if (warmup == 0) {
+        try run_notes.append(arena, "--warmup 0; first measured run may include cold-start effects");
+    }
+    if (anyCommandHighOutlierRate(commands.items)) {
+        try run_notes.append(arena, "outlier rate >=10% on at least one metric; check system load or raise --warmup");
+    }
+
     help.printRunNotes(run_notes.items);
 
     for (commands.items, 1..) |*command, command_n| {
@@ -1035,6 +1089,8 @@ fn writeJsonConfig(s: *std.json.Stringify, config: JsonRunConfig) !void {
     try s.write(config.min_samples);
     try s.objectField("max_samples");
     try s.write(config.max_samples);
+    try s.objectField("max_samples_cap");
+    try s.write(help.max_samples_cap);
     try s.objectField("max_samples_requested");
     try s.write(config.max_samples_requested);
     try s.objectField("warmup");
@@ -1555,7 +1611,7 @@ fn printMeasurement(
     var outlier_buf: [32]u8 = undefined;
     const outlier_line = try formatOutlierLine(&outlier_buf, m.outlier_count, m.sample_count);
     const outlier_percent = @as(f64, @floatFromInt(m.outlier_count)) / @as(f64, @floatFromInt(m.sample_count)) * 100;
-    if (outlier_percent >= 10)
+    if (outlier_percent >= outlier_highlight_threshold_percent)
         try terminal.setColor(.yellow)
     else
         try terminal.setColor(.dim);
@@ -1719,6 +1775,7 @@ test "printJsonOutput writes schema envelope and config" {
             duration_ms: u64,
             min_samples: u64,
             max_samples: u64,
+            max_samples_cap: u64,
             max_samples_requested: ?u64,
             warmup: usize,
             allow_failures: bool,
@@ -1742,6 +1799,7 @@ test "printJsonOutput writes schema envelope and config" {
     try std.testing.expectEqualStrings(help.version, parsed.value.zebrac_version);
     try std.testing.expectEqual(@as(u64, 500), parsed.value.config.duration_ms);
     try std.testing.expectEqual(@as(u64, 2), parsed.value.config.min_samples);
+    try std.testing.expectEqual(@as(u64, help.max_samples_cap), parsed.value.config.max_samples_cap);
     try std.testing.expectEqual(@as(?u64, 50_000), parsed.value.config.max_samples_requested);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.results.len);
     try std.testing.expectEqualStrings("/bin/true", parsed.value.results[0].command);
@@ -1753,6 +1811,49 @@ test "printJsonOutput writes schema envelope and config" {
     try std.testing.expectEqualStrings("count", parsed.value.results[0].minor_faults.unit);
     try std.testing.expectEqual(@as(f64, 2), parsed.value.results[0].major_faults.mean);
     try std.testing.expectEqualStrings("count", parsed.value.results[0].major_faults.unit);
+}
+
+test "jsonPathFromEqualsArg parses --json=path" {
+    try std.testing.expectEqualStrings("out.json", jsonPathFromEqualsArg("--json=out.json").?);
+    try std.testing.expectEqualStrings("zebrac-results.json", jsonPathFromEqualsArg("--json=").?);
+    try std.testing.expect(jsonPathFromEqualsArg("--json") == null);
+}
+
+test "anyCommandHighOutlierRate at 10% threshold" {
+    var low = testMeasurement(.count);
+    low.sample_count = 10;
+    low.outlier_count = 0;
+    var border = testMeasurement(.count);
+    border.sample_count = 10;
+    border.outlier_count = 1;
+    var high = testMeasurement(.count);
+    high.sample_count = 10;
+    high.outlier_count = 2;
+
+    const low_only: Command.Measurements = .{
+        .wall_time = low,
+        .peak_rss = low,
+        .minor_faults = low,
+        .major_faults = low,
+        .cpu_cycles = low,
+        .instructions = low,
+        .cache_references = low,
+        .cache_misses = low,
+        .branch_misses = low,
+    };
+    var border_meas = low_only;
+    border_meas.wall_time = border;
+    var high_meas = low_only;
+    high_meas.wall_time = high;
+
+    const cmds = [_]Command{
+        .{ .raw_cmd = "a", .argv = &.{}, .measurements = low_only, .sample_count = 10, .failed_sample_count = 0 },
+        .{ .raw_cmd = "b", .argv = &.{}, .measurements = border_meas, .sample_count = 10, .failed_sample_count = 0 },
+        .{ .raw_cmd = "c", .argv = &.{}, .measurements = high_meas, .sample_count = 10, .failed_sample_count = 0 },
+    };
+    try std.testing.expect(!anyCommandHighOutlierRate(cmds[0..1]));
+    try std.testing.expect(anyCommandHighOutlierRate(cmds[1..2]));
+    try std.testing.expect(anyCommandHighOutlierRate(cmds[2..3]));
 }
 
 test "StderrCaptureBuf caps append and resets" {

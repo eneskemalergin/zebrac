@@ -13,12 +13,18 @@ zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog cov
 
 - `failed_sample_count` per command in JSON `results[]` (always present); table header `(N runs, M failed)` when `M > 0`, else `(N runs)`; failed measured runs still contribute to means; warmup not counted
 - Stat fact-check unit tests: small-n Q1/Q3 order-stat indices (`n` = 2, 3, 4), Tukey outlier count on a skewed list, and compare delta significance at the ±1% practical band (`deltaIsSignificant`)
+- `--` ends option parsing; operands after it are commands even when they look like flags
+- `--json=<path>` as an alternative to `--json <path>`
+- JSON `config.max_samples_cap` (always `10000`)
+- Stderr hints when `--warmup 0` or any metric outlier rate is ≥10% (same `note:` block as clamp messages)
+- CI: `check` runs fmt + tests; `build` matrix cross-compiles four Linux targets and smokes the x86_64 binary (no duplicate native build)
 
 ### Changed
 
 - With `-f` / `--allow-failures`, `wall_time` ends when the child exits; draining stderr for failure notes happens after timing and is not included in `wall_time`
 - Progress bar renders after each measured sample (not before spawn); terminal width is cached at bar init
 - Piped stdout automatically skips the progress bar during sampling (same as `--quiet` for stderr animation); results table still prints unless `-q`
+- CLI table row visibility uses comptime `measurementFieldMeta` (P3 #35); `major_faults` row still hidden when `max == 0`; JSON always emits all nine metrics
 
 ### Fixed
 
