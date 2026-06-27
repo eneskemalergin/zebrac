@@ -868,9 +868,13 @@ pub fn main(init: process.Init) !void {
             try t.setColor(.bold);
             try stdout_w.print("Benchmark {d}", .{command_n});
             try t.setColor(.dim);
-            try stdout_w.print(" ({d} runs)", .{command.sample_count});
             if (command.failed_sample_count > 0) {
-                try stdout_w.print(", {d} failed", .{command.failed_sample_count});
+                try stdout_w.print(" ({d} runs, {d} failed)", .{
+                    command.sample_count,
+                    command.failed_sample_count,
+                });
+            } else {
+                try stdout_w.print(" ({d} runs)", .{command.sample_count});
             }
             try t.setColor(.reset);
             try stdout_w.writeAll(":");

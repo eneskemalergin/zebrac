@@ -11,7 +11,7 @@ zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog cov
 
 ### Added
 
-- `failed_sample_count` per command in results table header (when > 0) and JSON `results[]` when using `--allow-failures`; failed runs still contribute to means
+- `failed_sample_count` per command in JSON `results[]` (always present); table header `(N runs, M failed)` when `M > 0`, else `(N runs)`; failed measured runs still contribute to means; warmup not counted
 
 ## [0.5.6] - 2026-06-25
 

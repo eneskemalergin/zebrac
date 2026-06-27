@@ -69,7 +69,7 @@ Output:
   --color <mode>           auto, never, or ansi [auto]
   -q, --quiet              no progress bar or results table
   --json [<path>]          write results JSON [zebrac-results.json]
-  -f, --allow-failures     keep going on non-zero exit; failed runs stay in means; table and JSON show failed count
+  -f, --allow-failures     keep going on non-zero exit (measured runs; not warmup); failures in means; table `(N runs, M failed)` when needed; JSON `failed_sample_count` always
 
 Information:
   -h, --help               show full usage
@@ -153,14 +153,15 @@ Median in the results table uses the upper middle value when the sample count is
 
 CLI table and `--json` export answer different questions. Keep the roles separate:
 
-| Concern                           | CLI table                | JSON v1 (`--json`)   |
-| --------------------------------- | ------------------------ | -------------------- |
-| Compare deltas vs first command   | Yes (`delta` column)     | No                   |
-| Significance / CI on delta        | Yes (`±` half-width)     | No                   |
-| Per-run raw samples               | No                       | No                   |
-| Display scaling (ns/us/ms, KB/MB) | Yes                      | No (raw base units)  |
-| Outliers                          | Count + % in table       | `outlier_count` only |
-| Baseline command                  | Implicit (first operand) | Not recorded         |
+| Concern                           | CLI table                                          | JSON v1 (`--json`)                           |
+| --------------------------------- | -------------------------------------------------- | -------------------------------------------- |
+| Compare deltas vs first command   | Yes (`delta` column)                               | No                                           |
+| Significance / CI on delta        | Yes (`±` half-width)                               | No                                           |
+| Per-run raw samples               | No                                                 | No                                           |
+| Display scaling (ns/us/ms, KB/MB) | Yes                                                | No (raw base units)                          |
+| Outliers                          | Count + % in table                                 | `outlier_count` only                         |
+| Failed measured runs (`-f`)       | `(N runs, M failed)` when `M > 0`, else `(N runs)` | `failed_sample_count` always (`0` when none) |
+| Baseline command                  | Implicit (first operand)                           | Not recorded                                 |
 
 **σ column** is the per-command sample standard deviation (spread within one run set). **Delta ±** is a separate pooled two-sample compare interval (CLI only).
 
@@ -172,7 +173,7 @@ JSON is a **summary archive** for CI and tooling (`mean`, `std_dev`, quartiles, 
 
 The `--json` flag writes structured results to a file alongside the terminal output. Default path is `zebrac-results.json`. Custom path with `--json ./path/to/file.json`.
 
-The root object includes `schema_version`, `zebrac_version`, `config` (sampling flags used for the run), and `results`, an array of objects per command with `sample_count`, `failed_sample_count` (non-zero only when `-f` was used and some runs exited non-zero), and summarized metrics in **raw units** (nanoseconds, bytes, counts). JSON has **no** compare deltas, significance, or baseline index; those appear only in the CLI table when you pass two or more commands (first command is the baseline there).
+The root object includes `schema_version`, `zebrac_version`, `config` (sampling flags used for the run), and `results`, an array of objects per command with `sample_count`, `failed_sample_count` (always present; non-zero when some measured runs exited non-zero under `-f`; warmup failures are not counted), and summarized metrics in **raw units** (nanoseconds, bytes, counts). The CLI table uses `(N runs)` or `(N runs, M failed)` in the benchmark header when `M > 0`. JSON has **no** compare deltas, significance, or baseline index; those appear only in the CLI table when you pass two or more commands (first command is the baseline there).
 
 ```bash
 zebrac --json --duration 3000 './myapp'
