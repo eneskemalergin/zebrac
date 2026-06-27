@@ -1906,6 +1906,52 @@ test "summarizeField_oneSample_stdDevStaysZero" {
     try std.testing.expectApproxEqAbs(@as(f64, 0), m.std_dev, 0.001);
 }
 
+test "summarizeField smallN_q1q3_useOrderStatIndices" {
+    // Indices: q1 = sorted[n/4]; q3 = sorted[n-1] when n < 4 else sorted[n - n/4].
+    {
+        const values = [_]u64{ 200, 100 };
+        var samples: [2]Sample = undefined;
+        for (values, &samples) |v, *s| s.* = sampleWith("wall_time", v);
+        var scratch: [2]Sample = undefined;
+        const m = try Measurement.summarizeField(&samples, &scratch, "wall_time", .nanoseconds);
+        try std.testing.expectEqual(@as(u64, 100), m.q1);
+        try std.testing.expectEqual(@as(u64, 200), m.q3);
+        try std.testing.expectEqual(@as(u64, 200), m.median);
+    }
+    {
+        const values = [_]u64{ 300, 100, 200 };
+        var samples: [3]Sample = undefined;
+        for (values, &samples) |v, *s| s.* = sampleWith("wall_time", v);
+        var scratch: [3]Sample = undefined;
+        const m = try Measurement.summarizeField(&samples, &scratch, "wall_time", .nanoseconds);
+        try std.testing.expectEqual(@as(u64, 100), m.q1);
+        try std.testing.expectEqual(@as(u64, 300), m.q3);
+        try std.testing.expectEqual(@as(u64, 200), m.median);
+    }
+    {
+        const values = [_]u64{ 400, 100, 300, 200 };
+        var samples: [4]Sample = undefined;
+        for (values, &samples) |v, *s| s.* = sampleWith("wall_time", v);
+        var scratch: [4]Sample = undefined;
+        const m = try Measurement.summarizeField(&samples, &scratch, "wall_time", .nanoseconds);
+        try std.testing.expectEqual(@as(u64, 200), m.q1);
+        try std.testing.expectEqual(@as(u64, 400), m.q3);
+        try std.testing.expectEqual(@as(u64, 300), m.median);
+    }
+}
+
+test "summarizeField_tukeyCountsHighOutlier" {
+    // Sorted: 1..12 plus 100. q1=4 (idx 3), q3=11 (idx 10), IQR=7, high fence=21.5 -> one outlier.
+    const values = [_]u64{ 12, 1, 100, 6, 3, 9, 4, 11, 2, 8, 5, 10, 7 };
+    var samples: [values.len]Sample = undefined;
+    for (values, &samples) |v, *s| s.* = sampleWith("wall_time", v);
+    var scratch: [values.len]Sample = undefined;
+    const m = try Measurement.summarizeField(&samples, &scratch, "wall_time", .nanoseconds);
+    try std.testing.expectEqual(@as(u64, 4), m.q1);
+    try std.testing.expectEqual(@as(u64, 11), m.q3);
+    try std.testing.expectEqual(@as(u64, 1), m.outlier_count);
+}
+
 fn measurementForDeltaTest(mean: f64, std_dev: f64, sample_count: u64) Measurement {
     return .{
         .q1 = 0,
@@ -1971,6 +2017,22 @@ test "deltaHalfWidth: valid inputs return finite width" {
     try std.testing.expect(!std.math.isNan(half));
     try std.testing.expect(!std.math.isInf(half));
     try std.testing.expect(half > 0);
+}
+
+test "deltaIsSignificant positive arm clears 1% lower bound" {
+    try std.testing.expect(deltaIsSignificant(2, 1));
+    try std.testing.expect(!deltaIsSignificant(2, 1.01));
+    try std.testing.expect(deltaIsSignificant(1, 0));
+    try std.testing.expect(!deltaIsSignificant(1, 0.01));
+    try std.testing.expect(!deltaIsSignificant(0.99, 0));
+}
+
+test "deltaIsSignificant negative arm clears 1% upper bound" {
+    try std.testing.expect(deltaIsSignificant(-2, 1));
+    try std.testing.expect(!deltaIsSignificant(-2, 1.01));
+    try std.testing.expect(deltaIsSignificant(-1, 0));
+    try std.testing.expect(!deltaIsSignificant(-1, 0.01));
+    try std.testing.expect(!deltaIsSignificant(-0.99, 0));
 }
 
 test "writeDeltaPlain: undefined baseline writes n/a not nan" {

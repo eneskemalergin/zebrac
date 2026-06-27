@@ -193,8 +193,8 @@ pub const ProgressBar = struct {
         const layout = computeBarLayout(bar_width, current, estimate);
 
         try bw.print("{s}{s}{s} {d: >5}{s}", .{
-            colors.cyan, spinner_frame, colors.reset,
-            current, progress_run_suffix,
+            colors.cyan, spinner_frame,       colors.reset,
+            current,     progress_run_suffix,
         });
 
         try bw.print("{s}", .{colors.pink});
