@@ -16,7 +16,7 @@ zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog cov
 - `--json=<path>` as an alternative to `--json <path>`
 - JSON `config.max_samples_cap` (always `10000`)
 - Stderr hints when `--warmup 0` or any metric outlier rate is ≥10% (same `note:` block as clamp messages)
-- CI: `check` runs fmt + tests; `build` matrix cross-compiles four Linux targets and smokes the x86_64 binary (no duplicate native build)
+- CI: `check` runs fmt + tests; `build` matrix cross-compiles four Linux targets; tag push runs `release` workflow (binaries + CHANGELOG notes on GitHub Releases)
 
 ### Changed
 

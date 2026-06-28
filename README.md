@@ -115,6 +115,14 @@ zig build
 
 ReleaseSmall, stripped, about 290-300 KB on x86_64. Debug: `zig build -Doptimize=Debug`. Linux binaries for x86, x86_64, aarch64, riscv64: `zig build release` (`zig-out/{arch}-linux-zebrac`).
 
+Before a tag, run `zig build preflight` locally (fmt, tests, all cross-builds).
+
+## Releasing
+
+1. Bump `version` in `src/help.zig`, the README badge, and add a `CHANGELOG.md` section.
+2. Commit on `main`, then tag and push: `git tag v0.6.0 && git push origin v0.6.0`
+3. [release.yml](.github/workflows/release.yml) runs CI, builds all four Linux targets, packages `zebrac-<tag>-<arch>-linux.tar.gz` plus `SHA256SUMS`, and opens a GitHub Release with the matching CHANGELOG section as release notes.
+
 ## Compared to Hyperfine
 
 [Hyperfine](https://github.com/sharkdp/hyperfine) is the usual cross-platform wall-clock tool. zebrac stays on Linux because it pulls perf counters and page-fault counts Hyperfine does not report. Hyperfine often shells out; zebrac execs argv directly (you can still run `sh -c '...'` as your command). With multiple inputs, Hyperfine sorts by time and lets you pick a reference; zebrac always deltas against the first command.

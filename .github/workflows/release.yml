@@ -1,0 +1,70 @@
+name: release
+on:
+  push:
+    tags:
+      - v[0-9]*
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Verify tag matches src/help.zig
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          ver="${tag#v}"
+          src_ver=$(grep -oP 'pub const version = "\K[^"]+' src/help.zig)
+          if [ "$ver" != "$src_ver" ]; then
+            echo "::error::Tag $tag does not match src/help.zig version ($src_ver)"
+            exit 1
+          fi
+
+      - name: CI
+        run: zig build ci
+
+      - name: Build release binaries
+        run: zig build release
+
+      - name: Package tarballs and checksums
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          mkdir -p dist staging
+          for bin in zig-out/bin/*-linux-zebrac; do
+            arch=$(basename "$bin" | sed 's/-linux-zebrac$//')
+            install -Dm755 "$bin" staging/zebrac
+            tar -czf "dist/zebrac-${tag}-${arch}-linux.tar.gz" -C staging zebrac
+            rm -f staging/zebrac
+          done
+          (cd dist && sha256sum zebrac-*.tar.gz > SHA256SUMS)
+          ls -la dist/
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          awk -v ver="$ver" '
+            /^## \[/ {
+              if (found) exit
+              if ($0 ~ "\\[" ver "\\]") { found=1; next }
+            }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error::No CHANGELOG section for version $ver"
+            exit 1
+          fi
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --title "zebrac ${GITHUB_REF_NAME}" \
+            --notes-file release-notes.md

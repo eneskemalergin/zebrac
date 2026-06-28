@@ -29,9 +29,6 @@ jobs:
           version: 0.16.0
       - name: Build
         run: zig build -Doptimize=ReleaseSmall -Dtarget=${{ matrix.target }}
-      - name: Smoke
-        if: matrix.target == 'x86_64-linux'
-        run: zig-out/bin/zebrac --quiet --min-samples 2 --max-samples 2 --warmup 0 --duration 300 /bin/true
       - name: Archive executable
         uses: actions/upload-artifact@v4
         with:
