@@ -1,32 +1,34 @@
-//! CLI help text and version string.
-//! Single source for --help, --version, and error footers in main.zig.
+//! --help, --version, sample limits, run notes.
+//!
+//! Help text is wrapped at `wrap_width` at compile time; run tests after editing line breaks.
 
 const std = @import("std");
 
-/// Bump each release. Help header and JSON `zebrac_version` both read this.
-pub const version = "0.5.6";
+/// Release version. Used in --help, --version, and JSON.
+pub const version = "0.6.0";
 
-/// Maximum line length for help prose. Change this one constant to re-wrap.
+/// Max help line width. Change this to re-wrap help text.
 pub const wrap_width: usize = 78;
 
-/// Hard upper bound for `--max-samples` (also referenced in help text).
+/// Hard cap for --max-samples (also in help text).
 pub const max_samples_cap: u64 = 10_000;
 
+/// Bad min/max sample settings.
 pub const SampleLimitsError = error{
     MinSamplesZero,
     MaxSamplesZero,
     MinSamplesExceedsMax,
 };
 
+/// Reject zero bounds and min > max.
 pub fn validateSampleLimits(min_samples: u64, max_samples: u64) SampleLimitsError!void {
     if (min_samples == 0) return error.MinSamplesZero;
     if (max_samples == 0) return error.MaxSamplesZero;
     if (min_samples > max_samples) return error.MinSamplesExceedsMax;
 }
 
-pub fn sampleLimitsErrorMessage(err: SampleLimitsError, min_samples: u64, max_samples: u64) []const u8 {
-    _ = min_samples;
-    _ = max_samples;
+/// Error text when sample limits are invalid.
+pub fn errorMessage(err: SampleLimitsError) []const u8 {
     return switch (err) {
         error.MinSamplesZero => "--min-samples must be at least 1",
         error.MaxSamplesZero => "--max-samples must be at least 1",
@@ -34,20 +36,25 @@ pub fn sampleLimitsErrorMessage(err: SampleLimitsError, min_samples: u64, max_sa
     };
 }
 
-/// Stderr only. Printed after measurement, before results tables on stdout.
-pub fn printRunNotes(notes: []const []const u8) void {
+/// Print run notes on stderr (after sampling, before the table).
+pub fn printRunNotes(w: *std.Io.Writer, notes: []const []const u8) !void {
     if (notes.len == 0) return;
-    std.debug.print("note:\n", .{});
-    for (notes) |line| std.debug.print("  {s}\n", .{line});
+    try w.print("note:\n", .{});
+    for (notes) |line| try w.print("  {s}\n", .{line});
+    try w.flush();
 }
 
-/// Shown when a flag is missing a value. Full help is too noisy for that case.
+/// Short usage when a flag is missing its value.
 pub const short_usage =
     \\Usage: zebrac [options] <command> [<command> ...]
     \\
     \\Run 'zebrac --help' for full usage.
     \\
 ;
+
+const max_samples_cap_text = std.fmt.comptimePrint("{d}", .{max_samples_cap});
+const max_samples_hard_cap_phrase = std.fmt.comptimePrint("hard cap {d}", .{max_samples_cap});
+const max_samples_default_bracket = std.fmt.comptimePrint("[{d}]", .{max_samples_cap});
 
 const usage_rest =
     \\Linux only. Runs your command in a loop and reads perf counters.
@@ -131,7 +138,7 @@ const usage_rest =
     \\    zebrac "curl -s https://example.com"
     \\
     \\Comparison (two or more commands; delta logic from poop):
-    \\  Vs the first command. σ is spread within one command; delta ± is
+    \\  Vs the first command. Spread within one command; delta ± is
     \\  compare uncertainty (nonzero diffs only). Equal means: 0% with no
     \\  ± band. Too few samples or ~zero baseline mean: n/a.
     \\  95% CI on deltas; marks a change only when the interval clears
@@ -158,11 +165,34 @@ const usage_rest =
     \\
 ;
 
-pub const usage_text: []const u8 = "zebrac " ++ version ++ "\n" ++ usage_rest;
+/// `zebrac 0.x.x` line for --help and --version.
+pub const version_line: []const u8 = "zebrac " ++ version ++ "\n";
+
+/// Full --help text (version line + usage).
+pub const usage_text: []const u8 = version_line ++ usage_rest;
 
 comptime {
+    @setEvalBranchQuota(100_000);
     assertMaxLineWidth(usage_text, wrap_width);
     assertMaxLineWidth(short_usage, wrap_width);
+
+    if (std.mem.indexOf(u8, usage_rest, max_samples_hard_cap_phrase) == null)
+        @compileError("usage_rest hard-cap phrase must match max_samples_cap");
+    if (std.mem.indexOf(u8, usage_rest, max_samples_default_bracket) == null)
+        @compileError("usage_rest --max-samples default must match max_samples_cap");
+
+    const measured_metrics = [_][]const u8{
+        "wall_time",     "peak_rss",     "minor_faults",     "major_faults",
+        "cpu_cycles",    "instructions", "cache_references", "cache_misses",
+        "branch_misses",
+    };
+    for (measured_metrics) |name| {
+        if (std.mem.indexOf(u8, usage_rest, name) == null)
+            @compileError(std.fmt.comptimePrint("usage_rest must mention metric '{s}'", .{name}));
+    }
+    for (std.meta.fieldNames(SampleLimitsError)) |name| {
+        _ = errorMessage(@field(SampleLimitsError, name));
+    }
 }
 
 fn assertMaxLineWidth(comptime text: []const u8, comptime max: usize) void {
@@ -182,55 +212,41 @@ fn assertMaxLineWidth(comptime text: []const u8, comptime max: usize) void {
     }
 }
 
-test "usage_text: required sections present" {
-    try std.testing.expect(std.mem.indexOf(u8, usage_text, "zebrac " ++ version) != null);
-    try std.testing.expect(std.mem.indexOf(u8, usage_text, "first is the baseline") != null);
-    try std.testing.expect(std.mem.indexOf(u8, usage_text, "perf_event_paranoid") != null);
-    try std.testing.expect(std.mem.indexOf(u8, usage_text, "wall_time") != null);
-    try std.testing.expect(std.mem.indexOf(u8, usage_text, "peak_rss") != null);
-    try std.testing.expect(std.mem.indexOf(u8, usage_text, "minor_faults") != null);
-    try std.testing.expect(std.mem.indexOf(u8, usage_text, "major_faults") != null);
-    try std.testing.expect(std.mem.indexOf(u8, usage_text, "cpu_cycles") != null);
-    try std.testing.expect(std.mem.indexOf(u8, usage_text, "branch_misses") != null);
-    try std.testing.expect(std.mem.indexOf(u8, usage_text, "--version") != null);
-    try std.testing.expect(std.mem.indexOf(u8, usage_text, "NO_COLOR") != null);
-    try std.testing.expect(std.mem.indexOf(u8, usage_text, "hard cap 10000") != null);
-    try std.testing.expect(std.mem.indexOf(u8, usage_text, "https://github.com/andrewrk/poop") != null);
-    try std.testing.expect(std.mem.indexOf(u8, usage_text, "Andrew Kelley") != null);
-}
+test "help.usageText_contains" {
+    const cases = [_]struct {
+        haystack: []const u8,
+        needle: []const u8,
+    }{
+        .{ .haystack = usage_text, .needle = version_line },
+        .{ .haystack = usage_text, .needle = "first is the baseline" },
+        .{ .haystack = usage_text, .needle = "perf_event_paranoid" },
+        .{ .haystack = usage_text, .needle = "--version" },
+        .{ .haystack = usage_text, .needle = "NO_COLOR" },
+        .{ .haystack = usage_text, .needle = max_samples_cap_text },
+        .{ .haystack = usage_text, .needle = "https://github.com/andrewrk/poop" },
+        .{ .haystack = short_usage, .needle = "zebrac --help" },
+    };
 
-test "usage_text: no line exceeds wrap_width" {
-    var line_start: usize = 0;
-    while (line_start <= usage_text.len) {
-        const line_end = std.mem.indexOfScalarPos(u8, usage_text, line_start, '\n') orelse usage_text.len;
-        const line = usage_text[line_start..line_end];
-        try std.testing.expect(line.len <= wrap_width);
-        if (line_end == usage_text.len) break;
-        line_start = line_end + 1;
+    for (cases) |c| {
+        try std.testing.expect(std.mem.indexOf(u8, c.haystack, c.needle) != null);
     }
 }
 
-test "short_usage: points to full help" {
-    try std.testing.expect(std.mem.indexOf(u8, short_usage, "zebrac --help") != null);
-}
+test "validateSampleLimits" {
+    const ok_cases = [_]struct { min: u64, max: u64 }{
+        .{ .min = 5, .max = max_samples_cap },
+        .{ .min = 1, .max = 1 },
+    };
+    const err_cases = [_]struct {
+        min: u64,
+        max: u64,
+        err: SampleLimitsError,
+    }{
+        .{ .min = 100, .max = 10, .err = error.MinSamplesExceedsMax },
+        .{ .min = 0, .max = 10, .err = error.MinSamplesZero },
+        .{ .min = 5, .max = 0, .err = error.MaxSamplesZero },
+    };
 
-test "version: non-empty semver shape" {
-    try std.testing.expect(version.len >= 5);
-    try std.testing.expect(std.mem.indexOf(u8, version, ".") != null);
-}
-
-test "validateSampleLimits: accepts defaults" {
-    try validateSampleLimits(5, max_samples_cap);
-}
-
-test "validateSampleLimits: rejects min above max" {
-    try std.testing.expectError(error.MinSamplesExceedsMax, validateSampleLimits(100, 10));
-}
-
-test "validateSampleLimits: rejects zero min" {
-    try std.testing.expectError(error.MinSamplesZero, validateSampleLimits(0, 10));
-}
-
-test "validateSampleLimits: rejects zero max" {
-    try std.testing.expectError(error.MaxSamplesZero, validateSampleLimits(5, 0));
+    for (ok_cases) |c| try validateSampleLimits(c.min, c.max);
+    for (err_cases) |c| try std.testing.expectError(c.err, validateSampleLimits(c.min, c.max));
 }

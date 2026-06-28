@@ -1,4 +1,8 @@
-//! Loop commands, sample perf counters and rusage, emit a stats table or JSON.
+//! Spawn commands, collect samples, print a stats table or JSON.
+//!
+//! Operand parsing is in `argv_parse`; help text in `help`; progress bar in `progress`.
+//! One arena per run. Tables on stdout; notes and the bar on stderr.
+
 const std = @import("std");
 const Io = std.Io;
 const process = std.process;
@@ -7,7 +11,19 @@ const fd_t = std.posix.fd_t;
 const progress = @import("progress.zig");
 const argv_parse = @import("argv_parse.zig");
 const help = @import("help.zig");
+
 const max_stderr_bytes = 1024 * 1024;
+const stream_io_buf_len: usize = 1024;
+const json_file_buf_len: usize = 4096;
+const stderr_pipe_read_scratch: usize = 4096;
+const default_json_output_path = "zebrac-results.json";
+const default_duration_ms: u64 = 5000;
+const default_min_samples: u64 = 5;
+const default_warmup: usize = 3;
+const perf_ioctl_skip_limit_min: u32 = 32;
+const perf_ioctl_skip_limit_max: u32 = 1024;
+
+// --- Perf counter configuration ---
 
 const PerfMeasurement = struct {
     name: []const u8,
@@ -22,6 +38,7 @@ const perf_measurements = [_]PerfMeasurement{
     .{ .name = "branch_misses", .config = PERF.COUNT.HW.BRANCH_MISSES },
 };
 
+// --- Command and sample types ---
 const Command = struct {
     raw_cmd: []const u8,
     argv: []const []const u8,
@@ -72,7 +89,8 @@ const ColorMode = enum {
     ansi,
 };
 
-/// Fixed visible column starts (bytes, no ANSI). Header and rows share these.
+// --- Results table layout ---
+// Column separators (plain bytes, no ANSI). Shared by header and rows.
 const sep_mean: []const u8 = " ± ";
 const sep_minmax: []const u8 = " … ";
 const row_indent: usize = 2;
@@ -108,7 +126,7 @@ const TableLayout = struct {
         inline for (@typeInfo(Command.Measurements).@"struct".fields) |field| {
             const m = @field(measurements, field.name);
             if (measurementRowVisible(measurementFieldMeta(field.name).visibility, m)) {
-                layout.name_w = @max(layout.name_w, row_indent + visibleLen(field.name));
+                layout.name_w = @max(layout.name_w, row_indent + field.name.len);
                 layout.mean_w = @max(layout.mean_w, measureUnit(&unit_buf, m.mean, m.unit));
                 layout.std_w = @max(layout.std_w, measureUnit(&unit_buf, m.std_dev, m.unit));
                 layout.min_w = @max(layout.min_w, measureUnit(&unit_buf, @floatFromInt(m.min), m.unit));
@@ -130,12 +148,20 @@ const TableLayout = struct {
         return self.name_w + col_gap + self.mean_w;
     }
 
+    fn stdColEndVis(self: TableLayout) usize {
+        return self.name_w + col_gap + self.mean_w + visibleLen(sep_mean) + self.std_w;
+    }
+
     fn minSepVis(self: TableLayout) usize {
-        return self.name_w + col_gap + self.mean_w + visibleLen(sep_mean) + self.std_w + col_gap + self.min_w;
+        return self.stdColEndVis() + col_gap + self.min_w;
+    }
+
+    fn minMaxColEndVis(self: TableLayout) usize {
+        return self.minSepVis() + visibleLen(sep_minmax) + self.max_w;
     }
 
     fn outlierStartVis(self: TableLayout) usize {
-        return self.minSepVis() + visibleLen(sep_minmax) + self.max_w + col_gap;
+        return self.minMaxColEndVis() + col_gap;
     }
 
     fn deltaStartVis(self: TableLayout) usize {
@@ -153,68 +179,52 @@ const TableLayout = struct {
         try padVis(w, vis, vis.* + col_gap);
     }
 
+    fn printStyledLabel(w: *Io.Writer, t: Io.Terminal, label: []const u8, colors: []const Io.Terminal.Color) !void {
+        for (colors) |c| try t.setColor(c);
+        try w.writeAll(label);
+        try t.setColor(.reset);
+    }
+
     fn printHeader(w: *Io.Writer, t: Io.Terminal, layout: TableLayout, with_delta: bool) !void {
         var vis: usize = 0;
         try w.splatByteAll(' ', row_indent);
         try w.writeAll("measurement");
-        vis = row_indent + visibleLen("measurement");
+        vis = row_indent + "measurement".len;
         try padVis(w, &vis, layout.name_w);
 
         try gap(w, &vis);
-        try padVis(w, &vis, layout.meanSepVis() - visibleLen("mean"));
-        try t.setColor(.bright_green);
-        try w.writeAll("mean");
-        try t.setColor(.reset);
+        try padVis(w, &vis, layout.meanSepVis() - "mean".len);
+        try printStyledLabel(w, t, "mean", &.{.bright_green});
         vis = layout.meanSepVis();
         try t.setColor(.bold);
         try w.writeAll(sep_mean);
         try t.setColor(.reset);
         vis += visibleLen(sep_mean);
-        try t.setColor(.green);
-        try w.writeAll("σ");
-        try t.setColor(.reset);
+        try printStyledLabel(w, t, "σ", &.{.green});
         vis += visibleLen("σ");
-        try padVis(
-            w,
-            &vis,
-            layout.name_w + col_gap + layout.mean_w + visibleLen(sep_mean) + layout.std_w,
-        );
+        try padVis(w, &vis, layout.stdColEndVis());
 
         try gap(w, &vis);
-        try padVis(w, &vis, layout.minSepVis() - visibleLen("min"));
-        try t.setColor(.bold);
-        try t.setColor(.cyan);
-        try w.writeAll("min");
-        try t.setColor(.reset);
+        try padVis(w, &vis, layout.minSepVis() - "min".len);
+        try printStyledLabel(w, t, "min", &.{ .bold, .cyan });
         vis = layout.minSepVis();
         try t.setColor(.bold);
         try w.writeAll(sep_minmax);
         try t.setColor(.reset);
-        try t.setColor(.magenta);
-        try w.writeAll("max");
-        try t.setColor(.reset);
-        vis = layout.minSepVis() + visibleLen(sep_minmax) + visibleLen("max");
-        try padVis(
-            w,
-            &vis,
-            layout.name_w + col_gap + layout.mean_w + visibleLen(sep_mean) + layout.std_w + col_gap + layout.min_w + visibleLen(sep_minmax) + layout.max_w,
-        );
+        try printStyledLabel(w, t, "max", &.{.magenta});
+        vis = layout.minSepVis() + visibleLen(sep_minmax) + "max".len;
+        try padVis(w, &vis, layout.minMaxColEndVis());
 
         try gap(w, &vis);
         try padVis(w, &vis, layout.outlierStartVis());
-        try t.setColor(.bold);
-        try t.setColor(.bright_yellow);
-        try w.writeAll("outliers");
-        try t.setColor(.reset);
-        vis = layout.outlierStartVis() + visibleLen("outliers");
+        try printStyledLabel(w, t, "outliers", &.{ .bold, .bright_yellow });
+        vis = layout.outlierStartVis() + "outliers".len;
         try padVis(w, &vis, layout.outlierStartVis() + layout.outlier_w);
 
         if (with_delta) {
             try gap(w, &vis);
             try padVis(w, &vis, layout.deltaStartVis());
-            try t.setColor(.bold);
-            try w.writeAll("delta");
-            try t.setColor(.reset);
+            try printStyledLabel(w, t, "delta", &.{.bold});
         }
         try w.writeAll("\n");
     }
@@ -231,80 +241,89 @@ fn visibleLen(s: []const u8) usize {
     return n;
 }
 
+const plain_unit_suffix = "";
+const unit_suffix_max_vis_w: usize = 2;
+
 const UnitScaled = struct {
     val: f64,
     suffix: []const u8,
 };
 
+const scale_threshold = struct {
+    min: f64,
+    div: f64,
+    ns_suffix: []const u8 = "",
+    count_suffix: []const u8 = "",
+    byte_suffix: []const u8 = "",
+};
+
+const ns_unit_thresholds = [_]scale_threshold{
+    .{ .min = 3600 * 1_000_000_000, .div = 3600 * 1_000_000_000, .ns_suffix = "h" },
+    .{ .min = 60 * 1_000_000_000, .div = 60 * 1_000_000_000, .ns_suffix = "m" },
+    .{ .min = 1_000_000_000, .div = 1_000_000_000, .ns_suffix = "s" },
+    .{ .min = 1_000_000, .div = 1_000_000, .ns_suffix = "ms" },
+    .{ .min = 1_000, .div = 1_000, .ns_suffix = "µs" },
+};
+
+const qty_unit_thresholds = [_]scale_threshold{
+    .{ .min = 1_000_000_000_000, .div = 1_000_000_000_000, .count_suffix = "T", .byte_suffix = "TB" },
+    .{ .min = 1_000_000_000, .div = 1_000_000_000, .count_suffix = "G", .byte_suffix = "GB" },
+    .{ .min = 1_000_000, .div = 1_000_000, .count_suffix = "M", .byte_suffix = "MB" },
+    .{ .min = 1_000, .div = 1_000, .count_suffix = "K", .byte_suffix = "KB" },
+};
+
 fn scaleUnit(x: f64, unit: Measurement.Unit) UnitScaled {
     if (unit == .nanoseconds) {
-        if (x >= 3600 * 1_000_000_000) {
-            return .{ .val = x / (3600 * 1_000_000_000), .suffix = "h " };
-        }
-        if (x >= 60 * 1_000_000_000) {
-            return .{ .val = x / (60 * 1_000_000_000), .suffix = "m " };
-        }
-        if (x >= 1_000_000_000) {
-            return .{ .val = x / 1_000_000_000, .suffix = "s " };
-        }
-        if (x >= 1_000_000) {
-            return .{ .val = x / 1_000_000, .suffix = "ms" };
-        }
-        if (x >= 1_000) {
-            return .{ .val = x / 1_000, .suffix = "us" };
+        for (ns_unit_thresholds) |t| {
+            if (x >= t.min) return .{ .val = x / t.div, .suffix = t.ns_suffix };
         }
         return .{ .val = x, .suffix = "ns" };
     }
-    if (x >= 1000_000_000_000) {
-        return .{ .val = x / 1000_000_000_000, .suffix = switch (unit) {
-            .count => "T ",
-            .bytes => "TB",
-            .nanoseconds => unreachable,
-        } };
+    for (qty_unit_thresholds) |t| {
+        if (x >= t.min) return .{
+            .val = x / t.div,
+            .suffix = switch (unit) {
+                .count => t.count_suffix,
+                .bytes => t.byte_suffix,
+                .nanoseconds => unreachable,
+            },
+        };
     }
-    if (x >= 1000_000_000) {
-        return .{ .val = x / 1000_000_000, .suffix = switch (unit) {
-            .count => "G ",
-            .bytes => "GB",
-            .nanoseconds => unreachable,
-        } };
-    }
-    if (x >= 1000_000) {
-        return .{ .val = x / 1000_000, .suffix = switch (unit) {
-            .count => "M ",
-            .bytes => "MB",
-            .nanoseconds => unreachable,
-        } };
-    }
-    if (x >= 1000) {
-        return .{ .val = x / 1000, .suffix = switch (unit) {
-            .count => "K ",
-            .bytes => "KB",
-            .nanoseconds => unreachable,
-        } };
-    }
-    return .{ .val = x, .suffix = switch (unit) {
-        .count => "  ",
-        .bytes => "  ",
-        .nanoseconds => unreachable,
-    } };
+    return .{
+        .val = x,
+        .suffix = plain_unit_suffix,
+    };
 }
 
-fn formatUnitPlain(w: *std.Io.Writer, x: f64, unit: Measurement.Unit) !void {
+comptime {
+    for (ns_unit_thresholds) |t| {
+        if (t.ns_suffix.len > 0 and visibleLen(t.ns_suffix) > unit_suffix_max_vis_w) {
+            @compileError(std.fmt.comptimePrint(
+                "unit suffix '{s}' is wider than unit_suffix_max_vis_w ({d})",
+                .{ t.ns_suffix, unit_suffix_max_vis_w },
+            ));
+        }
+    }
+    for (qty_unit_thresholds) |t| {
+        if (visibleLen(t.count_suffix) > unit_suffix_max_vis_w or visibleLen(t.byte_suffix) > unit_suffix_max_vis_w) {
+            @compileError("qty threshold suffix exceeds unit_suffix_max_vis_w");
+        }
+    }
+    if (visibleLen("ns") > unit_suffix_max_vis_w) {
+        @compileError("plain ns suffix exceeds unit_suffix_max_vis_w");
+    }
+}
+
+fn measureUnitValueVis(buf: *[32]u8, x: f64, unit: Measurement.Unit) usize {
     const s = scaleUnit(x, unit);
-    try printNum3SigFigs(w, s.val);
-    try w.writeAll(s.suffix);
-}
-
-fn formatUnitVisibleLen(w: *std.Io.Writer, x: f64, unit: Measurement.Unit) !usize {
-    const prev = w.end;
-    try formatUnitPlain(w, x, unit);
-    return w.end - prev;
+    var fbs = std.Io.Writer.fixed(buf);
+    printNum3SigFigs(&fbs, s.val) catch return 0;
+    return visibleLen(fbs.buffered());
 }
 
 fn measureUnit(buf: *[32]u8, x: f64, unit: Measurement.Unit) usize {
-    var w = std.Io.Writer.fixed(buf);
-    return formatUnitVisibleLen(&w, x, unit) catch 0;
+    const s = scaleUnit(x, unit);
+    return measureUnitValueVis(buf, x, unit) + visibleLen(s.suffix);
 }
 
 fn measureOutlier(buf: *[32]u8, count: u64, sample_count: u64) usize {
@@ -314,10 +333,11 @@ fn measureOutlier(buf: *[32]u8, count: u64, sample_count: u64) usize {
 
 const delta_baseline_epsilon: f64 = 1e-9;
 
-/// Table yellow outlier column and stderr hint both use this rate (percent).
+// --- Compare deltas ---
+// Outlier highlight threshold (%). Used in the delta column and stderr notes.
 const outlier_highlight_threshold_percent: f64 = 10.0;
 
-/// Per-field CLI table metadata (comptime). JSON always emits every summarized field.
+// Per-field table labels (comptime). JSON includes every field.
 const MeasurementFieldMeta = struct {
     visibility: MeasurementRowVisibility,
     unit: Measurement.Unit,
@@ -329,15 +349,12 @@ const MeasurementRowVisibility = enum {
 };
 
 fn measurementFieldMeta(comptime field_name: []const u8) MeasurementFieldMeta {
-    if (comptime std.mem.eql(u8, field_name, "wall_time")) {
+    if (comptime std.mem.eql(u8, field_name, "wall_time"))
         return .{ .visibility = .always, .unit = .nanoseconds };
-    }
-    if (comptime std.mem.eql(u8, field_name, "peak_rss")) {
+    if (comptime std.mem.eql(u8, field_name, "peak_rss"))
         return .{ .visibility = .always, .unit = .bytes };
-    }
-    if (comptime std.mem.eql(u8, field_name, "major_faults")) {
+    if (comptime std.mem.eql(u8, field_name, "major_faults"))
         return .{ .visibility = .hide_when_max_is_zero, .unit = .count };
-    }
     return .{ .visibility = .always, .unit = .count };
 }
 
@@ -375,23 +392,6 @@ fn deltaIsDefined(m: Measurement, f: Measurement) bool {
     return true;
 }
 
-fn diffMeanPercent(m: Measurement, f: Measurement) f64 {
-    return (m.mean - f.mean) * 100 / f.mean;
-}
-
-fn isZeroDiffPercent(diff_mean_percent: f64) bool {
-    return @abs(diff_mean_percent) < delta_baseline_epsilon;
-}
-
-/// Equal means: bare `0%` when compare is defined; `n/a` when CI cannot be computed.
-fn writeZeroDiffDeltaPlain(w: *Io.Writer, m: Measurement, f: Measurement) !void {
-    if (!deltaIsDefined(m, f)) {
-        try w.writeAll("n/a");
-    } else {
-        try w.writeAll("0%");
-    }
-}
-
 fn writeDeltaPlain(w: *Io.Writer, m: Measurement, first_m: ?Measurement) !void {
     if (first_m == null) {
         try w.writeAll("0%");
@@ -402,9 +402,13 @@ fn writeDeltaPlain(w: *Io.Writer, m: Measurement, first_m: ?Measurement) !void {
         try w.writeAll("n/a");
         return;
     }
-    const diff_mean_percent = diffMeanPercent(m, f);
-    if (isZeroDiffPercent(diff_mean_percent)) {
-        try writeZeroDiffDeltaPlain(w, m, f);
+    const diff_mean_percent = (m.mean - f.mean) * 100 / f.mean;
+    if (@abs(diff_mean_percent) < delta_baseline_epsilon) {
+        if (!deltaIsDefined(m, f)) {
+            try w.writeAll("n/a");
+        } else {
+            try w.writeAll("0%");
+        }
         return;
     }
     const half = deltaHalfWidth(m, f) orelse {
@@ -441,10 +445,27 @@ fn deltaIsSignificant(diff_mean_percent: f64, half: f64) bool {
     return false;
 }
 
-fn writeUnitRightAligned(
+const UnitAlign = enum { left, right };
+
+fn printScaledUnit(
+    terminal: Io.Terminal,
+    w: *Io.Writer,
+    s: UnitScaled,
+    color: Io.Terminal.Color,
+    color_enabled: bool,
+) !void {
+    try terminal.setColor(color);
+    try printNum3SigFigs(w, s.val);
+    if (color_enabled) try terminal.setColor(.dim);
+    try w.writeAll(s.suffix);
+    try terminal.setColor(.reset);
+}
+
+fn writeUnitAligned(
     terminal: Io.Terminal,
     w: *Io.Writer,
     vis: *usize,
+    align_side: UnitAlign,
     end_vis: usize,
     x: f64,
     unit: Measurement.Unit,
@@ -453,36 +474,19 @@ fn writeUnitRightAligned(
     buf: *[32]u8,
 ) !void {
     const s = scaleUnit(x, unit);
-    var fbs = std.Io.Writer.fixed(buf);
-    const len = try formatUnitVisibleLen(&fbs, x, unit);
-    try TableLayout.padVis(w, vis, end_vis - len);
-    try terminal.setColor(color);
-    try printNum3SigFigs(w, s.val);
-    if (color_enabled) try terminal.setColor(.dim);
-    try w.writeAll(s.suffix);
-    try terminal.setColor(.reset);
-    vis.* = end_vis;
-}
-
-fn writeUnitLeftAligned(
-    terminal: Io.Terminal,
-    w: *Io.Writer,
-    vis: *usize,
-    x: f64,
-    unit: Measurement.Unit,
-    color: Io.Terminal.Color,
-    color_enabled: bool,
-    buf: *[32]u8,
-) !void {
-    const s = scaleUnit(x, unit);
-    var fbs = std.Io.Writer.fixed(buf);
-    const len = try formatUnitVisibleLen(&fbs, x, unit);
-    try terminal.setColor(color);
-    try printNum3SigFigs(w, s.val);
-    if (color_enabled) try terminal.setColor(.dim);
-    try w.writeAll(s.suffix);
-    try terminal.setColor(.reset);
-    vis.* += len;
+    const value_vis = measureUnitValueVis(buf, x, unit);
+    const suffix_vis = visibleLen(s.suffix);
+    switch (align_side) {
+        .right => {
+            try TableLayout.padVis(w, vis, end_vis - value_vis - suffix_vis);
+            try printScaledUnit(terminal, w, s, color, color_enabled);
+            vis.* = end_vis;
+        },
+        .left => {
+            try printScaledUnit(terminal, w, s, color, color_enabled);
+            vis.* += value_vis + suffix_vis;
+        },
+    }
 }
 
 fn writeDeltaColored(
@@ -542,9 +546,54 @@ fn jsonPathFromEqualsArg(arg: []const u8) ?[]const u8 {
     const prefix = "--json=";
     if (!std.mem.startsWith(u8, arg, prefix)) return null;
     const path = arg[prefix.len..];
-    if (path.len == 0) return "zebrac-results.json";
+    if (path.len == 0) return default_json_output_path;
     return path;
 }
+
+fn exitRequiresNumber(arg: []const u8) noreturn {
+    std.debug.print("'{s}' requires a number.\n{s}", .{ arg, help.short_usage });
+    process.exit(1);
+}
+
+fn nextFlagArg(args: []const []const u8, arg_i: *usize, flag: []const u8, number: bool) []const u8 {
+    arg_i.* += 1;
+    if (arg_i.* >= args.len) {
+        if (number) exitRequiresNumber(flag);
+        std.debug.print("'{s}' requires a value.\n{s}", .{ flag, help.short_usage });
+        process.exit(1);
+    }
+    return args[arg_i.*];
+}
+
+fn parseFlagU64(args: []const []const u8, arg_i: *usize, flag: []const u8, number: bool) u64 {
+    const next = nextFlagArg(args, arg_i, flag, number);
+    return std.fmt.parseInt(u64, next, 10) catch exitRequiresNumber(flag);
+}
+
+fn parseFlagUsized(args: []const []const u8, arg_i: *usize, flag: []const u8) usize {
+    const next = nextFlagArg(args, arg_i, flag, true);
+    return std.fmt.parseInt(usize, next, 10) catch exitRequiresNumber(flag);
+}
+
+fn printResultsTable(
+    w: *Io.Writer,
+    terminal: Io.Terminal,
+    measurements: Command.Measurements,
+    baseline: ?Command.Measurements,
+    with_delta: bool,
+) !void {
+    const layout = TableLayout.compute(measurements, baseline, with_delta);
+    try TableLayout.printHeader(w, terminal, layout, with_delta);
+    inline for (@typeInfo(Command.Measurements).@"struct".fields) |field| {
+        const m = @field(measurements, field.name);
+        if (measurementRowVisible(measurementFieldMeta(field.name).visibility, m)) {
+            const first_m = if (baseline) |b| @as(?Measurement, @field(b, field.name)) else null;
+            try printMeasurement(terminal, layout, m, field.name, first_m, with_delta);
+        }
+    }
+}
+
+// --- CLI operand parsing ---
 
 fn appendCommandOperand(
     arena: std.mem.Allocator,
@@ -587,30 +636,254 @@ fn anyCommandHighOutlierRate(commands: []const Command) bool {
     return false;
 }
 
+// --- Command benchmark loop ---
+
+const CommandBenchmarkConfig = struct {
+    min_samples: u64,
+    max_samples: u64,
+    max_nano_seconds: u64,
+    allow_failures: bool,
+    warmup: usize,
+};
+
+fn benchmarkCommand(
+    io: Io,
+    arena: std.mem.Allocator,
+    command: *Command,
+    command_n: usize,
+    config: CommandBenchmarkConfig,
+    bar: ?*progress.ProgressBar,
+    stderr_w: *Io.Writer,
+    stderr_capture_buf: *?StderrCaptureBuf,
+) !void {
+    var samples: std.ArrayList(Sample) = .empty;
+    try samples.ensureTotalCapacity(arena, @intCast(config.max_samples));
+    for (0..config.warmup) |_| {
+        var child = process.spawn(io, .{
+            .argv = command.argv,
+            .stdin = .inherit,
+            .stdout = .ignore,
+            .stderr = .ignore,
+            .request_resource_usage_statistics = false,
+        }) catch |err| {
+            std.debug.print("\nerror: Couldn't execute {s}: {t}\n", .{ command.argv[0], err });
+            process.exit(1);
+        };
+        const term = child.wait(io) catch |err| {
+            std.debug.print("\nerror: warmup for '{s}': {t}\n", .{ command.raw_cmd, err });
+            process.exit(1);
+        };
+        switch (term) {
+            .exited => |code| {
+                if (code != 0 and !config.allow_failures) {
+                    std.debug.print("\nerror: warmup for '{s}' failed with exit code {d}\n", .{ command.raw_cmd, code });
+                    process.exit(1);
+                }
+            },
+            else => {
+                std.debug.print("error: warmup terminated unexpectedly\n", .{});
+                process.exit(1);
+            },
+        }
+    }
+
+    var perf_fds: [perf_measurements.len]fd_t = @splat(-1);
+    openPerfGroup(&perf_fds);
+    defer closePerfFds(&perf_fds);
+
+    const first_start: Io.Timestamp = .now(io, .awake);
+    var sample_index: usize = 0;
+    var failure_stderr_verbose_shown = false;
+    var suppressed_failure_notes: u64 = 0;
+    var perf_ioctl_warned = false;
+    var perf_ioctl_skips: u32 = 0;
+    const perf_ioctl_skip_limit = perfIoctlSkipLimit(config.max_samples);
+    while ((sample_index < config.min_samples or
+        first_start.untilNow(io, .awake).toNanoseconds() < config.max_nano_seconds) and
+        sample_index < config.max_samples)
+    {
+        resetPerfGroupBeforeSample(perf_fds[0]) catch |err| {
+            onPerfIoctlSkip(err, command.raw_cmd, &perf_ioctl_warned, &perf_ioctl_skips, perf_ioctl_skip_limit);
+            continue;
+        };
+
+        const start: Io.Timestamp = .now(io, .awake);
+        const capture_failure_stderr = config.allow_failures and !failure_stderr_verbose_shown;
+
+        var child = process.spawn(io, .{
+            .argv = command.argv,
+            .stdin = .inherit,
+            .stdout = .ignore,
+            .stderr = if (capture_failure_stderr) .pipe else .ignore,
+            .request_resource_usage_statistics = true,
+        }) catch |err| {
+            std.debug.print("\nerror: Couldn't execute {s}: {t}\n", .{ command.argv[0], err });
+            process.exit(1);
+        };
+
+        var stderr_bytes: []const u8 = "";
+        var stderr_truncated = false;
+        var term: process.Child.Term = undefined;
+        var duration: Io.Duration = undefined;
+
+        if (capture_failure_stderr) {
+            if (stderr_capture_buf.* == null) {
+                stderr_capture_buf.* = .{
+                    .storage = try arena.alloc(u8, max_stderr_bytes),
+                };
+            }
+            const capture_buf = &stderr_capture_buf.*.?;
+            capture_buf.reset();
+            const measured = try waitChildAndCaptureStderr(io, &child, start, capture_buf);
+            term = measured.term;
+            duration = measured.duration;
+            const capture = capture_buf.view();
+            stderr_bytes = capture.bytes;
+            stderr_truncated = capture.truncated;
+        } else {
+            term = child.wait(io) catch |err| {
+                std.debug.print("\nerror: Couldn't execute {s}: {t}\n", .{ command.argv[0], err });
+                process.exit(1);
+            };
+            duration = start.untilNow(io, .awake);
+        }
+
+        disablePerfGroupAfterSample(perf_fds[0]) catch |err| {
+            onPerfIoctlSkip(err, command.raw_cmd, &perf_ioctl_warned, &perf_ioctl_skips, perf_ioctl_skip_limit);
+            continue;
+        };
+
+        const usage = child.resource_usage_statistics;
+        const peak_rss = usage.getMaxRss() orelse 0;
+        const faults = readPageFaults(usage);
+
+        switch (term) {
+            .exited => |code| {
+                if (code != 0 and !config.allow_failures) {
+                    if (bar) |b| b.clear() catch {};
+                    std.debug.print("\nerror: Benchmark {d} command '{s}' failed with exit code {d}\n", .{
+                        command_n,
+                        command.raw_cmd,
+                        code,
+                    });
+                    std.debug.print("hint: pass --allow-failures to capture stderr from failing runs\n", .{});
+                    process.exit(1);
+                }
+                if (code != 0 and config.allow_failures) {
+                    command.failed_sample_count += 1;
+                    if (!failure_stderr_verbose_shown) {
+                        failure_stderr_verbose_shown = true;
+                        std.debug.print("\nnote: sample {d} for '{s}' exited {d}\n", .{
+                            sample_index + 1,
+                            command.raw_cmd,
+                            code,
+                        });
+                        printCapturedStderr(stderr_bytes, stderr_truncated);
+                    } else {
+                        suppressed_failure_notes += 1;
+                    }
+                }
+            },
+            else => {
+                std.debug.print("error: terminated unexpectedly\n", .{});
+                process.exit(1);
+            },
+        }
+
+        const perf_values = try readSamplePerfCounters(&perf_fds);
+
+        try samples.append(arena, .{
+            .wall_time = @intCast(duration.toNanoseconds()),
+            .peak_rss = peak_rss,
+            .minor_faults = faults.minor,
+            .major_faults = faults.major,
+            .cpu_cycles = perf_values[0],
+            .instructions = perf_values[1],
+            .cache_references = perf_values[2],
+            .cache_misses = perf_values[3],
+            .branch_misses = perf_values[4],
+        });
+
+        sample_index += 1;
+
+        if (bar) |b| {
+            b.estimate = est_total: {
+                const cur_samples: u64 = sample_index;
+                var ns_per_sample: u64 = @intCast(@divTrunc((first_start.untilNow(io, .awake).toNanoseconds()), cur_samples));
+                if (ns_per_sample == 0) ns_per_sample = 1;
+                const estimate = std.math.divCeil(u64, config.max_nano_seconds, ns_per_sample) catch unreachable;
+                break :est_total @intCast(@min(config.max_samples, @max(cur_samples, estimate, config.min_samples)));
+            };
+            b.current += 1;
+            try b.render(io);
+        }
+    }
+
+    if (suppressed_failure_notes > 0) {
+        if (suppressed_failure_notes == 1) {
+            std.debug.print("\nnote: 1 more failed sample for '{s}' (stderr omitted)\n", .{command.raw_cmd});
+        } else {
+            std.debug.print("\nnote: {d} more failed samples for '{s}' (stderr omitted)\n", .{
+                suppressed_failure_notes,
+                command.raw_cmd,
+            });
+        }
+    }
+
+    if (bar) |b| {
+        b.estimate = b.current;
+        try b.render(io);
+        try b.clear();
+        try stderr_w.writeAll("\n");
+        try stderr_w.flush();
+        b.current = 0;
+        b.estimate = 1;
+    }
+
+    const all_samples = samples.items;
+    if (all_samples.len == 0) {
+        std.debug.print("\nerror: no samples collected for '{s}' (try longer --duration or more --min-samples)\n", .{
+            command.raw_cmd,
+        });
+        process.exit(1);
+    }
+    const sort_scratch = try arena.alloc(Sample, all_samples.len);
+    command.measurements = Measurement.summarizeAll(all_samples, sort_scratch) catch |err| {
+        std.debug.print("\nerror: stats for '{s}': {s}\n", .{
+            command.raw_cmd,
+            Measurement.errorMessage(err),
+        });
+        process.exit(1);
+    };
+    command.sample_count = all_samples.len;
+}
+
+// --- Entry point ---
+
 pub fn main(init: process.Init) !void {
     const io = init.io;
     const arena = init.arena.allocator();
 
     const args = try init.minimal.args.toSlice(arena);
 
-    var stdout_buffer: [1024]u8 = undefined;
+    var stdout_buffer: [stream_io_buf_len]u8 = undefined;
     var stdout_writer = Io.File.stdout().writerStreaming(io, &stdout_buffer);
     const stdout_w = &stdout_writer.interface;
 
-    var stderr_buffer: [1024]u8 = undefined;
+    var stderr_buffer: [stream_io_buf_len]u8 = undefined;
     var stderr_writer = Io.File.stderr().writerStreaming(io, &stderr_buffer);
     const stderr_w = &stderr_writer.interface;
 
     var commands: std.ArrayList(Command) = .empty;
-    var max_nano_seconds: u64 = std.time.ns_per_s * 5;
+    var max_nano_seconds: u64 = default_duration_ms * std.time.ns_per_ms;
     var color: ColorMode = .auto;
     var allow_failures = false;
     var json_path: ?[]const u8 = null;
     var quiet = false;
-    var min_samples: u64 = 5;
+    var min_samples: u64 = default_min_samples;
     var max_samples: u64 = help.max_samples_cap;
     var max_samples_clamped_from: ?u64 = null;
-    var warmup: usize = 3;
+    var warmup: usize = default_warmup;
 
     var parse_flags = true;
     var arg_i: usize = 1;
@@ -631,23 +904,11 @@ pub fn main(init: process.Init) !void {
             try stdout_w.flush();
             return process.cleanExit(io);
         } else if (std.mem.eql(u8, arg, "--version")) {
-            try stdout_w.print("zebrac {s}\n", .{help.version});
+            try stdout_w.writeAll(help.version_line);
             try stdout_w.flush();
             return process.cleanExit(io);
         } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--duration")) {
-            arg_i += 1;
-            if (arg_i >= args.len) {
-                std.debug.print("'{s}' requires a duration in milliseconds.\n{s}", .{ arg, help.short_usage });
-                process.exit(1);
-            }
-            const next = args[arg_i];
-            const max_ms = std.fmt.parseInt(u64, next, 10) catch |err| {
-                std.debug.print("unable to parse --duration argument '{s}': {t}\n", .{
-                    next, err,
-                });
-                process.exit(1);
-            };
-            max_nano_seconds = std.time.ns_per_ms * max_ms;
+            max_nano_seconds = std.time.ns_per_ms * parseFlagU64(args, &arg_i, arg, true);
         } else if (std.mem.eql(u8, arg, "--color")) {
             arg_i += 1;
             if (arg_i >= args.len) {
@@ -673,30 +934,14 @@ pub fn main(init: process.Init) !void {
                 arg_i += 1;
                 json_path = args[arg_i];
             } else {
-                json_path = "zebrac-results.json";
+                json_path = default_json_output_path;
             }
         } else if (std.mem.eql(u8, arg, "-q") or std.mem.eql(u8, arg, "--quiet")) {
             quiet = true;
         } else if (std.mem.eql(u8, arg, "-i") or std.mem.eql(u8, arg, "--min-samples")) {
-            arg_i += 1;
-            if (arg_i >= args.len) {
-                std.debug.print("'{s}' requires a number.\n{s}", .{ arg, help.short_usage });
-                process.exit(1);
-            }
-            min_samples = std.fmt.parseInt(u64, args[arg_i], 10) catch |err| {
-                std.debug.print("unable to parse --min-samples argument '{s}': {t}\n", .{ args[arg_i], err });
-                process.exit(1);
-            };
+            min_samples = parseFlagU64(args, &arg_i, arg, true);
         } else if (std.mem.eql(u8, arg, "-a") or std.mem.eql(u8, arg, "--max-samples")) {
-            arg_i += 1;
-            if (arg_i >= args.len) {
-                std.debug.print("'{s}' requires a number.\n{s}", .{ arg, help.short_usage });
-                process.exit(1);
-            }
-            const parsed_max = std.fmt.parseInt(u64, args[arg_i], 10) catch |err| {
-                std.debug.print("unable to parse --max-samples argument '{s}': {t}\n", .{ args[arg_i], err });
-                process.exit(1);
-            };
+            const parsed_max = parseFlagU64(args, &arg_i, arg, true);
             if (parsed_max > help.max_samples_cap) {
                 max_samples_clamped_from = parsed_max;
                 max_samples = help.max_samples_cap;
@@ -704,15 +949,7 @@ pub fn main(init: process.Init) !void {
                 max_samples = parsed_max;
             }
         } else if (std.mem.eql(u8, arg, "-w") or std.mem.eql(u8, arg, "--warmup")) {
-            arg_i += 1;
-            if (arg_i >= args.len) {
-                std.debug.print("'{s}' requires a number.\n{s}", .{ arg, help.short_usage });
-                process.exit(1);
-            }
-            warmup = std.fmt.parseInt(usize, args[arg_i], 10) catch |err| {
-                std.debug.print("unable to parse --warmup argument '{s}': {t}\n", .{ args[arg_i], err });
-                process.exit(1);
-            };
+            warmup = parseFlagUsized(args, &arg_i, arg);
         } else {
             std.debug.print("unrecognized argument: '{s}'\n{s}", .{ arg, help.usage_text });
             process.exit(1);
@@ -720,13 +957,15 @@ pub fn main(init: process.Init) !void {
     }
 
     if (commands.items.len == 0) {
+        @branchHint(.cold);
         try stdout_w.writeAll(help.usage_text);
         try stdout_w.flush();
         process.exit(1);
     }
 
     help.validateSampleLimits(min_samples, max_samples) catch |err| {
-        std.debug.print("error: {s}\n", .{help.sampleLimitsErrorMessage(err, min_samples, max_samples)});
+        @branchHint(.cold);
+        std.debug.print("error: {s}\n", .{help.errorMessage(err)});
         process.exit(1);
     };
 
@@ -761,211 +1000,26 @@ pub fn main(init: process.Init) !void {
     }
     defer if (bar) |*b| b.deinit();
 
-    var perf_fds: [perf_measurements.len]fd_t = @splat(-1);
-
     var stderr_capture_buf: ?StderrCaptureBuf = null;
+    const bench_config = CommandBenchmarkConfig{
+        .min_samples = min_samples,
+        .max_samples = max_samples,
+        .max_nano_seconds = max_nano_seconds,
+        .allow_failures = allow_failures,
+        .warmup = warmup,
+    };
 
     for (commands.items, 1..) |*command, command_n| {
-        var samples: std.ArrayList(Sample) = .empty;
-        try samples.ensureTotalCapacity(arena, @intCast(max_samples));
-        for (0..warmup) |_| {
-            var child = process.spawn(io, .{
-                .argv = command.argv,
-                .stdin = .inherit,
-                .stdout = .ignore,
-                .stderr = .ignore,
-                .request_resource_usage_statistics = false,
-            }) catch |err| {
-                std.debug.print("\nerror: Couldn't execute {s}: {t}\n", .{ command.argv[0], err });
-                process.exit(1);
-            };
-            const term = child.wait(io) catch |err| {
-                std.debug.print("\nerror: warmup for '{s}': {t}\n", .{ command.raw_cmd, err });
-                process.exit(1);
-            };
-            switch (term) {
-                .exited => |code| {
-                    if (code != 0 and !allow_failures) {
-                        std.debug.print("\nerror: warmup for '{s}' failed with exit code {d}\n", .{ command.raw_cmd, code });
-                        process.exit(1);
-                    }
-                },
-                else => {
-                    std.debug.print("error: warmup terminated unexpectedly\n", .{});
-                    process.exit(1);
-                },
-            }
-        }
-
-        openPerfGroup(&perf_fds);
-        defer closePerfFds(&perf_fds);
-
-        const first_start: Io.Timestamp = .now(io, .awake);
-        var sample_index: usize = 0;
-        var failure_stderr_verbose_shown = false;
-        var suppressed_failure_notes: u64 = 0;
-        var perf_ioctl_warned = false;
-        var perf_ioctl_skips: u32 = 0;
-        const perf_ioctl_skip_limit = perfIoctlSkipLimit(max_samples);
-        while ((sample_index < min_samples or
-            first_start.untilNow(io, .awake).toNanoseconds() < max_nano_seconds) and
-            sample_index < max_samples)
-        {
-            resetPerfGroupBeforeSample(perf_fds[0]) catch |err| {
-                onPerfIoctlSkip(err, command.raw_cmd, &perf_ioctl_warned, &perf_ioctl_skips, perf_ioctl_skip_limit);
-                continue;
-            };
-
-            const start: Io.Timestamp = .now(io, .awake);
-
-            const capture_failure_stderr = allow_failures and !failure_stderr_verbose_shown;
-
-            var child = try process.spawn(io, .{
-                .argv = command.argv,
-                .stdin = .inherit,
-                .stdout = .ignore,
-                .stderr = if (capture_failure_stderr) .pipe else .ignore,
-                .request_resource_usage_statistics = true,
-            });
-
-            var stderr_bytes: []const u8 = "";
-            var stderr_truncated = false;
-            var term: process.Child.Term = undefined;
-            var duration: Io.Duration = undefined;
-
-            if (capture_failure_stderr) {
-                if (stderr_capture_buf == null) {
-                    stderr_capture_buf = .{
-                        .storage = try arena.alloc(u8, max_stderr_bytes),
-                    };
-                }
-                const capture_buf = &stderr_capture_buf.?;
-                capture_buf.reset();
-                const measured = try waitChildAndCaptureStderr(io, &child, start, capture_buf);
-                term = measured.term;
-                duration = measured.duration;
-                const capture = capture_buf.view();
-                stderr_bytes = capture.bytes;
-                stderr_truncated = capture.truncated;
-            } else {
-                term = child.wait(io) catch |err| {
-                    std.debug.print("\nerror: Couldn't execute {s}: {t}\n", .{ command.argv[0], err });
-                    process.exit(1);
-                };
-                duration = start.untilNow(io, .awake);
-            }
-
-            disablePerfGroupAfterSample(perf_fds[0]) catch |err| {
-                onPerfIoctlSkip(err, command.raw_cmd, &perf_ioctl_warned, &perf_ioctl_skips, perf_ioctl_skip_limit);
-                continue;
-            };
-
-            const usage = child.resource_usage_statistics;
-            const peak_rss = usage.getMaxRss() orelse 0;
-            const faults = readPageFaults(usage);
-
-            switch (term) {
-                .exited => |code| {
-                    if (code != 0 and !allow_failures) {
-                        if (bar) |*b|
-                            b.clear(io) catch {};
-                        std.debug.print("\nerror: Benchmark {d} command '{s}' failed with exit code {d}\n", .{
-                            command_n,
-                            command.raw_cmd,
-                            code,
-                        });
-                        std.debug.print("hint: pass --allow-failures to capture stderr from failing runs\n", .{});
-                        process.exit(1);
-                    }
-                    if (code != 0 and allow_failures) {
-                        command.failed_sample_count += 1;
-                        if (!failure_stderr_verbose_shown) {
-                            failure_stderr_verbose_shown = true;
-                            std.debug.print("\nnote: sample {d} for '{s}' exited {d}\n", .{
-                                sample_index + 1,
-                                command.raw_cmd,
-                                code,
-                            });
-                            printCapturedStderr(stderr_bytes, stderr_truncated);
-                        } else {
-                            suppressed_failure_notes += 1;
-                        }
-                    }
-                },
-                else => {
-                    std.debug.print("error: terminated unexpectedly\n", .{});
-                    process.exit(1);
-                },
-            }
-
-            const perf_values = try readSamplePerfCounters(&perf_fds);
-
-            try samples.append(arena, .{
-                .wall_time = @intCast(duration.toNanoseconds()),
-                .peak_rss = peak_rss,
-                .minor_faults = faults.minor,
-                .major_faults = faults.major,
-                .cpu_cycles = perf_values[0],
-                .instructions = perf_values[1],
-                .cache_references = perf_values[2],
-                .cache_misses = perf_values[3],
-                .branch_misses = perf_values[4],
-            });
-
-            sample_index += 1;
-
-            if (bar) |*b| {
-                b.estimate = est_total: {
-                    const cur_samples: u64 = sample_index;
-                    var ns_per_sample: u64 = @intCast(@divTrunc((first_start.untilNow(io, .awake).toNanoseconds()), cur_samples));
-                    if (ns_per_sample == 0) ns_per_sample = 1;
-                    const estimate = std.math.divCeil(u64, max_nano_seconds, ns_per_sample) catch unreachable;
-                    break :est_total @intCast(@min(max_samples, @max(cur_samples, estimate, min_samples)));
-                };
-                b.current += 1;
-                try b.render(io);
-            }
-        }
-
-        if (suppressed_failure_notes > 0) {
-            if (suppressed_failure_notes == 1) {
-                std.debug.print("\nnote: 1 more failed sample for '{s}' (stderr omitted)\n", .{
-                    command.raw_cmd,
-                });
-            } else {
-                std.debug.print("\nnote: {d} more failed samples for '{s}' (stderr omitted)\n", .{
-                    suppressed_failure_notes,
-                    command.raw_cmd,
-                });
-            }
-        }
-
-        if (bar) |*b| {
-            b.estimate = b.current;
-            try b.render(io);
-            try b.clear(io);
-            try stderr_w.writeAll("\n");
-            try stderr_w.flush();
-            b.current = 0;
-            b.estimate = 1;
-        }
-
-        const all_samples = samples.items;
-        if (all_samples.len == 0) {
-            std.debug.print("\nerror: no samples collected for '{s}' (try longer --duration or more --min-samples)\n", .{
-                command.raw_cmd,
-            });
-            process.exit(1);
-        }
-        const sort_scratch = try arena.alloc(Sample, all_samples.len);
-        command.measurements = Measurement.summarizeAll(all_samples, sort_scratch) catch |err| {
-            std.debug.print("\nerror: stats for '{s}': {s}\n", .{
-                command.raw_cmd,
-                Measurement.statsErrorMessage(err),
-            });
-            process.exit(1);
-        };
-        command.sample_count = all_samples.len;
+        try benchmarkCommand(
+            io,
+            arena,
+            command,
+            command_n,
+            bench_config,
+            if (bar) |*b| b else null,
+            stderr_w,
+            &stderr_capture_buf,
+        );
     }
 
     if (warmup == 0) {
@@ -975,7 +1029,7 @@ pub fn main(init: process.Init) !void {
         try run_notes.append(arena, "outlier rate >=10% on at least one metric; check system load or raise --warmup");
     }
 
-    help.printRunNotes(run_notes.items);
+    try help.printRunNotes(stderr_w, run_notes.items);
 
     for (commands.items, 1..) |*command, command_n| {
         if (terminal) |t| {
@@ -997,27 +1051,18 @@ pub fn main(init: process.Init) !void {
 
             const with_delta = commands.items.len >= 2;
             const baseline: ?Command.Measurements = if (command_n == 1) null else commands.items[0].measurements;
-            const layout = TableLayout.compute(command.measurements, baseline, with_delta);
-            try TableLayout.printHeader(stdout_w, t, layout, with_delta);
-
-            inline for (@typeInfo(Command.Measurements).@"struct".fields) |field| {
-                const measurement = @field(command.measurements, field.name);
-                if (measurementRowVisible(measurementFieldMeta(field.name).visibility, measurement)) {
-                    const first_measurement = if (command_n == 1)
-                        null
-                    else
-                        @field(commands.items[0].measurements, field.name);
-                    try printMeasurement(t, layout, measurement, field.name, first_measurement, with_delta);
-                }
-            }
+            try printResultsTable(stdout_w, t, command.measurements, baseline, with_delta);
 
             try stdout_w.flush();
         }
     }
 
     if (json_path) |path| {
-        var file_buf: [4096]u8 = undefined;
-        var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        var file_buf: [json_file_buf_len]u8 = undefined;
+        var file = std.Io.Dir.cwd().createFile(io, path, .{}) catch |err| {
+            std.debug.print("\nerror: cannot write JSON to '{s}': {t}\n", .{ path, err });
+            process.exit(1);
+        };
         defer file.close(io);
         var file_writer = file.writerStreaming(io, &file_buf);
         const json_config = JsonRunConfig{
@@ -1035,6 +1080,8 @@ pub fn main(init: process.Init) !void {
 
     try stdout_w.flush();
 }
+
+// --- JSON export ---
 
 const json_schema_version = 1;
 
@@ -1102,36 +1149,14 @@ fn writeJsonConfig(s: *std.json.Stringify, config: JsonRunConfig) !void {
 
 fn writeJsonMeasurement(s: *std.json.Stringify, m: Measurement) !void {
     try s.beginObject();
-    try s.objectField("mean");
-    try s.write(m.mean);
-    try s.objectField("std_dev");
-    try s.write(m.std_dev);
-    try s.objectField("min");
-    try s.write(m.min);
-    try s.objectField("max");
-    try s.write(m.max);
-    try s.objectField("median");
-    try s.write(m.median);
-    try s.objectField("q1");
-    try s.write(m.q1);
-    try s.objectField("q3");
-    try s.write(m.q3);
-    try s.objectField("outlier_count");
-    try s.write(m.outlier_count);
-    try s.objectField("sample_count");
-    try s.write(m.sample_count);
+    const fields = .{ "mean", "std_dev", "min", "max", "median", "q1", "q3", "outlier_count", "sample_count" };
+    inline for (fields) |name| {
+        try s.objectField(name);
+        try s.write(@field(m, name));
+    }
     try s.objectField("unit");
     try s.write(@tagName(m.unit));
     try s.endObject();
-}
-
-fn closePerfFds(fds: []fd_t) void {
-    for (fds) |*fd| {
-        if (fd.* != -1) {
-            _ = std.os.linux.close(fd.*);
-            fd.* = -1;
-        }
-    }
 }
 
 const StderrCapture = struct {
@@ -1170,6 +1195,8 @@ const StderrCaptureBuf = struct {
     }
 };
 
+// --- Child stderr capture ---
+
 fn posixWaitStatusToTerm(status: u32) process.Child.Term {
     const W = std.os.linux.W;
     return if (W.IFEXITED(status))
@@ -1199,7 +1226,7 @@ fn closeChildPipes(child: *process.Child) void {
 }
 
 fn readStderrFd(stderr_fd: fd_t, buf: *StderrCaptureBuf) !void {
-    var scratch: [4096]u8 = undefined;
+    var scratch: [stderr_pipe_read_scratch]u8 = undefined;
     while (true) {
         const n = std.posix.read(stderr_fd, &scratch) catch |err| switch (err) {
             error.WouldBlock => return,
@@ -1216,13 +1243,12 @@ fn readStderrFd(stderr_fd: fd_t, buf: *StderrCaptureBuf) !void {
 }
 
 fn discardStderrRemainder(stderr_fd: fd_t) void {
-    var buf: [4096]u8 = undefined;
+    var buf: [stderr_pipe_read_scratch]u8 = undefined;
     while (std.posix.read(stderr_fd, &buf)) |_| {} else |_| return;
 }
 
-/// Under `-f`: reap the child, end wall time at exit, then drain stderr (post-exit
-/// drain is not counted). Interleaves stderr reads while the child runs so a full
-/// pipe cannot deadlock `wait`.
+// With -f: wall time ends when the child exits; stderr drain after that is extra.
+// Read stderr while the child runs so a full pipe can't block wait.
 fn waitChildAndCaptureStderr(
     io: Io,
     child: *process.Child,
@@ -1310,6 +1336,8 @@ fn printCapturedStderr(bytes: []const u8, truncated: bool) void {
     }
 }
 
+// --- Perf sampling ---
+
 const PerfSampleResetError = error{
     BadLeaderFd,
     DisableFailed,
@@ -1357,7 +1385,7 @@ fn printPerfIoctlSkipWarn(err: anyerror, command: []const u8) void {
 
 fn perfIoctlSkipLimit(max_samples: u64) u32 {
     const scaled = max_samples *| 2;
-    return @intCast(@max(@as(u32, 32), @min(scaled, 1024)));
+    return @intCast(@max(perf_ioctl_skip_limit_min, @min(scaled, perf_ioctl_skip_limit_max)));
 }
 
 fn onPerfIoctlSkip(
@@ -1431,9 +1459,18 @@ fn perfEventAttrForGroupMember(config: PERF.COUNT.HW, is_leader: bool) std.os.li
     };
 }
 
+fn closePerfFds(fds: []fd_t) void {
+    for (fds) |*fd| {
+        if (fd.* != -1) {
+            _ = std.os.linux.close(fd.*);
+            fd.* = -1;
+        }
+    }
+}
+
 fn openPerfGroup(fds: *[perf_measurements.len]fd_t) void {
-    // One perf group per command. Opening all five fds every sample was pure syscall tax.
-    // Each sample: DISABLE, RESET, spawn child, read counters, DISABLE again.
+    // One perf group per command; reopening fds every sample is too slow.
+    // Each sample: disable, reset, spawn, read counters, disable again.
     for (perf_measurements, fds, 0..) |measurement, *perf_fd, i| {
         var attr = perfEventAttrForGroupMember(measurement.config, i == 0);
         perf_fd.* = std.posix.perf_event_open(&attr, 0, -1, fds[0], PERF.FLAG.FD_CLOEXEC) catch |err| {
@@ -1461,6 +1498,8 @@ fn readPerfFd(fd: fd_t) !usize {
     return result;
 }
 
+// --- Statistics ---
+
 const Measurement = struct {
     q1: u64,
     median: u64,
@@ -1484,14 +1523,14 @@ const Measurement = struct {
         ScratchTooSmall,
     };
 
-    pub fn statsErrorMessage(err: StatsError) []const u8 {
+    pub fn errorMessage(err: StatsError) []const u8 {
         return switch (err) {
             error.NoSamples => "no samples to summarize",
             error.ScratchTooSmall => "sort scratch buffer is shorter than the sample list",
         };
     }
 
-    /// One scratch slice for the whole command; sorts once per metric via inline loop.
+    // One scratch buffer; sort once per metric.
     fn summarizeAll(samples: []const Sample, sort_scratch: []Sample) StatsError!Command.Measurements {
         if (samples.len == 0) return error.NoSamples;
         if (sort_scratch.len < samples.len) return error.ScratchTooSmall;
@@ -1504,7 +1543,7 @@ const Measurement = struct {
         return out;
     }
 
-    /// Caller owns `work`; we memcpy+sort in place so the sample list stays untouched.
+    // Sort a copy; leave the original sample list in run order.
     fn summarizeField(
         samples: []const Sample,
         work: []Sample,
@@ -1552,7 +1591,7 @@ const Measurement = struct {
         }
         return .{
             .q1 = q1,
-            // Upper middle index; even-length runs use the higher of the two middles.
+            // Even count: use the upper of the two middle values.
             .median = @field(work_slice[work_slice.len / 2], field),
             .q3 = q3,
             .mean = mean,
@@ -1565,6 +1604,12 @@ const Measurement = struct {
         };
     }
 };
+
+comptime {
+    for (std.meta.fieldNames(Measurement.StatsError)) |name| {
+        _ = Measurement.errorMessage(@field(Measurement.StatsError, name));
+    }
+}
 
 fn printMeasurement(
     terminal: Io.Terminal,
@@ -1581,30 +1626,22 @@ fn printMeasurement(
 
     try w.splatByteAll(' ', row_indent);
     try w.writeAll(name);
-    vis = row_indent + visibleLen(name);
+    vis = row_indent + name.len;
     try TableLayout.padVis(w, &vis, layout.name_w);
 
     try TableLayout.gap(w, &vis);
-    try writeUnitRightAligned(terminal, w, &vis, layout.meanSepVis(), m.mean, m.unit, .bright_green, color_enabled, &unit_buf);
+    try writeUnitAligned(terminal, w, &vis, .right, layout.meanSepVis(), m.mean, m.unit, .bright_green, color_enabled, &unit_buf);
     try w.writeAll(sep_mean);
     vis = layout.meanSepVis() + visibleLen(sep_mean);
-    try writeUnitLeftAligned(terminal, w, &vis, m.std_dev, m.unit, .green, color_enabled, &unit_buf);
-    try TableLayout.padVis(
-        w,
-        &vis,
-        layout.name_w + col_gap + layout.mean_w + visibleLen(sep_mean) + layout.std_w,
-    );
+    try writeUnitAligned(terminal, w, &vis, .left, 0, m.std_dev, m.unit, .green, color_enabled, &unit_buf);
+    try TableLayout.padVis(w, &vis, layout.stdColEndVis());
 
     try TableLayout.gap(w, &vis);
-    try writeUnitRightAligned(terminal, w, &vis, layout.minSepVis(), @floatFromInt(m.min), m.unit, .cyan, color_enabled, &unit_buf);
+    try writeUnitAligned(terminal, w, &vis, .right, layout.minSepVis(), @floatFromInt(m.min), m.unit, .cyan, color_enabled, &unit_buf);
     try w.writeAll(sep_minmax);
     vis = layout.minSepVis() + visibleLen(sep_minmax);
-    try writeUnitLeftAligned(terminal, w, &vis, @floatFromInt(m.max), m.unit, .magenta, color_enabled, &unit_buf);
-    try TableLayout.padVis(
-        w,
-        &vis,
-        layout.name_w + col_gap + layout.mean_w + visibleLen(sep_mean) + layout.std_w + col_gap + layout.min_w + visibleLen(sep_minmax) + layout.max_w,
-    );
+    try writeUnitAligned(terminal, w, &vis, .left, 0, @floatFromInt(m.max), m.unit, .magenta, color_enabled, &unit_buf);
+    try TableLayout.padVis(w, &vis, layout.minMaxColEndVis());
 
     try TableLayout.gap(w, &vis);
     try TableLayout.padVis(w, &vis, layout.outlierStartVis());
@@ -1640,7 +1677,7 @@ fn printNum3SigFigs(w: *std.Io.Writer, num: f64) !void {
     }
 }
 
-/// 95% critical value for compare deltas. Pass `df` for Student-t; `null` uses the normal approximation (1.96).
+/// 95% t critical value for compare deltas. `df` = Student-t; null = normal (1.96).
 pub fn getStatScore95(df: ?u64) f64 {
     if (df) |dff| {
         const dfv: usize = @intCast(dff);
@@ -1704,17 +1741,7 @@ const t_table95_10s_10to120 = [_]f64{
 };
 
 fn sampleWith(comptime field: []const u8, value: u64) Sample {
-    var s: Sample = .{
-        .wall_time = 0,
-        .peak_rss = 0,
-        .minor_faults = 0,
-        .major_faults = 0,
-        .cpu_cycles = 0,
-        .instructions = 0,
-        .cache_references = 0,
-        .cache_misses = 0,
-        .branch_misses = 0,
-    };
+    var s = std.mem.zeroes(Sample);
     @field(s, field) = value;
     return s;
 }
@@ -1734,319 +1761,58 @@ fn testMeasurement(unit: Measurement.Unit) Measurement {
     };
 }
 
-test "printJsonOutput writes schema envelope and config" {
-    var buf: [8192]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
+// --- Test helpers ---
 
-    const wall = testMeasurement(.nanoseconds);
-    const measurements: Command.Measurements = .{
+fn measurementsFill(each: Measurement) Command.Measurements {
+    var out: Command.Measurements = undefined;
+    inline for (@typeInfo(Command.Measurements).@"struct".fields) |field| {
+        @field(out, field.name) = each;
+    }
+    return out;
+}
+
+fn measurementsFromParts(wall: Measurement, rss: Measurement, count: Measurement) Command.Measurements {
+    return .{
         .wall_time = wall,
-        .peak_rss = testMeasurement(.bytes),
-        .minor_faults = testMeasurement(.count),
-        .major_faults = testMeasurement(.count),
-        .cpu_cycles = testMeasurement(.count),
-        .instructions = testMeasurement(.count),
-        .cache_references = testMeasurement(.count),
-        .cache_misses = testMeasurement(.count),
-        .branch_misses = testMeasurement(.count),
+        .peak_rss = rss,
+        .minor_faults = count,
+        .major_faults = count,
+        .cpu_cycles = count,
+        .instructions = count,
+        .cache_references = count,
+        .cache_misses = count,
+        .branch_misses = count,
     };
-    var commands = [_]Command{.{
-        .raw_cmd = "/bin/true",
-        .argv = &.{"/bin/true"},
-        .measurements = measurements,
-        .sample_count = 5,
-        .failed_sample_count = 2,
-    }};
-    const config = JsonRunConfig{
-        .duration_ms = 500,
-        .min_samples = 2,
-        .max_samples = help.max_samples_cap,
-        .max_samples_requested = 50_000,
-        .warmup = 1,
-        .allow_failures = false,
-    };
-
-    try printJsonOutput(&w, &commands, config);
-
-    const Parsed = struct {
-        schema_version: u32,
-        zebrac_version: []const u8,
-        config: struct {
-            duration_ms: u64,
-            min_samples: u64,
-            max_samples: u64,
-            max_samples_cap: u64,
-            max_samples_requested: ?u64,
-            warmup: usize,
-            allow_failures: bool,
-        },
-        results: []struct {
-            command: []const u8,
-            sample_count: usize,
-            failed_sample_count: u64,
-            wall_time: struct { mean: f64, unit: []const u8 },
-            minor_faults: struct { mean: f64, unit: []const u8 },
-            major_faults: struct { mean: f64, unit: []const u8 },
-        },
-    };
-
-    const parsed = try std.json.parseFromSlice(Parsed, std.testing.allocator, w.buffered(), .{
-        .ignore_unknown_fields = true,
-    });
-    defer parsed.deinit();
-
-    try std.testing.expectEqual(json_schema_version, parsed.value.schema_version);
-    try std.testing.expectEqualStrings(help.version, parsed.value.zebrac_version);
-    try std.testing.expectEqual(@as(u64, 500), parsed.value.config.duration_ms);
-    try std.testing.expectEqual(@as(u64, 2), parsed.value.config.min_samples);
-    try std.testing.expectEqual(@as(u64, help.max_samples_cap), parsed.value.config.max_samples_cap);
-    try std.testing.expectEqual(@as(?u64, 50_000), parsed.value.config.max_samples_requested);
-    try std.testing.expectEqual(@as(usize, 1), parsed.value.results.len);
-    try std.testing.expectEqualStrings("/bin/true", parsed.value.results[0].command);
-    try std.testing.expectEqual(@as(usize, 5), parsed.value.results[0].sample_count);
-    try std.testing.expectEqual(@as(u64, 2), parsed.value.results[0].failed_sample_count);
-    try std.testing.expectEqual(@as(f64, 2), parsed.value.results[0].wall_time.mean);
-    try std.testing.expectEqualStrings("nanoseconds", parsed.value.results[0].wall_time.unit);
-    try std.testing.expectEqual(@as(f64, 2), parsed.value.results[0].minor_faults.mean);
-    try std.testing.expectEqualStrings("count", parsed.value.results[0].minor_faults.unit);
-    try std.testing.expectEqual(@as(f64, 2), parsed.value.results[0].major_faults.mean);
-    try std.testing.expectEqualStrings("count", parsed.value.results[0].major_faults.unit);
 }
 
-test "jsonPathFromEqualsArg parses --json=path" {
-    try std.testing.expectEqualStrings("out.json", jsonPathFromEqualsArg("--json=out.json").?);
-    try std.testing.expectEqualStrings("zebrac-results.json", jsonPathFromEqualsArg("--json=").?);
-    try std.testing.expect(jsonPathFromEqualsArg("--json") == null);
-}
-
-test "anyCommandHighOutlierRate at 10% threshold" {
-    var low = testMeasurement(.count);
-    low.sample_count = 10;
-    low.outlier_count = 0;
-    var border = testMeasurement(.count);
-    border.sample_count = 10;
-    border.outlier_count = 1;
-    var high = testMeasurement(.count);
-    high.sample_count = 10;
-    high.outlier_count = 2;
-
-    const low_only: Command.Measurements = .{
-        .wall_time = low,
-        .peak_rss = low,
-        .minor_faults = low,
-        .major_faults = low,
-        .cpu_cycles = low,
-        .instructions = low,
-        .cache_references = low,
-        .cache_misses = low,
-        .branch_misses = low,
+fn commandWithWallOutlierPct(sample_count: u64, outlier_count: u64) Command {
+    var wall = testMeasurement(.count);
+    wall.sample_count = sample_count;
+    wall.outlier_count = outlier_count;
+    return .{
+        .raw_cmd = "cmd",
+        .argv = &.{},
+        .measurements = measurementsFill(wall),
+        .sample_count = @intCast(sample_count),
+        .failed_sample_count = 0,
     };
-    var border_meas = low_only;
-    border_meas.wall_time = border;
-    var high_meas = low_only;
-    high_meas.wall_time = high;
-
-    const cmds = [_]Command{
-        .{ .raw_cmd = "a", .argv = &.{}, .measurements = low_only, .sample_count = 10, .failed_sample_count = 0 },
-        .{ .raw_cmd = "b", .argv = &.{}, .measurements = border_meas, .sample_count = 10, .failed_sample_count = 0 },
-        .{ .raw_cmd = "c", .argv = &.{}, .measurements = high_meas, .sample_count = 10, .failed_sample_count = 0 },
-    };
-    try std.testing.expect(!anyCommandHighOutlierRate(cmds[0..1]));
-    try std.testing.expect(anyCommandHighOutlierRate(cmds[1..2]));
-    try std.testing.expect(anyCommandHighOutlierRate(cmds[2..3]));
 }
 
-test "StderrCaptureBuf caps append and resets" {
-    var storage: [8]u8 = undefined;
-    var buf: StderrCaptureBuf = .{ .storage = &storage };
-    buf.append("abc");
-    try std.testing.expectEqual(@as(usize, 3), buf.len);
-    try std.testing.expect(!buf.truncated);
-    buf.append("defghij");
-    try std.testing.expect(buf.truncated);
-    try std.testing.expectEqual(@as(usize, 8), buf.len);
-    const view = buf.view();
-    try std.testing.expectEqualStrings("abcdefgh", view.bytes);
-    buf.reset();
-    try std.testing.expectEqual(@as(usize, 0), buf.len);
-    try std.testing.expect(!buf.truncated);
-}
-
-test "resetPerfGroupBeforeSample rejects closed leader fd" {
-    try std.testing.expectError(error.BadLeaderFd, resetPerfGroupBeforeSample(-1));
-    try std.testing.expectError(error.BadLeaderFd, disablePerfGroupAfterSample(-1));
-}
-
-test "resetPerfGroupBeforeSample fails on non-perf fd" {
+fn withPipe(comptime op: *const fn (fd_t) anyerror!void) !void {
     var pipefd: [2]i32 = undefined;
-    const pr = std.os.linux.pipe(&pipefd);
-    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(pr));
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.pipe(&pipefd)));
     defer {
         _ = std.os.linux.close(pipefd[0]);
         _ = std.os.linux.close(pipefd[1]);
     }
-    resetPerfGroupBeforeSample(pipefd[0]) catch |err| switch (err) {
-        error.DisableFailed, error.ResetFailed => return,
-        else => return err,
-    };
-    return error.TestUnexpectedError;
+    try op(pipefd[0]);
 }
 
-test "disablePerfGroupAfterSample fails on non-perf fd" {
-    var pipefd: [2]i32 = undefined;
-    const pr = std.os.linux.pipe(&pipefd);
-    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(pr));
-    defer {
-        _ = std.os.linux.close(pipefd[0]);
-        _ = std.os.linux.close(pipefd[1]);
-    }
-    try std.testing.expectError(error.DisableFailed, disablePerfGroupAfterSample(pipefd[0]));
-}
-
-test "perfIoctlSkipLimit scales with max_samples" {
-    try std.testing.expectEqual(@as(u32, 32), perfIoctlSkipLimit(5));
-    try std.testing.expectEqual(@as(u32, 40), perfIoctlSkipLimit(20));
-    try std.testing.expectEqual(@as(u32, 1024), perfIoctlSkipLimit(10_000));
-}
-
-test "perf group leader opens disabled, children enabled" {
-    const leader = perfEventAttrForGroupMember(PERF.COUNT.HW.CPU_CYCLES, true);
-    const child = perfEventAttrForGroupMember(PERF.COUNT.HW.INSTRUCTIONS, false);
-    try std.testing.expect(leader.flags.disabled);
-    try std.testing.expect(!child.flags.disabled);
-    try std.testing.expect(leader.flags.enable_on_exec);
-    try std.testing.expect(child.flags.enable_on_exec);
-}
-
-test "readPerfFd returns ShortPerfRead on empty pipe" {
-    var pipefd: [2]i32 = undefined;
-    const pr = std.os.linux.pipe(&pipefd);
-    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(pr));
-    _ = std.os.linux.close(pipefd[1]);
-    defer _ = std.os.linux.close(pipefd[0]);
-    try std.testing.expectError(error.ShortPerfRead, readPerfFd(pipefd[0]));
-}
-
-test "getStatScore95 z-score fallback for null, low, and high df" {
-    try std.testing.expectApproxEqAbs(@as(f64, 1.96), getStatScore95(null), 0.001);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.96), getStatScore95(0), 0.001);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.96), getStatScore95(200), 0.001);
-}
-
-test "getStatScore95: df 1 and 30" {
-    try std.testing.expectApproxEqAbs(12.706, getStatScore95(1), 0.001);
-    try std.testing.expectApproxEqAbs(2.042, getStatScore95(30), 0.001);
-}
-
-test "getStatScore95: df 28 and 29 not swapped" {
-    try std.testing.expectApproxEqAbs(2.048, getStatScore95(28), 0.001);
-    try std.testing.expectApproxEqAbs(2.045, getStatScore95(29), 0.001);
-}
-
-test "summarizeAll_zeroSamples_returnsNoSamples" {
-    const samples: []const Sample = &.{};
-    var scratch: [1]Sample = undefined;
-    try std.testing.expectError(error.NoSamples, Measurement.summarizeAll(samples, &scratch));
-}
-
-test "summarizeField_scratchTooSmall_returnsError" {
-    const samples = [_]Sample{sampleWith("wall_time", 1)};
-    var scratch: [0]Sample = undefined;
-    try std.testing.expectError(error.ScratchTooSmall, Measurement.summarizeField(&samples, &scratch, "wall_time", .nanoseconds));
-}
-
-test "summarizeField_fourSamples_computesMeanAndMedian" {
-    const samples = [_]Sample{
-        sampleWith("wall_time", 10),
-        sampleWith("wall_time", 20),
-        sampleWith("wall_time", 30),
-        sampleWith("wall_time", 40),
-    };
-    var scratch: [4]Sample = undefined;
-    const m = try Measurement.summarizeField(&samples, &scratch, "wall_time", .nanoseconds);
-    try std.testing.expectEqual(@as(u64, 10), m.min);
-    try std.testing.expectEqual(@as(u64, 40), m.max);
-    try std.testing.expectEqual(@as(u64, 30), m.median);
-    try std.testing.expectApproxEqAbs(@as(f64, 25), m.mean, 0.001);
-    try std.testing.expectEqual(@as(u64, 4), m.sample_count);
-}
-
-test "summarizeField_sortsScratch_leavesInputSliceUntouched" {
-    var samples = [_]Sample{
-        sampleWith("wall_time", 30),
-        sampleWith("wall_time", 10),
-        sampleWith("wall_time", 20),
-    };
-    var scratch: [3]Sample = undefined;
-    _ = try Measurement.summarizeField(&samples, &scratch, "wall_time", .nanoseconds);
-    try std.testing.expectEqual(@as(u64, 30), samples[0].wall_time);
-}
-
-test "summarizeField_identicalSamples_zeroOutliers" {
-    const samples = [_]Sample{
-        sampleWith("wall_time", 100),
-        sampleWith("wall_time", 100),
-        sampleWith("wall_time", 100),
-    };
-    var scratch: [3]Sample = undefined;
-    const m = try Measurement.summarizeField(&samples, &scratch, "wall_time", .nanoseconds);
-    try std.testing.expectEqual(@as(u64, 0), m.outlier_count);
-    try std.testing.expectApproxEqAbs(@as(f64, 0), m.std_dev, 0.001);
-}
-
-test "summarizeField_oneSample_stdDevStaysZero" {
-    const samples = [_]Sample{sampleWith("wall_time", 42)};
-    var scratch: [1]Sample = undefined;
-    const m = try Measurement.summarizeField(&samples, &scratch, "wall_time", .nanoseconds);
-    try std.testing.expectEqual(@as(u64, 42), m.median);
-    try std.testing.expectApproxEqAbs(@as(f64, 42), m.mean, 0.001);
-    try std.testing.expectApproxEqAbs(@as(f64, 0), m.std_dev, 0.001);
-}
-
-test "summarizeField smallN_q1q3_useOrderStatIndices" {
-    // Indices: q1 = sorted[n/4]; q3 = sorted[n-1] when n < 4 else sorted[n - n/4].
-    {
-        const values = [_]u64{ 200, 100 };
-        var samples: [2]Sample = undefined;
-        for (values, &samples) |v, *s| s.* = sampleWith("wall_time", v);
-        var scratch: [2]Sample = undefined;
-        const m = try Measurement.summarizeField(&samples, &scratch, "wall_time", .nanoseconds);
-        try std.testing.expectEqual(@as(u64, 100), m.q1);
-        try std.testing.expectEqual(@as(u64, 200), m.q3);
-        try std.testing.expectEqual(@as(u64, 200), m.median);
-    }
-    {
-        const values = [_]u64{ 300, 100, 200 };
-        var samples: [3]Sample = undefined;
-        for (values, &samples) |v, *s| s.* = sampleWith("wall_time", v);
-        var scratch: [3]Sample = undefined;
-        const m = try Measurement.summarizeField(&samples, &scratch, "wall_time", .nanoseconds);
-        try std.testing.expectEqual(@as(u64, 100), m.q1);
-        try std.testing.expectEqual(@as(u64, 300), m.q3);
-        try std.testing.expectEqual(@as(u64, 200), m.median);
-    }
-    {
-        const values = [_]u64{ 400, 100, 300, 200 };
-        var samples: [4]Sample = undefined;
-        for (values, &samples) |v, *s| s.* = sampleWith("wall_time", v);
-        var scratch: [4]Sample = undefined;
-        const m = try Measurement.summarizeField(&samples, &scratch, "wall_time", .nanoseconds);
-        try std.testing.expectEqual(@as(u64, 200), m.q1);
-        try std.testing.expectEqual(@as(u64, 400), m.q3);
-        try std.testing.expectEqual(@as(u64, 300), m.median);
-    }
-}
-
-test "summarizeField_tukeyCountsHighOutlier" {
-    // Sorted: 1..12 plus 100. q1=4 (idx 3), q3=11 (idx 10), IQR=7, high fence=21.5 -> one outlier.
-    const values = [_]u64{ 12, 1, 100, 6, 3, 9, 4, 11, 2, 8, 5, 10, 7 };
-    var samples: [values.len]Sample = undefined;
-    for (values, &samples) |v, *s| s.* = sampleWith("wall_time", v);
-    var scratch: [values.len]Sample = undefined;
-    const m = try Measurement.summarizeField(&samples, &scratch, "wall_time", .nanoseconds);
-    try std.testing.expectEqual(@as(u64, 4), m.q1);
-    try std.testing.expectEqual(@as(u64, 11), m.q3);
-    try std.testing.expectEqual(@as(u64, 1), m.outlier_count);
+fn summarizeWallTime(values: []const u64) !Measurement {
+    var samples: [32]Sample = undefined;
+    for (values, 0..) |v, i| samples[i] = sampleWith("wall_time", v);
+    var scratch: [32]Sample = undefined;
+    return try Measurement.summarizeField(samples[0..values.len], scratch[0..values.len], "wall_time", .nanoseconds);
 }
 
 fn measurementForDeltaTest(mean: f64, std_dev: f64, sample_count: u64) Measurement {
@@ -2086,146 +1852,48 @@ fn writeDeltaPlainToBuf(m: Measurement, first_m: ?Measurement) ![]const u8 {
     var buf: [64]u8 = undefined;
     var w = Io.Writer.fixed(&buf);
     try writeDeltaPlain(&w, m, first_m);
-    return w.buffered();
+    return buf[0..w.end];
 }
 
-test "deltaHalfWidth undefined and valid compare" {
-    const m = measurementForDeltaTest(10, 1, 10);
-    try std.testing.expect(deltaHalfWidth(m, measurementForDeltaTest(0, 1, 10)) == null);
-    try std.testing.expect(deltaHalfWidth(
-        measurementForDeltaTest(10, 0, 1),
-        measurementForDeltaTest(10, 0, 1),
-    ) == null);
-    try std.testing.expect(deltaHalfWidth(
-        measurementForDeltaTest(10, 1, 2),
-        measurementForDeltaTest(10, 1, 1),
-    ) == null);
-
-    const half = deltaHalfWidth(
-        measurementForDeltaTest(110, 10, 10),
-        measurementForDeltaTest(100, 10, 10),
-    ).?;
-    try std.testing.expect(!std.math.isNan(half));
-    try std.testing.expect(!std.math.isInf(half));
-    try std.testing.expect(half > 0);
-}
-
-test "deltaIsSignificant at 1% practical band" {
-    try std.testing.expect(deltaIsSignificant(2, 1));
-    try std.testing.expect(!deltaIsSignificant(2, 1.01));
-    try std.testing.expect(deltaIsSignificant(1, 0));
-    try std.testing.expect(!deltaIsSignificant(1, 0.01));
-    try std.testing.expect(!deltaIsSignificant(0.99, 0));
-    try std.testing.expect(deltaIsSignificant(-2, 1));
-    try std.testing.expect(!deltaIsSignificant(-2, 1.01));
-    try std.testing.expect(deltaIsSignificant(-1, 0));
-    try std.testing.expect(!deltaIsSignificant(-1, 0.01));
-    try std.testing.expect(!deltaIsSignificant(-0.99, 0));
-}
-
-test "writeDeltaPlain compare semantics" {
-    const m5 = measurementForDeltaTest(5, 1, 10);
-    const f0 = measurementForDeltaTest(0, 0, 10);
-    const out_undef = try writeDeltaPlainToBuf(m5, @as(?Measurement, f0));
-    try std.testing.expectEqualStrings("n/a", out_undef);
-    try std.testing.expect(std.mem.indexOf(u8, out_undef, "nan") == null);
-
-    const m1 = measurementForDeltaTest(10, 0, 1);
-    const f1 = measurementForDeltaTest(10, 0, 1);
-    try std.testing.expectEqualStrings("n/a", try writeDeltaPlainToBuf(m1, @as(?Measurement, f1)));
-
-    const m_up = measurementForDeltaTest(110, 10, 10);
-    const f_up = measurementForDeltaTest(100, 10, 10);
-    const half_up = deltaHalfWidth(m_up, f_up).?;
-    const diff_up = (m_up.mean - f_up.mean) * 100 / f_up.mean;
-    var expect_buf: [64]u8 = undefined;
-    var expect_w = Io.Writer.fixed(&expect_buf);
-    try expect_w.writeAll(if (deltaIsSignificant(diff_up, half_up)) "! " else "  ");
-    try expect_w.writeAll("+");
-    try expect_w.print("{d: >5.1}% ± {d: >4.1}%", .{ @abs(diff_up), half_up });
-    try std.testing.expectEqualStrings(expect_w.buffered(), try writeDeltaPlainToBuf(m_up, @as(?Measurement, f_up)));
-
-    const m_eq = measurementForDeltaTest(100, 10, 10);
-    const f_eq = measurementForDeltaTest(100, 10, 10);
-    const out_eq = try writeDeltaPlainToBuf(m_eq, @as(?Measurement, f_eq));
-    try std.testing.expectEqualStrings("0%", out_eq);
-    try std.testing.expect(std.mem.indexOf(u8, out_eq, "±") == null);
-
-    const out_base = try writeDeltaPlainToBuf(m_eq, null);
-    try std.testing.expectEqualStrings("0%", out_base);
-
-    const m_dn = measurementForDeltaTest(90, 10, 10);
-    const f_dn = measurementForDeltaTest(100, 10, 10);
-    const half_dn = deltaHalfWidth(m_dn, f_dn).?;
-    const diff_dn = (m_dn.mean - f_dn.mean) * 100 / f_dn.mean;
-    expect_w = Io.Writer.fixed(&expect_buf);
-    try expect_w.writeAll(if (deltaIsSignificant(diff_dn, half_dn)) "* " else "  ");
-    try expect_w.writeAll("-");
-    try expect_w.print("{d: >5.1}% ± {d: >4.1}%", .{ @abs(diff_dn), half_dn });
-    try std.testing.expectEqualStrings(expect_w.buffered(), try writeDeltaPlainToBuf(m_dn, @as(?Measurement, f_dn)));
-}
-
-test "summarizeAll includes page fault fields" {
-    const samples = [_]Sample{
-        .{
-            .wall_time = 100,
-            .peak_rss = 1000,
-            .minor_faults = 10,
-            .major_faults = 0,
-            .cpu_cycles = 50,
-            .instructions = 40,
-            .cache_references = 30,
-            .cache_misses = 20,
-            .branch_misses = 5,
-        },
-        .{
-            .wall_time = 200,
-            .peak_rss = 2000,
-            .minor_faults = 30,
-            .major_faults = 2,
-            .cpu_cycles = 60,
-            .instructions = 50,
-            .cache_references = 35,
-            .cache_misses = 25,
-            .branch_misses = 6,
-        },
-    };
-    var scratch: [2]Sample = undefined;
-    const m = try Measurement.summarizeAll(&samples, &scratch);
-    try std.testing.expectEqual(@as(u64, 30), m.minor_faults.median);
-    try std.testing.expectEqual(@as(u64, 2), m.major_faults.max);
-    try std.testing.expectEqual(Measurement.Unit.count, m.minor_faults.unit);
-    try std.testing.expectEqual(Measurement.Unit.count, m.major_faults.unit);
-}
-
-fn tableBenchmarkWall() Measurement {
+fn tableFixture(
+    q1: u64,
+    median: u64,
+    q3: u64,
+    min: u64,
+    max: u64,
+    mean: f64,
+    std_dev: f64,
+    unit: Measurement.Unit,
+) Measurement {
     return .{
-        .q1 = 640_000,
-        .median = 659_000,
-        .q3 = 677_000,
-        .min = 638_000,
-        .max = 719_000,
-        .mean = 659_000,
-        .std_dev = 27_800,
+        .q1 = q1,
+        .median = median,
+        .q3 = q3,
+        .min = min,
+        .max = max,
+        .mean = mean,
+        .std_dev = std_dev,
         .outlier_count = 0,
         .sample_count = 8,
-        .unit = .nanoseconds,
+        .unit = unit,
     };
 }
 
-fn tableBenchmarkRss() Measurement {
-    return .{
-        .q1 = 1_150_000,
-        .median = 1_150_000,
-        .q3 = 1_150_000,
-        .min = 1_150_000,
-        .max = 1_220_000,
-        .mean = 1_160_000,
-        .std_dev = 23_200,
-        .outlier_count = 0,
-        .sample_count = 8,
-        .unit = .bytes,
-    };
+const TableFixtures = struct {
+    const wall = tableFixture(640_000, 659_000, 677_000, 638_000, 719_000, 659_000, 27_800, .nanoseconds);
+    const rss = tableFixture(1_150_000, 1_150_000, 1_150_000, 1_150_000, 1_220_000, 1_160_000, 23_200, .bytes);
+    const faults = tableFixture(60, 62, 63, 60, 63, 62.3, 0.58, .count);
+    const cycles = tableFixture(400_000, 584_000, 700_000, 334_000, 795_000, 584_000, 233_000, .count);
+    const zero_delta_rss = tableFixture(1_200_000, 1_220_000, 1_240_000, 1_190_000, 1_300_000, 1_220_000, 25_000, .bytes);
+};
+
+fn tableFixtureMeasurements(major_faults: Measurement) Command.Measurements {
+    var out = measurementsFill(TableFixtures.wall);
+    out.peak_rss = TableFixtures.rss;
+    out.minor_faults = TableFixtures.faults;
+    out.cpu_cycles = TableFixtures.cycles;
+    out.major_faults = major_faults;
+    return out;
 }
 
 fn renderResultsTableForTest(
@@ -2236,221 +1904,8 @@ fn renderResultsTableForTest(
     var buf: [8192]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     const term = Io.Terminal{ .writer = &w, .mode = mode };
-    const with_delta = baseline != null;
-    const layout = TableLayout.compute(measurements, baseline, with_delta);
-    try TableLayout.printHeader(&w, term, layout, with_delta);
-    inline for (@typeInfo(Command.Measurements).@"struct".fields) |field| {
-        const m = @field(measurements, field.name);
-        if (measurementRowVisible(measurementFieldMeta(field.name).visibility, m)) {
-            const first_m = if (baseline) |b| @as(?Measurement, @field(b, field.name)) else null;
-            try printMeasurement(term, layout, m, field.name, first_m, with_delta);
-        }
-    }
+    try printResultsTable(&w, term, measurements, baseline, baseline != null);
     return w.buffered();
-}
-
-test "results table omits major_faults when max is zero" {
-    const wall = tableBenchmarkWall();
-    const zero_faults = Measurement{
-        .q1 = 0,
-        .median = 0,
-        .q3 = 0,
-        .min = 0,
-        .max = 0,
-        .mean = 0,
-        .std_dev = 0,
-        .outlier_count = 0,
-        .sample_count = 8,
-        .unit = .count,
-    };
-    const measurements: Command.Measurements = .{
-        .wall_time = wall,
-        .peak_rss = tableBenchmarkRss(),
-        .minor_faults = wall,
-        .major_faults = zero_faults,
-        .cpu_cycles = wall,
-        .instructions = wall,
-        .cache_references = wall,
-        .cache_misses = wall,
-        .branch_misses = wall,
-    };
-    const out = try renderResultsTableForTest(measurements, null, .no_color);
-    try std.testing.expect(std.mem.indexOf(u8, out, "major_faults") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "minor_faults") != null);
-    try std.testing.expectEqual(
-        MeasurementRowVisibility.hide_when_max_is_zero,
-        measurementFieldMeta("major_faults").visibility,
-    );
-    try std.testing.expectEqual(Measurement.Unit.nanoseconds, measurementFieldMeta("wall_time").unit);
-    try std.testing.expectEqual(Measurement.Unit.bytes, measurementFieldMeta("peak_rss").unit);
-    try std.testing.expectEqual(Measurement.Unit.count, measurementFieldMeta("cpu_cycles").unit);
-}
-
-test "printNum3SigFigs scaling" {
-    var buf: [32]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
-    try printNum3SigFigs(&w, 5.0);
-    try std.testing.expectEqualStrings("5.00", w.buffered());
-    w = std.Io.Writer.fixed(&buf);
-    try printNum3SigFigs(&w, 1234);
-    try std.testing.expectEqualStrings("1234", w.buffered());
-}
-
-test "results table: separators and zero-delta align across color modes" {
-    for (&[_]Io.Terminal.Mode{ .no_color, .escape_codes }) |mode| {
-        try tableSeparatorAlignmentTest(mode);
-        try tableZeroDeltaAlignmentTest(mode);
-    }
-}
-
-fn tableSeparatorAlignmentTest(mode: Io.Terminal.Mode) !void {
-    var buf: [4096]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
-    const term = Io.Terminal{ .writer = &w, .mode = mode };
-
-    const wall = tableBenchmarkWall();
-    const rss = tableBenchmarkRss();
-    const measurements: Command.Measurements = .{
-        .wall_time = wall,
-        .peak_rss = rss,
-        .minor_faults = wall,
-        .major_faults = wall,
-        .cpu_cycles = wall,
-        .instructions = wall,
-        .cache_references = wall,
-        .cache_misses = wall,
-        .branch_misses = wall,
-    };
-    const layout = TableLayout.compute(measurements, measurements, true);
-    try TableLayout.printHeader(&w, term, layout, true);
-    try printMeasurement(term, layout, wall, "wall_time", null, true);
-    try printMeasurement(term, layout, rss, "peak_rss", wall, true);
-
-    const out = w.buffered();
-    var mean_sep: ?usize = null;
-    var min_sep: ?usize = null;
-    var outlier_start: ?usize = null;
-    var line_start: usize = 0;
-    while (line_start < out.len) {
-        const line_end = std.mem.indexOfScalarPos(u8, out, line_start, '\n') orelse out.len;
-        const line = out[line_start..line_end];
-        const this_mean = visibleIndexOfUtf8(line, "±");
-        const this_min = visibleIndexOfUtf8(line, "…");
-        if (this_mean) |m| {
-            if (mean_sep) |prev| try std.testing.expectEqual(prev, m);
-            mean_sep = m;
-        }
-        if (this_min) |m| {
-            if (min_sep) |prev| try std.testing.expectEqual(prev, m);
-            min_sep = m;
-        }
-        if (visibleIndexOfUtf8(line, "outliers")) |start| {
-            if (outlier_start) |prev| try std.testing.expectEqual(prev, start);
-            outlier_start = start;
-        } else if (visibleIndexOfUtf8(line, "0 (0%)")) |start| {
-            if (outlier_start) |prev| try std.testing.expectEqual(prev, start);
-            outlier_start = start;
-        }
-        if (line_end == out.len) break;
-        line_start = line_end + 1;
-    }
-    try std.testing.expect(mean_sep != null);
-    try std.testing.expect(min_sep != null);
-    try std.testing.expect(outlier_start != null);
-}
-
-fn tableZeroDeltaAlignmentTest(mode: Io.Terminal.Mode) !void {
-    var buf: [4096]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
-    const term = Io.Terminal{ .writer = &w, .mode = mode };
-
-    const baseline_wall = tableBenchmarkWall();
-    const baseline_rss = tableBenchmarkRss();
-    const compare_rss = Measurement{
-        .q1 = 1_200_000,
-        .median = 1_220_000,
-        .q3 = 1_240_000,
-        .min = 1_190_000,
-        .max = 1_300_000,
-        .mean = 1_220_000,
-        .std_dev = 25_000,
-        .outlier_count = 0,
-        .sample_count = 8,
-        .unit = .bytes,
-    };
-    const baseline: Command.Measurements = .{
-        .wall_time = baseline_wall,
-        .peak_rss = baseline_rss,
-        .minor_faults = baseline_wall,
-        .major_faults = baseline_wall,
-        .cpu_cycles = baseline_wall,
-        .instructions = baseline_wall,
-        .cache_references = baseline_wall,
-        .cache_misses = baseline_wall,
-        .branch_misses = baseline_wall,
-    };
-    const compare: Command.Measurements = .{
-        .wall_time = baseline_wall,
-        .peak_rss = compare_rss,
-        .minor_faults = baseline_wall,
-        .major_faults = baseline_wall,
-        .cpu_cycles = baseline_wall,
-        .instructions = baseline_wall,
-        .cache_references = baseline_wall,
-        .cache_misses = baseline_wall,
-        .branch_misses = baseline_wall,
-    };
-    const layout = TableLayout.compute(compare, baseline, true);
-    try TableLayout.printHeader(&w, term, layout, true);
-    try printMeasurement(term, layout, compare.wall_time, "wall_time", baseline.wall_time, true);
-    try printMeasurement(term, layout, compare.peak_rss, "peak_rss", baseline.peak_rss, true);
-
-    const out = w.buffered();
-    var mean_sep: ?usize = null;
-    var min_sep: ?usize = null;
-    var line_start: usize = 0;
-    while (line_start < out.len) {
-        const line_end = std.mem.indexOfScalarPos(u8, out, line_start, '\n') orelse out.len;
-        const line = out[line_start..line_end];
-        const vis_line = stripAnsiForTest(line);
-        if (std.mem.startsWith(u8, vis_line, "  wall_time")) {
-            try std.testing.expect(std.mem.indexOf(u8, vis_line, "-  0.0%") == null);
-            const delta_pct = std.mem.lastIndexOf(u8, vis_line, "0%") orelse unreachable;
-            const outlier_pct = std.mem.indexOf(u8, vis_line, "0 (0%)") orelse unreachable;
-            try std.testing.expect(delta_pct > outlier_pct);
-        }
-        if (std.mem.startsWith(u8, vis_line, "  peak_rss")) {
-            try std.testing.expect(visibleIndexOfUtf8(line, "±") != null);
-        }
-        const this_mean = visibleIndexOfUtf8(line, "±");
-        const this_min = visibleIndexOfUtf8(line, "…");
-        if (this_mean) |m| {
-            if (mean_sep) |prev| try std.testing.expectEqual(prev, m);
-            mean_sep = m;
-        }
-        if (this_min) |m| {
-            if (min_sep) |prev| try std.testing.expectEqual(prev, m);
-            min_sep = m;
-        }
-        if (line_end == out.len) break;
-        line_start = line_end + 1;
-    }
-    try std.testing.expect(mean_sep != null);
-    try std.testing.expect(min_sep != null);
-}
-
-test "scaleUnit nanoseconds uses minutes and hours" {
-    const one_min: f64 = 60.0 * 1_000_000_000.0;
-    const one_hour: f64 = 3600.0 * 1_000_000_000.0;
-    const s_min = scaleUnit(one_min, .nanoseconds);
-    try std.testing.expectEqualStrings("m ", s_min.suffix);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.0), s_min.val, 0.001);
-    const s_hour = scaleUnit(one_hour, .nanoseconds);
-    try std.testing.expectEqualStrings("h ", s_hour.suffix);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.0), s_hour.val, 0.001);
-    const s_sec = scaleUnit(5.0 * 1_000_000_000.0, .nanoseconds);
-    try std.testing.expectEqualStrings("s ", s_sec.suffix);
-    try std.testing.expectApproxEqAbs(@as(f64, 5.0), s_sec.val, 0.001);
 }
 
 fn visibleIndexOfUtf8(haystack: []const u8, needle: []const u8) ?usize {
@@ -2476,6 +1931,119 @@ fn advanceVisibleColumn(s: []const u8, i: *usize, vis: *usize) void {
     vis.* += 1;
 }
 
+fn isTableDataRow(vis_line: []const u8) bool {
+    return std.mem.startsWith(u8, vis_line, "  wall_") or
+        std.mem.startsWith(u8, vis_line, "  peak_") or
+        std.mem.startsWith(u8, vis_line, "  minor_") or
+        std.mem.startsWith(u8, vis_line, "  major_") or
+        std.mem.startsWith(u8, vis_line, "  cpu_") or
+        std.mem.startsWith(u8, vis_line, "  instr") or
+        std.mem.startsWith(u8, vis_line, "  cache_") or
+        std.mem.startsWith(u8, vis_line, "  branch_");
+}
+
+fn scanTableSeparatorAlignment(out: []const u8, layout: TableLayout, check_zero_delta_order: bool) !void {
+    const expect_mean_sep = layout.meanSepVis();
+    const expect_min_sep = layout.minSepVis();
+    const expect_outlier_start = layout.outlierStartVis();
+    var line_start: usize = 0;
+    while (line_start < out.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, out, line_start, '\n') orelse out.len;
+        const line = out[line_start..line_end];
+        const vis_line = stripAnsiForTest(line);
+        if (std.mem.startsWith(u8, vis_line, "  measurement")) {
+            try std.testing.expectEqual(expect_mean_sep, visibleIndexOfUtf8(line, sep_mean));
+            try std.testing.expectEqual(expect_min_sep, visibleIndexOfUtf8(line, sep_minmax));
+            try std.testing.expectEqual(expect_outlier_start, visibleIndexOfUtf8(line, "outliers"));
+        }
+        if (isTableDataRow(vis_line)) {
+            if (check_zero_delta_order and std.mem.startsWith(u8, vis_line, "  wall_time")) {
+                try std.testing.expect(std.mem.indexOf(u8, vis_line, "-  0.0%") == null);
+                const delta_pct = std.mem.lastIndexOf(u8, vis_line, "0%") orelse unreachable;
+                const outlier_pct = std.mem.indexOf(u8, vis_line, "0 (0%)") orelse unreachable;
+                try std.testing.expect(delta_pct > outlier_pct);
+            }
+            try std.testing.expectEqual(expect_mean_sep, visibleIndexOfUtf8(line, sep_mean));
+            try std.testing.expectEqual(expect_min_sep, visibleIndexOfUtf8(line, sep_minmax));
+            const outlier_at = visibleIndexOfUtf8(line, "0 (0%)") orelse visibleIndexOfUtf8(line, "outliers");
+            if (outlier_at) |at| try std.testing.expectEqual(expect_outlier_start, at);
+        }
+        if (line_end == out.len) break;
+        line_start = line_end + 1;
+    }
+}
+
+fn scanSingleSpaceBeforeSep(out: []const u8, sep: []const u8, sep_vis: usize) !void {
+    std.debug.assert(sep.len > 0 and sep[0] == ' ');
+    var line_start: usize = 0;
+    while (line_start < out.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, out, line_start, '\n') orelse out.len;
+        const line = out[line_start..line_end];
+        const vis_line = stripAnsiForTest(line);
+        if (isTableDataRow(vis_line)) {
+            const sep_at = visibleIndexOfUtf8(line, sep) orelse return error.TestExpectedEqual;
+            try std.testing.expectEqual(sep_vis, sep_at);
+            if (sep_at > 0) {
+                var vis: usize = 0;
+                var i: usize = 0;
+                while (i < line.len and vis < sep_at) advanceVisibleColumn(line, &i, &vis);
+                try std.testing.expect(vis == sep_at);
+                try std.testing.expect(i > 0 and line[i - 1] != ' ');
+            }
+        }
+        if (line_end == out.len) break;
+        line_start = line_end + 1;
+    }
+}
+
+fn scanTableInvariants(out: []const u8, layout: TableLayout, check_zero_delta_order: bool) !void {
+    try scanTableSeparatorAlignment(out, layout, check_zero_delta_order);
+    try scanSingleSpaceBeforeSep(out, sep_mean, layout.meanSepVis());
+    try scanSingleSpaceBeforeSep(out, sep_minmax, layout.minSepVis());
+}
+
+const TableAlignmentCase = enum { mixed_units, zero_delta };
+
+fn tableAlignmentInvariantsTest(mode: Io.Terminal.Mode, case: TableAlignmentCase) !void {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    const term = Io.Terminal{ .writer = &w, .mode = mode };
+    const f = TableFixtures;
+
+    switch (case) {
+        .mixed_units => {
+            const measurements = tableFixtureMeasurements(f.wall);
+            const layout = TableLayout.compute(measurements, measurements, true);
+            try TableLayout.printHeader(&w, term, layout, true);
+            try printMeasurement(term, layout, f.wall, "wall_time", null, true);
+            try printMeasurement(term, layout, f.rss, "peak_rss", f.wall, true);
+            try printMeasurement(term, layout, f.faults, "minor_faults", f.wall, true);
+            try printMeasurement(term, layout, f.cycles, "cpu_cycles", f.wall, true);
+            try scanTableInvariants(w.buffered(), layout, false);
+        },
+        .zero_delta => {
+            const baseline = tableFixtureMeasurements(f.wall);
+            const compare = Command.Measurements{
+                .wall_time = f.wall,
+                .peak_rss = f.zero_delta_rss,
+                .minor_faults = f.faults,
+                .major_faults = f.wall,
+                .cpu_cycles = f.wall,
+                .instructions = f.wall,
+                .cache_references = f.wall,
+                .cache_misses = f.wall,
+                .branch_misses = f.wall,
+            };
+            const layout = TableLayout.compute(compare, baseline, true);
+            try TableLayout.printHeader(&w, term, layout, true);
+            try printMeasurement(term, layout, compare.wall_time, "wall_time", baseline.wall_time, true);
+            try printMeasurement(term, layout, compare.peak_rss, "peak_rss", baseline.peak_rss, true);
+            try printMeasurement(term, layout, compare.minor_faults, "minor_faults", baseline.minor_faults, true);
+            try scanTableInvariants(w.buffered(), layout, true);
+        },
+    }
+}
+
 fn checkSummarizeFieldInvariants(n: u8, samples: []const Sample, scratch: []Sample) !void {
     const m = try Measurement.summarizeField(samples[0..n], scratch[0..n], "wall_time", .nanoseconds);
     try std.testing.expectEqual(n, m.sample_count);
@@ -2483,6 +2051,10 @@ fn checkSummarizeFieldInvariants(n: u8, samples: []const Sample, scratch: []Samp
     try std.testing.expect(m.outlier_count <= n);
     try std.testing.expect(m.q1 <= m.median or n == 1);
     try std.testing.expect(m.median <= m.q3 or n == 1);
+    for (samples[0..n]) |s| {
+        try std.testing.expect(s.wall_time >= m.min);
+        try std.testing.expect(s.wall_time <= m.max);
+    }
 
     try std.testing.expectError(error.NoSamples, Measurement.summarizeField(samples[0..0], scratch[0..0], "wall_time", .nanoseconds));
     if (n > 0) {
@@ -2501,6 +2073,335 @@ fn fuzzSummarizeField(_: void, smith: *std.testing.Smith) !void {
     try checkSummarizeFieldInvariants(n, &samples, &scratch);
 }
 
-test "summarizeField fuzz invariants" {
+// --- Tests ---
+
+test "main.jsonOutput" {
+    const json_cases = [_]struct { arg: []const u8, want: ?[]const u8 }{
+        .{ .arg = "--json=out.json", .want = "out.json" },
+        .{ .arg = "--json=", .want = default_json_output_path },
+        .{ .arg = "--json", .want = null },
+    };
+    for (json_cases) |c| {
+        const got = jsonPathFromEqualsArg(c.arg);
+        if (c.want) |want| try std.testing.expectEqualStrings(want, got.?) else try std.testing.expect(got == null);
+    }
+
+    var buf: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    const wall = testMeasurement(.nanoseconds);
+    const count = testMeasurement(.count);
+    const measurements = measurementsFromParts(wall, testMeasurement(.bytes), count);
+    var commands = [_]Command{.{
+        .raw_cmd = "/bin/true",
+        .argv = &.{"/bin/true"},
+        .measurements = measurements,
+        .sample_count = 5,
+        .failed_sample_count = 2,
+    }};
+    const config = JsonRunConfig{
+        .duration_ms = 500,
+        .min_samples = 2,
+        .max_samples = help.max_samples_cap,
+        .max_samples_requested = 50_000,
+        .warmup = 1,
+        .allow_failures = false,
+    };
+
+    try printJsonOutput(&w, &commands, config);
+
+    const Parsed = struct {
+        schema_version: u32,
+        zebrac_version: []const u8,
+        config: struct {
+            duration_ms: u64,
+            min_samples: u64,
+            max_samples_cap: u64,
+            max_samples_requested: ?u64,
+        },
+        results: []struct {
+            command: []const u8,
+            sample_count: usize,
+            failed_sample_count: u64,
+            wall_time: struct { mean: f64, unit: []const u8 },
+            major_faults: struct { mean: f64, unit: []const u8 },
+        },
+    };
+    const parsed = try std.json.parseFromSlice(Parsed, std.testing.allocator, w.buffered(), .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(json_schema_version, parsed.value.schema_version);
+    try std.testing.expectEqualStrings(help.version, parsed.value.zebrac_version);
+    try std.testing.expectEqual(@as(u64, 500), parsed.value.config.duration_ms);
+    try std.testing.expectEqual(@as(?u64, 50_000), parsed.value.config.max_samples_requested);
+    try std.testing.expectEqual(@as(u64, 2), parsed.value.results[0].failed_sample_count);
+    try std.testing.expectEqualStrings("nanoseconds", parsed.value.results[0].wall_time.unit);
+    try std.testing.expectEqualStrings("count", parsed.value.results[0].major_faults.unit);
+}
+
+test "main.outlierRateThreshold" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("2 (20%)", try formatOutlierLine(&buf, 2, 10));
+
+    const cases = [_]struct { outliers: u64, want_high: bool }{
+        .{ .outliers = 0, .want_high = false },
+        .{ .outliers = 1, .want_high = true },
+        .{ .outliers = 2, .want_high = true },
+    };
+    for (cases) |c| {
+        const cmd = commandWithWallOutlierPct(10, c.outliers);
+        try std.testing.expectEqual(c.want_high, anyCommandHighOutlierRate(&.{cmd}));
+    }
+
+    var zero_n = testMeasurement(.count);
+    zero_n.sample_count = 0;
+    zero_n.outlier_count = 99;
+    try std.testing.expect(!measurementsHaveHighOutlierRate(measurementsFill(zero_n)));
+}
+
+test "main.stderrCaptureBuf" {
+    var storage: [8]u8 = undefined;
+    var buf: StderrCaptureBuf = .{ .storage = &storage };
+
+    buf.append("abc");
+    try std.testing.expectEqual(@as(usize, 3), buf.len);
+    buf.append("defghij");
+    try std.testing.expect(buf.truncated);
+    try std.testing.expectEqualStrings("abcdefgh", buf.view().bytes);
+    buf.append("zzz");
+    try std.testing.expectEqual(@as(usize, 8), buf.len);
+
+    buf.reset();
+    try std.testing.expectEqual(@as(usize, 0), buf.len);
+    try std.testing.expect(!buf.truncated);
+}
+
+test "main.perf" {
+    try std.testing.expectError(error.BadLeaderFd, resetPerfGroupBeforeSample(-1));
+    try std.testing.expectError(error.BadLeaderFd, disablePerfGroupAfterSample(-1));
+
+    const leader = perfEventAttrForGroupMember(PERF.COUNT.HW.CPU_CYCLES, true);
+    const child = perfEventAttrForGroupMember(PERF.COUNT.HW.INSTRUCTIONS, false);
+    try std.testing.expect(leader.flags.disabled);
+    try std.testing.expect(!child.flags.disabled);
+
+    try withPipe(struct {
+        fn disableOnPipe(fd: fd_t) !void {
+            try std.testing.expectError(error.DisableFailed, disablePerfGroupAfterSample(fd));
+        }
+    }.disableOnPipe);
+    try withPipe(struct {
+        fn resetOnPipe(fd: fd_t) !void {
+            resetPerfGroupBeforeSample(fd) catch |err| switch (err) {
+                error.DisableFailed, error.ResetFailed => {},
+                else => return err,
+            };
+        }
+    }.resetOnPipe);
+
+    const limit_cases = [_]struct { max_samples: u64, want: u32 }{
+        .{ .max_samples = 5, .want = perf_ioctl_skip_limit_min },
+        .{ .max_samples = 20, .want = 40 },
+        .{ .max_samples = 10_000, .want = perf_ioctl_skip_limit_max },
+    };
+    for (limit_cases) |c| try std.testing.expectEqual(c.want, perfIoctlSkipLimit(c.max_samples));
+
+    var pipefd: [2]i32 = undefined;
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.pipe(&pipefd)));
+    _ = std.os.linux.close(pipefd[1]);
+    defer _ = std.os.linux.close(pipefd[0]);
+    try std.testing.expectError(error.ShortPerfRead, readPerfFd(pipefd[0]));
+}
+
+test "main.getStatScore95" {
+    const cases = [_]struct { df: ?u64, want: f64 }{
+        .{ .df = null, .want = 1.96 },
+        .{ .df = 0, .want = 1.96 },
+        .{ .df = 200, .want = 1.96 },
+        .{ .df = 1, .want = 12.706 },
+        .{ .df = 30, .want = 2.042 },
+        .{ .df = 28, .want = 2.048 },
+        .{ .df = 29, .want = 2.045 },
+    };
+    for (cases) |c| try std.testing.expectApproxEqAbs(c.want, getStatScore95(c.df), 0.001);
+}
+
+test "main.summarize.field" {
+    const samples_empty: []const Sample = &.{};
+    var scratch_one: [1]Sample = undefined;
+    try std.testing.expectError(error.NoSamples, Measurement.summarizeAll(samples_empty, &scratch_one));
+    const one = [_]Sample{sampleWith("wall_time", 1)};
+    var tiny: [0]Sample = undefined;
+    try std.testing.expectError(error.ScratchTooSmall, Measurement.summarizeAll(&one, &tiny));
+    try std.testing.expectError(error.ScratchTooSmall, Measurement.summarizeField(&one, &tiny, "wall_time", .nanoseconds));
+
+    {
+        var samples = [_]Sample{
+            sampleWith("wall_time", 30),
+            sampleWith("wall_time", 10),
+            sampleWith("wall_time", 20),
+            sampleWith("wall_time", 40),
+        };
+        var scratch: [4]Sample = undefined;
+        const m = try Measurement.summarizeField(&samples, &scratch, "wall_time", .nanoseconds);
+        try std.testing.expectEqual(@as(u64, 10), m.min);
+        try std.testing.expectEqual(@as(u64, 40), m.max);
+        try std.testing.expectEqual(@as(u64, 30), m.median);
+        try std.testing.expectApproxEqAbs(@as(f64, 25), m.mean, 0.001);
+        try std.testing.expectEqual(@as(u64, 30), samples[0].wall_time);
+    }
+
+    const stat_cases = [_]struct {
+        values: []const u64,
+        q1: u64,
+        median: u64,
+        q3: u64,
+        outliers: u64,
+        std_dev_zero: bool,
+    }{
+        .{ .values = &.{42}, .q1 = 42, .median = 42, .q3 = 42, .outliers = 0, .std_dev_zero = true },
+        .{ .values = &.{ 200, 100 }, .q1 = 100, .median = 200, .q3 = 200, .outliers = 0, .std_dev_zero = false },
+        .{ .values = &.{ 300, 100, 200 }, .q1 = 100, .median = 200, .q3 = 300, .outliers = 0, .std_dev_zero = false },
+        .{ .values = &.{ 400, 100, 300, 200 }, .q1 = 200, .median = 300, .q3 = 400, .outliers = 0, .std_dev_zero = false },
+        .{ .values = &.{ 100, 100, 100 }, .q1 = 100, .median = 100, .q3 = 100, .outliers = 0, .std_dev_zero = true },
+        .{ .values = &.{ 12, 1, 100, 6, 3, 9, 4, 11, 2, 8, 5, 10, 7 }, .q1 = 4, .median = 7, .q3 = 11, .outliers = 1, .std_dev_zero = false },
+    };
+    for (stat_cases) |c| {
+        const m = try summarizeWallTime(c.values);
+        try std.testing.expectEqual(c.q1, m.q1);
+        try std.testing.expectEqual(c.median, m.median);
+        try std.testing.expectEqual(c.q3, m.q3);
+        try std.testing.expectEqual(c.outliers, m.outlier_count);
+        if (c.std_dev_zero) try std.testing.expectApproxEqAbs(@as(f64, 0), m.std_dev, 0.001);
+    }
+}
+
+test "main.summarize.all" {
+    const samples = [_]Sample{
+        .{ .wall_time = 100, .peak_rss = 1000, .minor_faults = 10, .major_faults = 0, .cpu_cycles = 50, .instructions = 40, .cache_references = 30, .cache_misses = 20, .branch_misses = 5 },
+        .{ .wall_time = 200, .peak_rss = 2000, .minor_faults = 30, .major_faults = 2, .cpu_cycles = 60, .instructions = 50, .cache_references = 35, .cache_misses = 25, .branch_misses = 6 },
+    };
+    var scratch: [2]Sample = undefined;
+    const m = try Measurement.summarizeAll(&samples, &scratch);
+
+    try std.testing.expectEqual(@as(u64, 30), m.minor_faults.median);
+    try std.testing.expectEqual(@as(u64, 2), m.major_faults.max);
+    try std.testing.expectEqual(Measurement.Unit.nanoseconds, m.wall_time.unit);
+    try std.testing.expectEqual(Measurement.Unit.bytes, m.peak_rss.unit);
+    try std.testing.expectEqual(Measurement.Unit.count, m.cpu_cycles.unit);
+}
+
+test "main.compareDelta" {
+    const m = measurementForDeltaTest(10, 1, 10);
+    try std.testing.expect(deltaHalfWidth(m, measurementForDeltaTest(0, 1, 10)) == null);
+    try std.testing.expect(deltaHalfWidth(
+        measurementForDeltaTest(10, 0, 1),
+        measurementForDeltaTest(10, 0, 1),
+    ) == null);
+
+    const half = deltaHalfWidth(
+        measurementForDeltaTest(110, 10, 10),
+        measurementForDeltaTest(100, 10, 10),
+    ).?;
+    try std.testing.expect(half > 0);
+
+    const sig_cases = [_]struct { diff: f64, band: f64, want: bool }{
+        .{ .diff = 2, .band = 1, .want = true },
+        .{ .diff = 2, .band = 1.01, .want = false },
+        .{ .diff = 1, .band = 0, .want = true },
+        .{ .diff = 0.99, .band = 0, .want = false },
+        .{ .diff = -2, .band = 1, .want = true },
+        .{ .diff = -1, .band = 0.01, .want = false },
+    };
+    for (sig_cases) |c| try std.testing.expectEqual(c.want, deltaIsSignificant(c.diff, c.band));
+
+    try std.testing.expectEqualStrings("n/a", try writeDeltaPlainToBuf(measurementForDeltaTest(5, 1, 10), measurementForDeltaTest(0, 0, 10)));
+    try std.testing.expectEqualStrings("n/a", try writeDeltaPlainToBuf(measurementForDeltaTest(10, 1, 1), measurementForDeltaTest(10, 1, 1)));
+    try std.testing.expectEqualStrings("0%", try writeDeltaPlainToBuf(measurementForDeltaTest(100, 10, 10), measurementForDeltaTest(100, 10, 10)));
+
+    const m_up = measurementForDeltaTest(110, 10, 10);
+    const f_up = measurementForDeltaTest(100, 10, 10);
+    try std.testing.expectEqualStrings("  + 10.0% ±  9.4%", try writeDeltaPlainToBuf(m_up, f_up));
+
+    const m_dn = measurementForDeltaTest(90, 10, 10);
+    const f_dn = measurementForDeltaTest(100, 10, 10);
+    try std.testing.expectEqualStrings("  - 10.0% ±  9.4%", try writeDeltaPlainToBuf(m_dn, f_dn));
+}
+
+test "main.resultsTable" {
+    const zero_faults = Measurement{
+        .q1 = 0,
+        .median = 0,
+        .q3 = 0,
+        .min = 0,
+        .max = 0,
+        .mean = 0,
+        .std_dev = 0,
+        .outlier_count = 0,
+        .sample_count = 8,
+        .unit = .count,
+    };
+    const out = try renderResultsTableForTest(tableFixtureMeasurements(zero_faults), null, .no_color);
+    try std.testing.expect(std.mem.indexOf(u8, out, "major_faults") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "minor_faults") != null);
+    try std.testing.expectEqual(
+        MeasurementRowVisibility.hide_when_max_is_zero,
+        measurementFieldMeta("major_faults").visibility,
+    );
+
+    for (&[_]Io.Terminal.Mode{ .no_color, .escape_codes }) |mode| {
+        try tableAlignmentInvariantsTest(mode, .mixed_units);
+        try tableAlignmentInvariantsTest(mode, .zero_delta);
+    }
+}
+
+test "main.unitFormat" {
+    const scale_cases = [_]struct { x: f64, unit: Measurement.Unit, suffix: []const u8, val: f64 }{
+        .{ .x = 5.0 * 1_000_000_000.0, .unit = .nanoseconds, .suffix = "s", .val = 5.0 },
+        .{ .x = 1.5 * 1_000_000.0, .unit = .nanoseconds, .suffix = "ms", .val = 1.5 },
+        .{ .x = 1.5 * 1_000.0, .unit = .nanoseconds, .suffix = "µs", .val = 1.5 },
+        .{ .x = 60.0 * 1_000_000_000.0, .unit = .nanoseconds, .suffix = "m", .val = 1.0 },
+        .{ .x = 3600.0 * 1_000_000_000.0, .unit = .nanoseconds, .suffix = "h", .val = 1.0 },
+        .{ .x = 2048, .unit = .bytes, .suffix = "KB", .val = 2.048 },
+        .{ .x = 42, .unit = .count, .suffix = plain_unit_suffix, .val = 42 },
+    };
+    for (scale_cases) |c| {
+        const s = scaleUnit(c.x, c.unit);
+        try std.testing.expectEqualStrings(c.suffix, s.suffix);
+        try std.testing.expectApproxEqAbs(c.val, s.val, 0.001);
+    }
+
+    {
+        var buf: [32]u8 = undefined;
+        const value_vis = measureUnitValueVis(&buf, 1.5 * 1_000.0, .nanoseconds);
+        const s = scaleUnit(1.5 * 1_000.0, .nanoseconds);
+        try std.testing.expectEqualStrings("µs", s.suffix);
+        try std.testing.expectEqual(@as(usize, 4), value_vis);
+        try std.testing.expectEqual(@as(usize, 6), measureUnit(&buf, 1.5 * 1_000.0, .nanoseconds));
+        var probe: [32]u8 = undefined;
+        var pw = std.Io.Writer.fixed(&probe);
+        try printNum3SigFigs(&pw, s.val);
+        try pw.writeAll(s.suffix);
+        try std.testing.expectEqual(value_vis + visibleLen(s.suffix), visibleLen(pw.buffered()));
+    }
+
+    {
+        var buf: [32]u8 = undefined;
+        const s = scaleUnit(62.3, .count);
+        try std.testing.expectEqualStrings(plain_unit_suffix, s.suffix);
+        try std.testing.expectEqual(measureUnitValueVis(&buf, 62.3, .count), measureUnit(&buf, 62.3, .count));
+    }
+
+    var buf: [32]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try printNum3SigFigs(&w, 5.0);
+    try std.testing.expectEqualStrings("5.00", w.buffered());
+    w = std.Io.Writer.fixed(&buf);
+    try printNum3SigFigs(&w, 1234);
+    try std.testing.expectEqualStrings("1234", w.buffered());
+}
+
+test "main.summarizeField.fuzz" {
     try std.testing.fuzz({}, fuzzSummarizeField, .{});
 }

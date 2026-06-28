@@ -7,12 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog covers the poop lineage starting at v0.3.0 and tracks zebrac-specific changes after [0.5.0] section.
 
-## [0.6.0] - Unreleased
+## [0.6.0] - 2026-06-28
 
 ### Added
 
 - `failed_sample_count` per command in JSON `results[]` (always present); table header `(N runs, M failed)` when `M > 0`, else `(N runs)`; failed measured runs still contribute to means; warmup not counted
-- Stat fact-check unit tests: small-n Q1/Q3 order-stat indices (`n` = 2, 3, 4), Tukey outlier count on a skewed list, and compare delta significance at the ±1% practical band (`deltaIsSignificant`)
 - `--` ends option parsing; operands after it are commands even when they look like flags
 - `--json=<path>` as an alternative to `--json <path>`
 - JSON `config.max_samples_cap` (always `10000`)
@@ -21,19 +20,26 @@ zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog cov
 
 ### Changed
 
+- Results table unit columns: suffixes (`µs`, `KB`, `K`, …) are only the abbreviation; one space before `±` and `…`, then one space after (no extra padding spaces in the suffix slot)
 - With `-f` / `--allow-failures`, `wall_time` ends when the child exits; draining stderr for failure notes happens after timing and is not included in `wall_time`
 - Progress bar renders after each measured sample (not before spawn); terminal width is cached at bar init
 - Piped stdout automatically skips the progress bar during sampling (same as `--quiet` for stderr animation); results table still prints unless `-q`
 - CLI table row visibility uses comptime `measurementFieldMeta` (P3 #35); `major_faults` row still hidden when `max == 0`; JSON always emits all nine metrics
+- `help.version`, README badge, and JSON `zebrac_version` aligned to `0.6.0`
+- `zig build` adds `ci`, `preflight`, `cross`, and `release` (see README)
+- `main.zig` refactors (sampling loop, table layout helpers, tests); behavior unchanged except table formatting notes above
+- Simplified main README so it is less overwhelming and more useful for new users (might consider adding wiki docs later for more detailed usage and troubleshooting)
 
 ### Fixed
 
+- Results table `±` and `…` columns stay aligned in plain and color modes after suffix layout change
 - Check perf group `DISABLE` / `RESET` ioctl results; warn once per command and skip the measured sample instead of recording unreliable counters; abort the command after repeated ioctl failures
 - Report a clear stderr hint when a perf counter read returns fewer than eight bytes (`ShortPerfRead`)
 - Open perf group leader with `disabled=true` and child counters with `disabled=false` per `perf_event_open(2)`
 - Under `-f`, only the first failing sample prints full stderr; later failures summarize as `N more failed samples` (stderr omitted)
 - Under `-f`, reuse one stderr capture buffer per run instead of retaining each sample in the arena
 - Under `-f`, after the first failure stderr note, later samples use `stderr: .ignore` and normal `child.wait` (no per-sample pipe drain); 1 MiB capture buffer allocated only if a failure note is needed
+- CLI errors: invalid numeric flags use `requires a number`; spawn and JSON write failures print clear messages (no Debug stack traces)
 
 ## [0.5.6] - 2026-06-25
 

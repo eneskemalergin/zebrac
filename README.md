@@ -11,7 +11,7 @@
   <a href="https://github.com/eneskemalergin/zebrac/actions/workflows/ci.yml">
     <img src="https://github.com/eneskemalergin/zebrac/actions/workflows/ci.yml/badge.svg?style=flat-square" alt="CI">
   </a>
-  <img src="https://img.shields.io/badge/version-v0.5.6-8A2BE2?style=flat-square" alt="v0.5.6">
+  <img src="https://img.shields.io/badge/version-v0.6.0-8A2BE2?style=flat-square" alt="v0.6.0">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/license-MIT-4B9D6E?style=flat-square" alt="MIT">
   <img src="https://img.shields.io/badge/linux-x86__64%20%7C%20aarch64%20%7C%20riscv64-1793D1?style=flat-square" alt="Linux">
@@ -24,111 +24,87 @@
 
 ---
 
-## Features
+## Quick start
 
-Inherited from poop:
-
-- **Hardware counters.** CPU cycles, instructions, cache references, cache misses, branch misses via `perf_event_open`.
-- **Peak RSS tracking.** Memory spikes per run via `getrusage`.
-- **Page fault counts.** Minor and major faults per run from the same `getrusage` wait (no extra syscall).
-- **Statistical analysis.** Mean, standard deviation, quartiles, outlier detection (Tukey's fences), Student's t-test.
-- **Color-coded deltas.** First command is the reference. Subsequent results show % difference with confidence intervals.
-- **No shell overhead.** Commands spawn directly. No shell noise in measurements.
-- **Progress bar.** Spinner and animated bar with estimated completion.
-
-Added by zebrac:
-
-- **Warmup runs.** Run unmeasured iterations before sampling to warm caches and branch predictors.
-- **Configurable sampling.** Set min/max samples and duration per command.
-- **Machine-readable output.** `--json` writes structured results to a file for CI pipelines.
-- **Shell-like quoting.** `'...'`, `"..."`, and `\ ` outside quotes (see [Quoting rules](#quoting-rules)).
-
-## Usage
-
-Linux only. Full reference: run `zebrac --help` after building (source of truth is `src/help.zig`).
+zebrac runs on Linux and needs `perf_event_open` (if counters fail, `--help` mentions `perf_event_paranoid`).
 
 ```bash
-./zig-out/bin/zebrac --help
-./zig-out/bin/zebrac --version
+git clone https://github.com/eneskemalergin/zebrac
+cd zebrac
+zig build
+./zig-out/bin/zebrac ./app-old ./app-new
 ```
 
-**Commands:** one quoted string per program (no `/bin/sh`). Two or more commands: first is the baseline, rest show delta %.
+You pass one quoted command string per program. With several commands, the first is the baseline and later ones get a % delta in the table. Warmup runs happen first (default 3, not measured), then sampling continues until both `--duration` and `--min-samples` are satisfied, or `--max-samples` (hard cap 10,000) stops the run. Flags and defaults: `zebrac --help`.
 
-**Measured each run:** `wall_time`, `peak_rss`, `minor_faults`, `major_faults` (table row hidden when `max` is 0; JSON always includes the field), and five perf hardware counters (`cpu_cycles`, `instructions`, `cache_references`, `cache_misses`, `branch_misses`). With `-f`, `wall_time` ends when the child exits; post-exit stderr drain for the first failure note is excluded, and later failing samples do not pipe stderr.
+While samples run, a progress bar prints on stderr unless stdout is piped or you pass `-q`. The results table still shows unless you use `--quiet`.
 
-**Sampling:** warmup runs first (unmeasured), then samples until both `--duration` and `--min-samples` are satisfied, or `--max-samples` (cap 10000) stops the run. Rejects `min < 1`, `max == 0`, or `min > max` before spawn. With `-f`, non-zero exit on a measured run does not stop the benchmark; see **Output semantics** and `zebrac --help` (Sampling).
+## What it measures
 
-```text
-Sampling:
-  -d, --duration <ms>      time budget per command [5000]
-  -i, --min-samples <n>    minimum measured runs per command [5]
-  -a, --max-samples <n>    maximum measured runs per command [10000]
-  -w, --warmup <n>         unmeasured runs before sampling [3]
+Nine fields per sample (`wall_time`, `peak_rss`, `minor_faults`, `major_faults`, and the five perf counters: `cpu_cycles`, `instructions`, `cache_references`, `cache_misses`, `branch_misses`). Wall time and memory peak are self-explanatory; `minor_faults` are page faults that never touched disk, `major_faults` are ones that did.
 
-Output:
-  --color <mode>           auto, never, or ansi [auto]
-  -q, --quiet              no progress bar or results table
-  --json [<path>]          write results JSON [zebrac-results.json]
-  -f, --allow-failures     keep sampling on non-zero exit
+`major_faults` drops out of the printed table if every sample was zero. JSON always keeps it. Each metric gets mean, σ, min, max, quartiles, and an outlier count. Pass two commands and the second table adds % vs the first; `!` means probably slower, `*` probably faster, dim means probably noise.
 
-Information:
-  -h, --help               show full usage
-  --version                show version
-```
+zebrac execs your program directly (no `/bin/sh`). Paths with spaces need quoting ([below](#quoting)). Compared to upstream [poop](https://github.com/andrewrk/poop), this fork adds warmup, min/max sample limits, `--json`, `--` to stop flag parsing, and `--json=path` for awkward paths.
 
-**Requirements:** Linux with `perf_event_open`. If counters fail, check `perf_event_paranoid` (see `--help`).
-
-**Environment:** `NO_COLOR` and `CLICOLOR_FORCE` affect color in `auto` mode (see `--help`).
-
-### Examples
-
-Compare two builds:
+## Examples
 
 ```bash
+# two builds, second column shows % vs the first
 zebrac ./app-old ./app-new
-```
 
-Path with spaces:
-
-```bash
+# spaced path and args
 zebrac './build/my app' "./build/my app --release"
-```
 
-Quick 2-second benchmark:
-
-```bash
+# stop sampling after ~2s of wall time (still honors --min-samples)
 zebrac --duration 2000 'curl https://example.com'
-```
 
-With warmup and custom sample count:
-
-```bash
 zebrac --warmup 10 --min-samples 20 './myapp'
+
+# CI: no table, write JSON
+zebrac --quiet --json ./ci-results.json --duration 5000 './myapp'
+
+# keep sampling when exit code != 0; first failure prints stderr, rest get a count
+zebrac -f './might-fail.sh' './baseline.sh'
+
+# operand looks like a flag; everything after -- is the command
+zebrac -d 500 -- '/bin/true --version'
 ```
 
-With JSON output for CI (quiet, only JSON file):
+## Quoting
+
+Your shell handles zebrac's flags. Each command string is split again inside zebrac before exec:
+
+- `foo bar` - two words (split on space, tab, or newline)
+- `'...'` and `"..."` - literal text, no escapes inside
+- `\x` - outside quotes, takes the next character literally (`\\` -> `\`)
+- `echo'hi'` - adjacent quote and text glue into one word (`echohi`)
+
+No `$VAR`, backticks, globs, pipes, or redirects.
+
+## JSON output
+
+`--json` writes summaries to `zebrac-results.json` by default. Use `--json=path` when the path starts with `-`.
+
+The CLI table scales numbers (ms, KB) and can compare runs with a delta column. JSON keeps raw units (nanoseconds, bytes, counts) and does not store which command was the baseline or any compare %. It always includes `major_faults` even when the table hid that row. Under `-f`, JSON has `failed_sample_count`; the table shows `(N runs, M failed)` when M > 0.
 
 ```bash
-zebrac --quiet --json ./ci-results.json --duration 5000 './myapp'
+zebrac --json --duration 3000 './myapp'
+jq '.results[0].wall_time.mean' zebrac-results.json
+jq '.results[0].major_faults.mean' zebrac-results.json
 ```
 
-## Quoting rules
+```python
+import json
+data = json.load(open("zebrac-results.json"))
+print(data["results"][0]["minor_faults"]["mean"])
+```
 
-zebrac does not run `/bin/sh`. Each **command operand** you pass (every non-flag argument) is parsed again by a small lexer (`argv_parse.zig`) before spawn. Your shell still splits `zebrac`’s own argv first; quoting below applies to those command strings, not to `zebrac`’s flags.
+Each result has `sample_count`, `failed_sample_count`, `argv`, and the nine metrics above. Each metric object carries `mean`, `std_dev`, `min`, `max`, `median`, `q1`, `q3`, `outlier_count`, `sample_count`, `unit`. Root also has `schema_version`, `zebrac_version`, and `config` (duration, sample limits, warmup, `allow_failures`, `max_samples_cap`, and `max_samples_requested` when clamped).
 
-| Syntax     | Behavior                                                                      |
-| ---------- | ----------------------------------------------------------------------------- |
-| `foo bar`  | Two arguments (whitespace: space, tab, newline, carriage return).             |
-| `'...'`    | Literal; no escapes inside.                                                   |
-| `"..."`    | Literal; no escapes inside.                                                   |
-| `\x`       | Outside quotes only: x becomes part of the word (use `\\` for one backslash). |
-| `echo'hi'` | Adjacent quoted and bare text glue into one word (`echohi`).                  |
+## Build
 
-Not supported: `$VAR`, `` `cmd` ``, globs, `|`, `>`, `&`. UTF-8 paths work as bytes; do not split inside a multibyte character.
-
-## Build from Source
-
-Tested with [Zig](https://ziglang.org/) 0.16.0 (download into `zig-0.16.0/` at repo root, gitignored).
+[Zig](https://ziglang.org/) 0.16.0.
 
 ```bash
 git clone https://github.com/eneskemalergin/zebrac
@@ -137,79 +113,13 @@ zig build
 ./zig-out/bin/zebrac --help
 ```
 
-Default `zig build` produces a stripped **ReleaseSmall** binary (~290 KB on x86_64; size varies by Zig version). For debugging: `zig build -Doptimize=Debug`. Other modes: `-Doptimize=ReleaseSafe` or `ReleaseFast`.
+ReleaseSmall, stripped, about 290-300 KB on x86_64. Debug: `zig build -Doptimize=Debug`. Linux binaries for x86, x86_64, aarch64, riscv64: `zig build release` (`zig-out/{arch}-linux-zebrac`).
 
-Match CI: the **check** job runs `zig fmt --check build.zig src/` and `zig build test`; the **build** job cross-compiles ReleaseSmall for x86, x86_64, aarch64, and riscv64 Linux and runs a one-line smoke on the x86_64 artifact (`zebrac --quiet --min-samples 2 /bin/true`). Locally, `zig build ci` runs tests plus those four cross-builds in one step. `zig build test --fuzz` is maintainer-only (not CI); run it when your Zig toolchain supports fuzzing.
+## Compared to Hyperfine
 
-Cross-compile for aarch64, x86_64, x86, and riscv64 Linux:
+[Hyperfine](https://github.com/sharkdp/hyperfine) is the usual cross-platform wall-clock tool. zebrac stays on Linux because it pulls perf counters and page-fault counts Hyperfine does not report. Hyperfine often shells out; zebrac execs argv directly (you can still run `sh -c '...'` as your command). With multiple inputs, Hyperfine sorts by time and lets you pick a reference; zebrac always deltas against the first command.
 
-```bash
-zig build release
-```
-
-Median in the results table uses the upper middle value when the sample count is even (index `n/2` after sorting).
-
-## Output semantics
-
-CLI table and `--json` export answer different questions. Keep the roles separate:
-
-| Concern                           | CLI table                                          | JSON v1 (`--json`)                           |
-| --------------------------------- | -------------------------------------------------- | -------------------------------------------- |
-| Compare deltas vs first command   | Yes (`delta` column)                               | No                                           |
-| Significance / CI on delta        | Yes (`±` half-width)                               | No                                           |
-| Per-run raw samples               | No                                                 | No                                           |
-| Display scaling (ns/us/ms, KB/MB) | Yes                                                | No (raw base units)                          |
-| Outliers                          | Count + % in table                                 | `outlier_count` only                         |
-| Failed measured runs (`-f`)       | `(N runs, M failed)` when `M > 0`, else `(N runs)` | `failed_sample_count` always (`0` when none) |
-| Baseline command                  | Implicit (first operand)                           | Not recorded                                 |
-
-**σ column** is the per-command sample standard deviation (spread within one run set). **Delta ±** is a separate pooled two-sample compare interval (CLI only).
-
-**Equal means:** compare delta shows bare `0%` with no `±` band when the difference is zero and compare is defined; too few samples or a ~zero baseline yields `n/a`.
-
-JSON is a **summary archive** for CI and tooling (`mean`, `std_dev`, quartiles, etc.). Recompute compare semantics yourself or wait for schema v2 (planned). Full detail: `zebrac --help` (Comparison and Sampling sections).
-
-## Tooling Usage
-
-The `--json` flag writes structured results to a file alongside the terminal output. Default path is `zebrac-results.json`. Custom path with `--json ./path/to/file.json`.
-
-The root object includes `schema_version`, `zebrac_version`, `config` (sampling flags used for the run), and `results`, an array of objects per command with `sample_count`, `failed_sample_count` (always present; non-zero when some measured runs exited non-zero under `-f`; warmup failures are not counted), and summarized metrics in **raw units** (nanoseconds, bytes, counts). The CLI table uses `(N runs)` or `(N runs, M failed)` in the benchmark header when `M > 0`. JSON has **no** compare deltas, significance, or baseline index; those appear only in the CLI table when you pass two or more commands (first command is the baseline there).
-
-```bash
-zebrac --json --duration 3000 './myapp'
-# terminal output shows, then: results written to zebrac-results.json
-jq '.results[0].wall_time.mean' zebrac-results.json
-jq '.config.warmup' zebrac-results.json
-```
-
-Parse in Python:
-
-```python
-import json
-data = json.load(open('zebrac-results.json'))
-mean = data['results'][0]['wall_time']['mean']
-warmup = data['config']['warmup']
-```
-
-Each measurement includes `mean`, `std_dev`, `min`, `max`, `median`, `q1`, `q3`, `outlier_count`, `sample_count`, and `unit`.
-
-## Comparison with Hyperfine
-
-zebrac is new. [Hyperfine](https://github.com/sharkdp/hyperfine) has been around longer and has more configuration options.
-
-zebrac reports peak memory usage and 5 hardware counters (cycles, instructions, cache refs/misses, branch misses). Hyperfine has none of those.
-
-Commands run directly in zebrac - no shell spawning noise, but no shell syntax either. Hyperfine defaults to shell mode, with a flag to turn it off.
-
-zebrac uses the first command as a reference and shows deltas. Hyperfine sorts by wall clock and lets you pick the reference.
-
-Hyperfine is cross-platform. zebrac is Linux-only.
-
-## References
-
-- [andrewrk/poop](https://github.com/andrewrk/poop) - original upstream. zebrac adds JSON export, warmup, configurable sampling, shell-like quoting, cross-compilation, and tests.
-- [Hyperfine](https://github.com/sharkdp/hyperfine) - command-line benchmarking tool. Cross-platform, more features, no hardware counters.
-- [perf](https://perf.wiki.kernel.org/) - Linux profiler. Low-level event monitoring. zebrac wraps a subset of its functionality.
+Related: [poop](https://github.com/andrewrk/poop) (upstream), [perf](https://perf.wiki.kernel.org/) (kernel tooling underneath).
 
 ## License
 

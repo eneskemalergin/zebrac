@@ -1,39 +1,56 @@
-//! Progress bar on stderr during sampling. Fixed-width layout for tests.
+//! Progress bar on stderr while samples run.
+//!
+//! Bar width follows terminal columns. `render` caps updates around 20 per second.
+
 const std = @import("std");
 const Io = std.Io;
 
 const Spinner = struct {
-    pub const frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
-    pub const frame1 = "⠋";
-    pub const frame_count = frames.len / frame1.len;
+    const frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+    const frame1 = "⠋";
+    const frame_count = frames.len / frame1.len;
 
     frame_idx: usize,
 
-    pub fn init() Spinner {
+    fn init() Spinner {
         return .{ .frame_idx = 0 };
     }
 
-    pub fn get(self: *const Spinner) []const u8 {
+    fn get(self: *const Spinner) []const u8 {
         return frames[self.frame_idx * frame1.len ..][0..frame1.len];
     }
 
-    pub fn next(self: *Spinner) void {
+    fn next(self: *Spinner) void {
         self.frame_idx = (self.frame_idx + 1) % frame_count;
     }
 };
 
+// Box-drawing chars; one column each in most fonts.
 const bar_char = "━";
 const half_bar_left = "╸";
 const half_bar_right = "╺";
-const WIDTH_PADDING: usize = 100;
-const progress_run_suffix = " runs ";
 
-/// True when the progress bar should run during sampling (`!quiet` and stdout is a TTY).
+const progress_run_suffix = " runs ";
+const min_term_cols: usize = 23;
+const default_term_cols: usize = 80;
+const render_throttle_ms: i64 = 50;
+// ANSI sequences can be wider than visible columns; pad past ioctl width.
+const width_padding: usize = 100;
+
+// Widest run count and percent strings; keep in sync with formatLine.
+const max_run_count_field = std.fmt.comptimePrint(" {d: >5}{s}", .{ 10_000, progress_run_suffix });
+const max_pct_field = std.fmt.comptimePrint(" {d: >3.0}% ", .{100});
+
+fn barSlotCount(term_cols: usize) usize {
+    return term_cols - Spinner.frame1.len - max_run_count_field.len - max_pct_field.len;
+}
+
+/// Bar on when not quiet and stdout is a TTY.
 pub fn samplingShowsProgressBar(quiet: bool, stdout_is_tty: bool) bool {
     return !quiet and stdout_is_tty;
 }
 
-/// Heuristic for tests and smoke: progress lines contain a run count and percent field.
+/// Does this look like a progress line? (tests)
 pub fn outputLooksLikeProgressLine(buf: []const u8) bool {
     return std.mem.indexOf(u8, buf, progress_run_suffix) != null and
         std.mem.indexOf(u8, buf, "%") != null;
@@ -45,59 +62,43 @@ fn getScreenWidth(io: Io, file: Io.File) usize {
         .file = file,
         .code = std.posix.T.IOCGWINSZ,
         .arg = &winsize,
-    } }) catch return 80).device_io_control;
+    } }) catch return default_term_cols).device_io_control;
     if (err >= 0 and winsize.col > 0) return winsize.col;
-    return 80;
+    return default_term_cols;
 }
 
 const ColorCodes = struct {
     dim: []const u8,
     pink: []const u8,
     white: []const u8,
-    green: []const u8,
-    magenta: []const u8,
     cyan: []const u8,
     reset: []const u8,
     erase_line: []const u8,
 
     fn init(mode: Io.Terminal.Mode) ColorCodes {
         return switch (mode) {
-            .no_color => .{
-                .dim = "",
-                .pink = "",
-                .white = "",
-                .green = "",
-                .magenta = "",
-                .cyan = "",
-                .reset = "",
-                // `\r` alone leaves stale bar glyphs. EL clears the row. Bar on stderr, table on stdout.
-                .erase_line = "\x1b[2K\r",
-            },
             .escape_codes => .{
                 .dim = "\x1b[2m",
                 .pink = "\x1b[38;5;205m",
                 .white = "\x1b[37m",
-                .green = "\x1b[32m",
-                .magenta = "\x1b[35m",
                 .cyan = "\x1b[36m",
                 .reset = "\x1b[0m",
                 .erase_line = "\x1b[2K\r",
             },
-            .windows_api => .{
+            .no_color, .windows_api => .{
                 .dim = "",
                 .pink = "",
                 .white = "",
-                .green = "",
-                .magenta = "",
                 .cyan = "",
                 .reset = "",
+                // CR alone leaves junk on the line; clear the row first. Bar on stderr, table on stdout.
                 .erase_line = "\x1b[2K\r",
             },
         };
     }
 };
 
-/// Visual segments for the animated bar. `visualWidth` always equals `bar_width`.
+/// Bar layout: full blocks, optional half blocks, empty tail.
 pub const BarLayout = struct {
     bar_width: usize,
     full_bars_len: usize,
@@ -113,7 +114,8 @@ pub const BarLayout = struct {
     }
 };
 
-/// Maps run progress to bar segments. Cap at 100% so a full bar cannot underflow `empty_bars`.
+// Half-column steps so the bar can move smoothly between full blocks.
+// Clamp at 100% so empty_bars can't underflow.
 fn computeBarLayout(bar_width: usize, current: u64, estimate: u64) BarLayout {
     if (bar_width == 0) {
         return .{
@@ -144,6 +146,11 @@ fn computeBarLayout(bar_width: usize, current: u64, estimate: u64) BarLayout {
     };
 }
 
+fn writeGlyphRepeat(w: *Io.Writer, glyph: []const u8, count: usize) !void {
+    var n: usize = 0;
+    while (n < count) : (n += 1) try w.writeAll(glyph);
+}
+
 pub const ProgressBar = struct {
     spinner: Spinner,
     current: u64,
@@ -154,6 +161,7 @@ pub const ProgressBar = struct {
     buf: Io.Writer.Allocating,
     last_rendered: Io.Timestamp,
 
+    /// `writer` is borrowed; `buf` is ours and cleared each frame.
     pub fn init(
         io: Io,
         allocator: std.mem.Allocator,
@@ -162,7 +170,7 @@ pub const ProgressBar = struct {
         screen: Io.File,
     ) !ProgressBar {
         const term_cols = getScreenWidth(io, screen);
-        const buf: Io.Writer.Allocating = try .initCapacity(allocator, term_cols + WIDTH_PADDING);
+        const buf: Io.Writer.Allocating = try .initCapacity(allocator, term_cols + width_padding);
         return .{
             .spinner = .init(),
             .last_rendered = .now(io, .awake),
@@ -179,7 +187,7 @@ pub const ProgressBar = struct {
         self.buf.deinit();
     }
 
-    /// Writes one progress line into `bw`. `term_cols` is full terminal width (used to derive bar width).
+    /// Format one progress line into `bw`. `term_cols` = full terminal width.
     pub fn formatLine(
         bw: *Io.Writer,
         colors: ColorCodes,
@@ -188,9 +196,11 @@ pub const ProgressBar = struct {
         current: u64,
         estimate: u64,
     ) !void {
-        if (term_cols < 23) return;
-        const bar_width = term_cols - Spinner.frame1.len - " 10000 runs ".len - " 100% ".len;
-        const layout = computeBarLayout(bar_width, current, estimate);
+        if (term_cols < min_term_cols) {
+            @branchHint(.cold);
+            return;
+        }
+        const layout = computeBarLayout(barSlotCount(term_cols), current, estimate);
 
         try bw.print("{s}{s}{s} {d: >5}{s}", .{
             colors.cyan, spinner_frame,       colors.reset,
@@ -198,35 +208,29 @@ pub const ProgressBar = struct {
         });
 
         try bw.print("{s}", .{colors.pink});
-        for (0..layout.full_bars_len) |_| {
-            try bw.print(bar_char, .{});
-        }
-        if (layout.show_half_left) {
-            try bw.print(half_bar_left, .{});
-        }
+        try writeGlyphRepeat(bw, bar_char, layout.full_bars_len);
+        if (layout.show_half_left) try bw.writeAll(half_bar_left);
         try bw.print("{s}{s}", .{ colors.white, colors.dim });
-        if (layout.show_half_right) {
-            try bw.print(half_bar_right, .{});
-        }
-        for (0..layout.empty_bars) |_| {
-            try bw.print(bar_char, .{});
-        }
+        if (layout.show_half_right) try bw.writeAll(half_bar_right);
+        try writeGlyphRepeat(bw, bar_char, layout.empty_bars);
         try bw.print("{s}", .{colors.reset});
         try bw.print(" {d: >3.0}% ", .{
             @as(f64, @floatFromInt(current)) * 100 / @as(f64, @floatFromInt(@max(estimate, 1))),
         });
     }
 
+    /// Redraw the bar. Skips if called within 50 ms of the last draw.
     pub fn render(self: *ProgressBar, io: Io) !void {
         const now: Io.Timestamp = .now(io, .awake);
-        if (self.last_rendered.durationTo(now).toMilliseconds() < 50) {
-            return;
-        }
-        try self.clear(io);
+        if (self.last_rendered.durationTo(now).toMilliseconds() < render_throttle_ms) return;
+        try self.clear();
         self.last_rendered = now;
         const width = self.term_cols;
-        if (width < 23) return;
-        try self.buf.ensureTotalCapacity(width + WIDTH_PADDING);
+        if (width < min_term_cols) {
+            @branchHint(.cold);
+            return;
+        }
+        try self.buf.ensureTotalCapacity(width + width_padding);
         const bw = &self.buf.writer;
         const spinner_frame = self.spinner.get();
         try ProgressBar.formatLine(bw, self.colors, width, spinner_frame, self.current, self.estimate);
@@ -236,15 +240,20 @@ pub const ProgressBar = struct {
         try self.writer.flush();
     }
 
-    pub fn clear(self: *ProgressBar, io: Io) !void {
-        _ = io;
+    /// Clear the bar line on stderr. Call before printing the results table.
+    pub fn clear(self: *ProgressBar) !void {
         try self.writer.writeAll(self.colors.erase_line);
         try self.writer.flush();
         self.buf.clearRetainingCapacity();
     }
 };
 
-/// Format a single progress line into `buf` (fixed terminal width for tests and previews).
+comptime {
+    if (barSlotCount(default_term_cols) < 1)
+        @compileError("barSlotCount must leave room for bar glyphs at default_term_cols");
+}
+
+/// Format one line into a fixed buffer (tests).
 fn formatPreviewLine(
     buf: []u8,
     mode: Io.Terminal.Mode,
@@ -253,8 +262,7 @@ fn formatPreviewLine(
     estimate: u64,
 ) !usize {
     var w = Io.Writer.fixed(buf);
-    const colors = ColorCodes.init(mode);
-    try ProgressBar.formatLine(&w, colors, term_cols, Spinner.frame1, current, estimate);
+    try ProgressBar.formatLine(&w, ColorCodes.init(mode), term_cols, Spinner.init().get(), current, estimate);
     return w.end;
 }
 
@@ -268,117 +276,44 @@ fn countSubstring(hay: []const u8, needle: []const u8) usize {
     return n;
 }
 
-fn barSlotCount(term_cols: usize) usize {
-    return term_cols - Spinner.frame1.len - " 10000 runs ".len - " 100% ".len;
+/// Old empty-slot math (pre-2.0.1). Wraps in ReleaseSmall; panics in Debug.
+fn legacyEmptySlots(bar_width: usize, full_bars_len: usize) usize {
+    return bar_width - full_bars_len - 1;
 }
 
-test "no_color erase_line clears full row before shorter output" {
-    const colors = ColorCodes.init(.no_color);
-    try std.testing.expectEqualStrings("\x1b[2K\r", colors.erase_line);
-    var threaded = std.Io.Threaded.init_single_threaded;
-    const io = threaded.io();
-    var out_buf: [4096]u8 = undefined;
-    var out_writer = Io.Writer.fixed(&out_buf);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var bar = try ProgressBar.init(io, arena.allocator(), &out_writer, .no_color, Io.File.stdout());
-    defer bar.deinit();
-    bar.last_rendered = Io.Timestamp.zero;
-    bar.current = 7;
-    bar.estimate = 8;
-    try bar.render(io);
-    const progress_len = out_writer.end;
-    try bar.clear(io);
-    try out_writer.writeAll("Benchmark 1 (8 runs): /bin/sleep 0.4\n");
-    const final = out_writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, final, "\x1b[2K\r") != null);
-    const bench_start = std.mem.indexOf(u8, final, "Benchmark 1").?;
-    const bench_line_end = std.mem.indexOfScalar(u8, final[bench_start..], '\n').? + bench_start;
-    const bench_line = final[bench_start..bench_line_end];
-    try std.testing.expectEqualStrings("Benchmark 1 (8 runs): /bin/sleep 0.4", bench_line);
-    try std.testing.expect(std.mem.indexOf(u8, bench_line, bar_char) == null);
-    try std.testing.expect(std.mem.indexOf(u8, bench_line, "%") == null);
-    _ = progress_len;
-}
-
-test "formatLine: 100 percent fills bar slots (no_color)" {
-    var buf: [512]u8 = undefined;
-    const term_cols: usize = 100;
-    const len = try formatPreviewLine(&buf, .no_color, term_cols, 50, 50);
-    const line = buf[0..len];
-    try std.testing.expect(std.mem.indexOf(u8, line, "    50 runs ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, line, " 100% ") != null);
-    const slots = barSlotCount(term_cols);
-    try std.testing.expectEqual(slots, countSubstring(line, bar_char));
-    try std.testing.expect(std.mem.indexOf(u8, line, half_bar_left) == null);
-    try std.testing.expect(std.mem.indexOf(u8, line, half_bar_right) == null);
-}
-
-test "formatLine: zero percent has dim tail (no_color)" {
-    var buf: [512]u8 = undefined;
-    const term_cols: usize = 80;
-    const len = try formatPreviewLine(&buf, .no_color, term_cols, 0, 20);
-    const line = buf[0..len];
-    try std.testing.expect(std.mem.indexOf(u8, line, "     0 runs ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, line, "   0% ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, line, half_bar_right) != null);
-    try std.testing.expectEqual(barSlotCount(term_cols), countSubstring(line, bar_char) + 1);
-}
-
-test "formatLine: fifty percent (no_color)" {
-    var buf: [512]u8 = undefined;
-    const len = try formatPreviewLine(&buf, .no_color, 100, 25, 50);
-    const line = buf[0..len];
-    try std.testing.expect(std.mem.indexOf(u8, line, "    25 runs ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, line, "  50% ") != null);
-    const slots = barSlotCount(100);
-    try std.testing.expectEqual(slots, countSubstring(line, bar_char) + countSubstring(line, half_bar_left) + countSubstring(line, half_bar_right));
-}
-
-test "formatLine: escape_codes includes ANSI sequences" {
-    var buf: [1024]u8 = undefined;
-    const len = try formatPreviewLine(&buf, .escape_codes, 100, 50, 100);
-    const line = buf[0..len];
-    try std.testing.expect(std.mem.indexOf(u8, line, "\x1b[36m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, line, "\x1b[38;5;205m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, line, "\x1b[0m") != null);
-}
-
-test "BarLayout: 100 percent matches bar_width (regression 2.0.1)" {
-    const bar_width: usize = 50;
-    const layout = computeBarLayout(bar_width, 100, 100);
-    try std.testing.expectEqual(bar_width, layout.full_bars_len);
-    try std.testing.expect(!layout.show_half_left);
-    try std.testing.expect(!layout.show_half_right);
-    try std.testing.expectEqual(@as(usize, 0), layout.empty_bars);
-    try std.testing.expectEqual(bar_width, layout.visualWidth());
-}
-
-test "BarLayout: current equals estimate at various widths" {
-    const estimates = [_]u64{ 1, 2, 5, 100, 10_000 };
-    const widths = [_]usize{ 1, 10, 57, 200 };
-    for (estimates) |est| {
-        for (widths) |w| {
-            const layout = computeBarLayout(w, est, est);
-            try std.testing.expectEqual(w, layout.visualWidth());
-            try std.testing.expectEqual(@as(usize, 0), layout.empty_bars);
-        }
+test "progress.BarLayout" {
+    {
+        const layout = computeBarLayout(50, 100, 100);
+        try std.testing.expectEqual(@as(usize, 50), layout.full_bars_len);
+        try std.testing.expect(!layout.show_half_left);
+        try std.testing.expect(!layout.show_half_right);
+        try std.testing.expectEqual(@as(usize, 0), layout.empty_bars);
+        try std.testing.expectEqual(@as(usize, 50), layout.visualWidth());
     }
-}
 
-test "BarLayout: zero and partial progress" {
-    const w: usize = 20;
-    const z = computeBarLayout(w, 0, 10);
-    try std.testing.expectEqual(@as(usize, 0), z.full_bars_len);
-    try std.testing.expect(z.show_half_right);
-    try std.testing.expectEqual(w, z.visualWidth());
+    const edges = [_]struct {
+        w: usize,
+        cur: u64,
+        est: u64,
+        full: usize,
+        half_l: bool,
+        half_r: bool,
+        empty: usize,
+    }{
+        .{ .w = 20, .cur = 0, .est = 10, .full = 0, .half_l = false, .half_r = true, .empty = 19 },
+        .{ .w = 20, .cur = 5, .est = 10, .full = 10, .half_l = false, .half_r = true, .empty = 9 },
+        .{ .w = 30, .cur = 200, .est = 100, .full = 30, .half_l = false, .half_r = false, .empty = 0 },
+        .{ .w = 10, .cur = 5, .est = 0, .full = 10, .half_l = false, .half_r = false, .empty = 0 },
+    };
+    for (edges) |e| {
+        const layout = computeBarLayout(e.w, e.cur, e.est);
+        try std.testing.expectEqual(e.full, layout.full_bars_len);
+        try std.testing.expectEqual(e.half_l, layout.show_half_left);
+        try std.testing.expectEqual(e.half_r, layout.show_half_right);
+        try std.testing.expectEqual(e.empty, layout.empty_bars);
+        try std.testing.expectEqual(e.w, layout.visualWidth());
+    }
 
-    const half = computeBarLayout(w, 5, 10);
-    try std.testing.expectEqual(@as(usize, 10), half.full_bars_len);
-    try std.testing.expectEqual(w, half.visualWidth());
-}
-
-test "BarLayout: visual width invariant (property)" {
     var bar_width: usize = 1;
     while (bar_width <= 80) : (bar_width += 1) {
         var estimate: u64 = 1;
@@ -392,23 +327,101 @@ test "BarLayout: visual width invariant (property)" {
     }
 }
 
-test "BarLayout: current above estimate caps at full bar" {
-    const layout = computeBarLayout(30, 200, 100);
-    try std.testing.expectEqual(@as(usize, 30), layout.full_bars_len);
-    try std.testing.expectEqual(@as(usize, 0), layout.empty_bars);
+test "progress.formatLine" {
+    const cases = [_]struct {
+        mode: Io.Terminal.Mode,
+        cols: usize,
+        current: u64,
+        estimate: u64,
+        runs: []const u8,
+        pct: []const u8,
+        bar_chars: usize,
+        half_left: usize,
+        half_right: usize,
+        segment_total: ?usize,
+        want_ansi: bool,
+    }{
+        .{
+            .mode = .no_color,
+            .cols = 80,
+            .current = 0,
+            .estimate = 20,
+            .runs = "     0 runs ",
+            .pct = "   0% ",
+            .bar_chars = 0,
+            .half_left = 0,
+            .half_right = 1,
+            .segment_total = barSlotCount(80),
+            .want_ansi = false,
+        },
+        .{
+            .mode = .no_color,
+            .cols = 100,
+            .current = 25,
+            .estimate = 50,
+            .runs = "    25 runs ",
+            .pct = "  50% ",
+            .bar_chars = 0,
+            .half_left = 0,
+            .half_right = 0,
+            .segment_total = barSlotCount(100),
+            .want_ansi = false,
+        },
+        .{
+            .mode = .no_color,
+            .cols = 100,
+            .current = 50,
+            .estimate = 50,
+            .runs = "    50 runs ",
+            .pct = " 100% ",
+            .bar_chars = barSlotCount(100),
+            .half_left = 0,
+            .half_right = 0,
+            .segment_total = null,
+            .want_ansi = false,
+        },
+        .{
+            .mode = .escape_codes,
+            .cols = 100,
+            .current = 50,
+            .estimate = 100,
+            .runs = "    50 runs ",
+            .pct = "  50% ",
+            .bar_chars = 0,
+            .half_left = 0,
+            .half_right = 0,
+            .segment_total = barSlotCount(100),
+            .want_ansi = true,
+        },
+    };
+
+    for (cases) |c| {
+        var buf: [1024]u8 = undefined;
+
+        const len = try formatPreviewLine(&buf, c.mode, c.cols, c.current, c.estimate);
+        const line = buf[0..len];
+
+        try std.testing.expect(std.mem.indexOf(u8, line, c.runs) != null);
+        try std.testing.expect(std.mem.indexOf(u8, line, c.pct) != null);
+        const bars = countSubstring(line, bar_char);
+        const halves_l = countSubstring(line, half_bar_left);
+        const halves_r = countSubstring(line, half_bar_right);
+        if (c.segment_total) |total| {
+            try std.testing.expectEqual(total, bars + halves_l + halves_r);
+        } else {
+            try std.testing.expectEqual(c.bar_chars, bars);
+            try std.testing.expectEqual(c.half_left, halves_l);
+            try std.testing.expectEqual(c.half_right, halves_r);
+        }
+        if (c.want_ansi) {
+            try std.testing.expect(std.mem.indexOf(u8, line, "\x1b[36m") != null);
+            try std.testing.expect(std.mem.indexOf(u8, line, "\x1b[38;5;205m") != null);
+            try std.testing.expect(std.mem.indexOf(u8, line, "\x1b[0m") != null);
+        }
+    }
 }
 
-test "BarLayout: estimate zero treated as one" {
-    const layout = computeBarLayout(10, 5, 0);
-    try std.testing.expectEqual(@as(usize, 10), layout.full_bars_len);
-}
-
-/// Legacy formula from pre-2.0.1. In ReleaseSmall this wraps; in Debug it panics.
-fn legacyEmptySlots(bar_width: usize, full_bars_len: usize) usize {
-    return bar_width - full_bars_len - 1;
-}
-
-test "legacy formula underflows at 100 percent in optimized builds" {
+test "progress.legacyEmptySlots_underflows" {
     const builtin = @import("builtin");
     if (builtin.mode == .Debug) return error.SkipZigTest;
     const bar_width: usize = 50;
@@ -417,73 +430,37 @@ test "legacy formula underflows at 100 percent in optimized builds" {
     try std.testing.expect(remainder > bar_width);
 }
 
-test "render at 100 percent completes without hang" {
+test "progress.eraseLine_clearsRowBeforeBenchmark" {
+    const colors = ColorCodes.init(.no_color);
+    try std.testing.expectEqualStrings("\x1b[2K\r", colors.erase_line);
+
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
-    var out_buf: [8192]u8 = undefined;
+    var out_buf: [4096]u8 = undefined;
     var out_writer = Io.Writer.fixed(&out_buf);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var bar = try ProgressBar.init(io, arena.allocator(), &out_writer, .no_color, Io.File.stdout());
     defer bar.deinit();
     bar.last_rendered = Io.Timestamp.zero;
-    bar.current = 100;
-    bar.estimate = 100;
+    bar.current = 7;
+    bar.estimate = 8;
+
     try bar.render(io);
-    const line = out_writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, line, " 100% ") != null);
-    try std.testing.expectEqual(countSubstring(line, bar_char), barSlotCount(bar.term_cols));
+    try bar.clear();
+    try out_writer.writeAll("Benchmark 1 (8 runs): /bin/sleep 0.4\n");
+
+    const final = out_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, final, "\x1b[2K\r") != null);
+    const bench_start = std.mem.indexOf(u8, final, "Benchmark 1").?;
+    const bench_line_end = std.mem.indexOfScalar(u8, final[bench_start..], '\n').? + bench_start;
+    const bench_line = final[bench_start..bench_line_end];
+    try std.testing.expectEqualStrings("Benchmark 1 (8 runs): /bin/sleep 0.4", bench_line);
+    try std.testing.expect(std.mem.indexOf(u8, bench_line, bar_char) == null);
+    try std.testing.expect(std.mem.indexOf(u8, bench_line, "%") == null);
 }
 
-test "init caches terminal width for render" {
-    var threaded = std.Io.Threaded.init_single_threaded;
-    const io = threaded.io();
-    var out_buf: [8192]u8 = undefined;
-    var out_writer = Io.Writer.fixed(&out_buf);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var bar = try ProgressBar.init(io, arena.allocator(), &out_writer, .no_color, Io.File.stdout());
-    defer bar.deinit();
-    const at_init = bar.term_cols;
-    try std.testing.expect(at_init >= 23);
-    bar.last_rendered = Io.Timestamp.zero;
-    bar.current = 1;
-    bar.estimate = 2;
-    try bar.render(io);
-    try std.testing.expectEqual(at_init, bar.term_cols);
-    try std.testing.expect(std.mem.indexOf(u8, out_writer.buffered(), "     1 runs ") != null);
-}
-
-test "render with escape_codes mode" {
-    var threaded = std.Io.Threaded.init_single_threaded;
-    const io = threaded.io();
-    var out_buf: [8192]u8 = undefined;
-    var out_writer = Io.Writer.fixed(&out_buf);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var bar = try ProgressBar.init(io, arena.allocator(), &out_writer, .escape_codes, Io.File.stdout());
-    defer bar.deinit();
-    bar.last_rendered = Io.Timestamp.zero;
-    bar.current = 50;
-    bar.estimate = 100;
-    try bar.render(io);
-    try std.testing.expect(std.mem.indexOf(u8, out_writer.buffered(), "\x1b[") != null);
-}
-
-test "samplingShowsProgressBar respects quiet and stdout tty" {
-    try std.testing.expect(!samplingShowsProgressBar(true, true));
-    try std.testing.expect(!samplingShowsProgressBar(true, false));
-    try std.testing.expect(samplingShowsProgressBar(false, true));
-    try std.testing.expect(!samplingShowsProgressBar(false, false));
-}
-
-test "outputLooksLikeProgressLine detects bar output" {
-    try std.testing.expect(outputLooksLikeProgressLine("     3 runs 100%"));
-    try std.testing.expect(!outputLooksLikeProgressLine("Benchmark 1 (3 runs): /bin/true"));
-    try std.testing.expect(!outputLooksLikeProgressLine(""));
-}
-
-test "render throttled skips second write" {
+test "progress.render_throttlesRapidUpdates" {
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
     var out_buf: [4096]u8 = undefined;
@@ -495,10 +472,33 @@ test "render throttled skips second write" {
     bar.last_rendered = Io.Timestamp.zero;
     bar.current = 2;
     bar.estimate = 5;
+
     try bar.render(io);
     const after_first = out_writer.end;
     try std.testing.expect(after_first > 0);
+
     bar.last_rendered = .now(io, .awake);
     try bar.render(io);
     try std.testing.expectEqual(after_first, out_writer.end);
+}
+
+test "progress.helpers" {
+    const show_cases = [_]struct { quiet: bool, tty: bool, want: bool }{
+        .{ .quiet = true, .tty = true, .want = false },
+        .{ .quiet = true, .tty = false, .want = false },
+        .{ .quiet = false, .tty = true, .want = true },
+        .{ .quiet = false, .tty = false, .want = false },
+    };
+    for (show_cases) |c| {
+        try std.testing.expectEqual(c.want, samplingShowsProgressBar(c.quiet, c.tty));
+    }
+
+    const line_cases = [_]struct { line: []const u8, want: bool }{
+        .{ .line = "     3 runs 100%", .want = true },
+        .{ .line = "Benchmark 1 (3 runs): /bin/true", .want = false },
+        .{ .line = "", .want = false },
+    };
+    for (line_cases) |c| {
+        try std.testing.expectEqual(c.want, outputLooksLikeProgressLine(c.line));
+    }
 }

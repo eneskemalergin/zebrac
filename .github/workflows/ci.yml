@@ -12,10 +12,8 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      - name: Format check
-        run: zig fmt --check build.zig src/
-      - name: Test
-        run: zig build test
+      - name: CI
+        run: zig build ci
 
   build:
     needs: check

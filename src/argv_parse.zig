@@ -1,8 +1,10 @@
-//! We exec argv directly, but users still type shell-ish words.
-//! This lexer is the thin layer between those two worlds: no `$VAR`, no globs, no pipes.
-//! Quotes are literal wrappers; backslash only works in bare (unquoted) text.
+//! Split a command operand into argv. No shell magic; no $VAR, globs, or pipes.
+//!
+//! Plain words point into the original string. Quoted or escaped words are copied to the arena.
+
 const std = @import("std");
 
+/// Bad quotes, trailing backslash, or empty operand.
 pub const ParseError = error{
     UnclosedSingleQuote,
     UnclosedDoubleQuote,
@@ -10,13 +12,112 @@ pub const ParseError = error{
     EmptyCommand,
 };
 
-const State = enum { bare, single, double };
+/// Parse error, or arena OOM.
+pub const ParseCommandLineError = ParseError || error{OutOfMemory};
+
+/// Split `cmd` into argv. Clears `argv` first.
+pub fn parseCommandLine(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), cmd: []const u8) ParseCommandLineError!void {
+    argv.clearRetainingCapacity();
+    errdefer argv.clearRetainingCapacity();
+
+    var mode: QuoteMode = .bare;
+    var i: usize = 0;
+    var word = Word{
+        .cmd = cmd,
+        .slice_start = 0,
+        .buf = .empty,
+        .materialized = false,
+        .active = false,
+    };
+    defer word.buf.deinit(arena);
+
+    while (i < cmd.len) {
+        const c = cmd[i];
+        switch (mode) {
+            .bare => {
+                if (std.ascii.isWhitespace(c)) {
+                    try pushWord(arena, argv, &word, i);
+                    i += 1;
+                    continue;
+                }
+                switch (c) {
+                    '\'' => try openQuote(&word, &mode, arena, &i, .single),
+                    '"' => try openQuote(&word, &mode, arena, &i, .double),
+                    '\\' => {
+                        if (!word.active) word.begin(i);
+                        try word.materializePrefix(arena, i);
+                        i += 1;
+                        if (i >= cmd.len) {
+                            @branchHint(.cold);
+                            return error.TrailingBackslash;
+                        }
+                        try word.buf.append(arena, cmd[i]);
+                        i += 1;
+                    },
+                    else => {
+                        if (!word.active) {
+                            word.begin(i);
+                        } else if (word.materialized) {
+                            // Had quotes or escapes; finish the word in buf.
+                            try word.buf.append(arena, c);
+                        }
+                        // Plain word: slice points into cmd.
+                        i += 1;
+                    },
+                }
+            },
+            .single, .double => {
+                // Inside quotes: literal bytes until the closing quote.
+                const close: u8 = if (mode == .single) '\'' else '"';
+                if (c == close) mode = .bare else try word.pushQuoted(arena, c, i);
+                i += 1;
+            },
+        }
+    }
+
+    switch (mode) {
+        .single => {
+            @branchHint(.cold);
+            return error.UnclosedSingleQuote;
+        },
+        .double => {
+            @branchHint(.cold);
+            return error.UnclosedDoubleQuote;
+        },
+        .bare => {},
+    }
+
+    try pushWord(arena, argv, &word, cmd.len);
+    if (argv.items.len == 0) {
+        @branchHint(.cold);
+        return error.EmptyCommand;
+    }
+}
+
+/// Error message for stderr.
+pub fn errorMessage(err: ParseCommandLineError) []const u8 {
+    return switch (err) {
+        error.OutOfMemory => "out of memory",
+        error.UnclosedSingleQuote => "missing closing single quote (')",
+        error.UnclosedDoubleQuote => "missing closing double quote (\")",
+        error.TrailingBackslash => "trailing backslash with nothing to escape",
+        error.EmptyCommand => "empty command (only whitespace, or nothing to run)",
+    };
+}
+
+comptime {
+    for (std.meta.fieldNames(ParseError)) |name| {
+        _ = errorMessage(@field(ParseError, name));
+    }
+    _ = errorMessage(error.OutOfMemory);
+}
+
+const QuoteMode = enum { bare, single, double };
 
 const Word = struct {
     cmd: []const u8,
     slice_start: usize,
     buf: std.ArrayList(u8),
-    /// Once quotes or `\` show up we cannot keep pointing into `cmd` for the whole word.
     materialized: bool,
     active: bool,
 
@@ -27,6 +128,7 @@ const Word = struct {
         self.buf.clearRetainingCapacity();
     }
 
+    // First quote or backslash: copy the plain prefix into buf.
     fn materializePrefix(self: *Word, arena: std.mem.Allocator, end: usize) !void {
         if (!self.materialized) {
             try self.buf.appendSlice(arena, self.cmd[self.slice_start..end]);
@@ -34,140 +136,69 @@ const Word = struct {
         }
     }
 
-    fn append(self: *Word, arena: std.mem.Allocator, byte: u8, index: usize) !void {
+    fn pushQuoted(self: *Word, arena: std.mem.Allocator, byte: u8, index: usize) !void {
         try self.materializePrefix(arena, index);
         try self.buf.append(arena, byte);
     }
 
     fn finish(self: *Word, arena: std.mem.Allocator, end: usize) ![]const u8 {
-        if (!self.active) return "";
         self.active = false;
         if (!self.materialized) return self.cmd[self.slice_start..end];
         return try self.buf.toOwnedSlice(arena);
     }
 };
 
-/// Split one command string into argv tokens.
-pub fn parseCommandLine(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), cmd: []const u8) (ParseError || error{OutOfMemory})!void {
-    argv.clearRetainingCapacity();
-
-    var state: State = .bare;
-    var i: usize = 0;
-    var word = Word{
-        .cmd = cmd,
-        .slice_start = 0,
-        .buf = .empty,
-        .materialized = false,
-        .active = false,
-    };
-
-    const push = struct {
-        fn do(a: std.mem.Allocator, list: *std.ArrayList([]const u8), w: *Word, end: usize) !void {
-            try list.append(a, try w.finish(a, end));
-        }
-    }.do;
-
-    while (i < cmd.len) {
-        const c = cmd[i];
-        switch (state) {
-            .bare => {
-                switch (c) {
-                    ' ', '\t', '\n', '\r' => {
-                        if (word.active) try push(arena, argv, &word, i);
-                        i += 1;
-                    },
-                    '\'' => {
-                        if (!word.active) word.begin(i);
-                        try word.materializePrefix(arena, i);
-                        state = .single;
-                        i += 1;
-                    },
-                    '"' => {
-                        if (!word.active) word.begin(i);
-                        try word.materializePrefix(arena, i);
-                        state = .double;
-                        i += 1;
-                    },
-                    '\\' => {
-                        if (!word.active) word.begin(i);
-                        i += 1;
-                        if (i >= cmd.len) return error.TrailingBackslash;
-                        try word.append(arena, cmd[i], i);
-                        i += 1;
-                    },
-                    else => {
-                        if (!word.active) {
-                            word.begin(i);
-                        } else if (word.materialized) {
-                            try word.buf.append(arena, c);
-                        }
-                        i += 1;
-                    },
-                }
-            },
-            .single => {
-                if (c == '\'') {
-                    state = .bare;
-                } else {
-                    try word.append(arena, c, i);
-                }
-                i += 1;
-            },
-            .double => {
-                if (c == '"') {
-                    state = .bare;
-                } else {
-                    try word.append(arena, c, i);
-                }
-                i += 1;
-            },
-        }
-    }
-
-    switch (state) {
-        .single => return error.UnclosedSingleQuote,
-        .double => return error.UnclosedDoubleQuote,
-        .bare => {},
-    }
-
-    if (word.active) try push(arena, argv, &word, cmd.len);
-
-    if (argv.items.len == 0) return error.EmptyCommand;
+// Chars that need quoting on round-trip join (tests).
+fn isMeta(c: u8) bool {
+    return std.ascii.isWhitespace(c) or c == '"' or c == '\'' or c == '\\';
 }
 
-pub fn errorMessage(err: anyerror) []const u8 {
-    return switch (err) {
-        error.OutOfMemory => "out of memory",
-        error.UnclosedSingleQuote => "missing closing single quote (')",
-        error.UnclosedDoubleQuote => "missing closing double quote (\")",
-        error.TrailingBackslash => "trailing backslash with nothing to escape",
-        error.EmptyCommand => "empty command (only whitespace, or nothing to run)",
-        else => "invalid command line",
-    };
+fn pushWord(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), word: *Word, end: usize) !void {
+    if (!word.active) return;
+    try argv.append(arena, try word.finish(arena, end));
 }
+
+fn openQuote(word: *Word, mode: *QuoteMode, arena: std.mem.Allocator, i: *usize, next: QuoteMode) !void {
+    if (!word.active) word.begin(i.*);
+    try word.materializePrefix(arena, i.*);
+    mode.* = next;
+    i.* += 1;
+}
+
+// Join helpers, tests only.
 
 fn needsQuoting(arg: []const u8) bool {
     if (arg.len == 0) return true;
-    for (arg) |c| {
-        switch (c) {
-            ' ', '\t', '\n', '\r', '"', '\'', '\\' => return true,
-            else => continue,
-        }
-    }
+    for (arg) |c| if (isMeta(c)) return true;
     return false;
 }
 
-/// Rebuilds a command string for tests. Single-quoted when bare words would break.
-pub fn joinCommandLine(arena: std.mem.Allocator, argv: []const []const u8) ![]const u8 {
+fn appendEscapedBare(arena: std.mem.Allocator, out: *std.ArrayList(u8), arg: []const u8) !void {
+    for (arg) |c| {
+        if (isMeta(c)) {
+            try out.append(arena, '\\');
+            try out.append(arena, c);
+        } else try out.append(arena, c);
+    }
+}
+
+fn joinCommandLine(arena: std.mem.Allocator, argv: []const []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
-    for (argv, 0..) |arg, i| {
-        if (i > 0) try out.append(arena, ' ');
+    errdefer out.deinit(arena);
+    for (argv, 0..) |arg, n| {
+        if (n > 0) try out.append(arena, ' ');
         if (!needsQuoting(arg)) {
             try out.appendSlice(arena, arg);
-        } else {
+        } else if (std.mem.indexOfScalar(u8, arg, '\'') == null) {
             try out.append(arena, '\'');
             try out.appendSlice(arena, arg);
             try out.append(arena, '\'');
+        } else if (std.mem.indexOfScalar(u8, arg, '"') == null) {
+            try out.append(arena, '"');
+            try out.appendSlice(arena, arg);
+            try out.append(arena, '"');
+        } else {
+            try appendEscapedBare(arena, &out, arg);
         }
     }
     return try out.toOwnedSlice(arena);
@@ -179,185 +210,42 @@ fn argvEqual(a: []const []const u8, b: []const []const u8) bool {
     return true;
 }
 
-test "parseCommandLine_plainWords_staysZeroCopy" {
-    const gpa = std.testing.allocator;
+fn roundtripExpect(arena: std.mem.Allocator, cmd: []const u8) !void {
     var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(gpa);
-
-    const cmd = "echo hello world";
-    try parseCommandLine(gpa, &argv, cmd);
-
-    try std.testing.expectEqual(@as(usize, 3), argv.items.len);
-    try std.testing.expect(std.meta.eql(argv.items[0], cmd[0..4]));
-    try std.testing.expect(std.meta.eql(argv.items[1], cmd[5..10]));
-    try std.testing.expect(std.meta.eql(argv.items[2], cmd[11..16]));
+    try parseCommandLine(arena, &argv, cmd);
+    const joined = try joinCommandLine(arena, argv.items);
+    var again: std.ArrayList([]const u8) = .empty;
+    try parseCommandLine(arena, &again, joined);
+    try std.testing.expect(argvEqual(argv.items, again.items));
 }
 
-test "parseCommandLine_doubleQuotes_preservesSpaces" {
-    const gpa = std.testing.allocator;
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(gpa);
-
-    try parseCommandLine(gpa, &argv, "myapp --path \"/home/user/my dir\"");
-    try std.testing.expectEqual(@as(usize, 3), argv.items.len);
-    try std.testing.expectEqualStrings("myapp", argv.items[0]);
-    try std.testing.expectEqualStrings("--path", argv.items[1]);
-    try std.testing.expectEqualStrings("/home/user/my dir", argv.items[2]);
-}
-
-test "parseCommandLine_singleQuotes_preservesSpaces" {
-    const gpa = std.testing.allocator;
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(gpa);
-
-    try parseCommandLine(gpa, &argv, "sh -c 'echo hi there'");
-    try std.testing.expectEqual(@as(usize, 3), argv.items.len);
-    try std.testing.expectEqualStrings("echo hi there", argv.items[2]);
-}
-
-test "parseCommandLine_backslashOutsideQuotes_escapesSpace" {
-    const gpa = std.testing.allocator;
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(gpa);
-
-    try parseCommandLine(gpa, &argv, "one two\\ three");
-    try std.testing.expectEqual(@as(usize, 2), argv.items.len);
-    try std.testing.expectEqualStrings("one", argv.items[0]);
-    try std.testing.expectEqualStrings("two three", argv.items[1]);
-}
-
-test "parseCommandLine_adjacentQuoteStyles_gluesOneWord" {
-    const gpa = std.testing.allocator;
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(gpa);
-
-    try parseCommandLine(gpa, &argv, "echo'hello'");
-    try std.testing.expectEqual(@as(usize, 1), argv.items.len);
-    try std.testing.expectEqualStrings("echohello", argv.items[0]);
-}
-
-test "parseCommandLine_emptyDoubleQuotes_yieldsEmptyArg" {
-    const gpa = std.testing.allocator;
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(gpa);
-
-    try parseCommandLine(gpa, &argv, "prog \"\" x");
-    try std.testing.expectEqual(@as(usize, 3), argv.items.len);
-    try std.testing.expectEqualStrings("", argv.items[1]);
-}
-
-test "parseCommandLine_whitespaceOnly_returnsEmptyCommand" {
-    const gpa = std.testing.allocator;
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(gpa);
-
-    try std.testing.expectError(error.EmptyCommand, parseCommandLine(gpa, &argv, " \t\r\n"));
-}
-
-test "parseCommandLine_leadingTrailingSpace_trimsWords" {
-    const gpa = std.testing.allocator;
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(gpa);
-
-    try parseCommandLine(gpa, &argv, "  foo  bar  ");
-    try std.testing.expectEqual(@as(usize, 2), argv.items.len);
-    try std.testing.expectEqualStrings("foo", argv.items[0]);
-    try std.testing.expectEqualStrings("bar", argv.items[1]);
-}
-
-test "parseCommandLine_newlineInsideQuotes_isLiteral" {
-    const gpa = std.testing.allocator;
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(gpa);
-
-    try parseCommandLine(gpa, &argv, "x \"a\nb\" y");
-    try std.testing.expectEqual(@as(usize, 3), argv.items.len);
-    try std.testing.expectEqualStrings("a\nb", argv.items[1]);
-}
-
-test "parseCommandLine_backslashInsideSingleQuotes_isLiteral" {
-    const gpa = std.testing.allocator;
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(gpa);
-
-    try parseCommandLine(gpa, &argv, "cmd 'a\\b'");
-    try std.testing.expectEqual(@as(usize, 2), argv.items.len);
-    try std.testing.expectEqualStrings("a\\b", argv.items[1]);
-}
-
-test "parseCommandLine_quoteInsideOppositeQuote_isLiteral" {
-    const gpa = std.testing.allocator;
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(gpa);
-
-    try parseCommandLine(gpa, &argv, "cmd 'say \"hi\"'");
-    try std.testing.expectEqualStrings("say \"hi\"", argv.items[1]);
-}
-
-test "parseCommandLine_backslashBeforeQuoteInBare_escapesQuoteByte" {
-    const gpa = std.testing.allocator;
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(gpa);
-
-    try parseCommandLine(gpa, &argv, "a\\\"b");
-    try std.testing.expectEqual(@as(usize, 1), argv.items.len);
-    try std.testing.expectEqualStrings("a\"b", argv.items[0]);
-}
-
-test "parseCommandLine_reusedArgvList_clearsPrevious" {
-    const gpa = std.testing.allocator;
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(gpa);
-
-    try parseCommandLine(gpa, &argv, "a b");
-    try std.testing.expectEqual(@as(usize, 2), argv.items.len);
-    try parseCommandLine(gpa, &argv, "only");
-    try std.testing.expectEqual(@as(usize, 1), argv.items.len);
-    try std.testing.expectEqualStrings("only", argv.items[0]);
-}
-
-test "parseCommandLine_joinRoundtrip_preservesArgv" {
-    const gpa = std.testing.allocator;
-    const cases = [_][]const u8{
-        "a b c",
-        "myapp --path \"/x y\"",
-        "sh -c 'echo hi'",
-        "one two\\ three",
-        "echo'hello'",
-        "prog \"\" x",
-        "a\\\"b",
+fn roundtripBody(cmd: []const u8, gpa: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    roundtripExpect(arena.allocator(), cmd) catch |err| switch (err) {
+        error.OutOfMemory => return error.SkipZigTest,
+        error.UnclosedSingleQuote,
+        error.UnclosedDoubleQuote,
+        error.TrailingBackslash,
+        error.EmptyCommand,
+        => return,
+        else => return err,
     };
-    for (cases) |cmd| {
-        var arena = std.heap.ArenaAllocator.init(gpa);
-        defer arena.deinit();
-        const a = arena.allocator();
+}
 
-        var argv: std.ArrayList([]const u8) = .empty;
-        try parseCommandLine(a, &argv, cmd);
-        const joined = try joinCommandLine(a, argv.items);
-        var argv2: std.ArrayList([]const u8) = .empty;
-        try parseCommandLine(a, &argv2, joined);
-        try std.testing.expect(argvEqual(argv.items, argv2.items));
+fn expectBorrowedFrom(cmd: []const u8, got: []const []const u8) !void {
+    for (got) |tok| {
+        if (tok.len == 0) continue;
+        const off = std.mem.indexOf(u8, cmd, tok) orelse return error.TestExpectedEqual;
+        try std.testing.expect(tok.ptr == cmd.ptr + off);
     }
 }
 
-test "parseCommandLine_onlyWhitespace_returnsEmptyCommand" {
-    const gpa = std.testing.allocator;
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(gpa);
-    try std.testing.expectError(error.EmptyCommand, parseCommandLine(gpa, &argv, "\t"));
-}
+const FUZZ_INPUT_CAP: usize = 2048;
+const STRESS_INPUT_CAP: usize = 512;
+const STRESS_ROUNDS: usize = 4096;
 
-test "parseCommandLine_doubleQuoteByteInsideSingleQuotes_isLiteral" {
-    const gpa = std.testing.allocator;
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(gpa);
-    try parseCommandLine(gpa, &argv, "x 'a\"b' y");
-    try std.testing.expectEqual(@as(usize, 3), argv.items.len);
-    try std.testing.expectEqualStrings("a\"b", argv.items[1]);
-}
-
-const FuzzByteWeights = [_]std.testing.Smith.Weight{
+const FUZZ_BYTE_WEIGHTS = [_]std.testing.Smith.Weight{
     .rangeAtMost(u8, 0x00, 0xff, 1),
     .rangeAtMost(u8, 0x20, 0x7e, 4),
     .value(u8, ' ', 4),
@@ -368,51 +256,132 @@ const FuzzByteWeights = [_]std.testing.Smith.Weight{
     .value(u8, '\\', 2),
 };
 
-fn fuzzParseCommandLineRoundtripBody(cmd: []const u8, gpa: std.mem.Allocator) !void {
-    var arena = std.heap.ArenaAllocator.init(gpa);
+test "argv_parse.examples" {
+    const cases = [_]struct {
+        cmd: []const u8,
+        want: []const []const u8,
+        borrow_cmd: bool = false,
+        roundtrip: bool = false,
+    }{
+        .{ .cmd = "echo hello world", .want = &.{ "echo", "hello", "world" }, .borrow_cmd = true, .roundtrip = true },
+        .{ .cmd = "myapp --path \"/home/user/my dir\"", .want = &.{ "myapp", "--path", "/home/user/my dir" }, .roundtrip = true },
+        .{ .cmd = "sh -c 'echo hi there'", .want = &.{ "sh", "-c", "echo hi there" }, .roundtrip = true },
+        .{ .cmd = "one two\\ three", .want = &.{ "one", "two three" }, .roundtrip = true },
+        .{ .cmd = "echo'hello'", .want = &.{"echohello"}, .roundtrip = true },
+        .{ .cmd = "prog '' x", .want = &.{ "prog", "", "x" }, .roundtrip = true },
+        .{ .cmd = "prog \"\" x", .want = &.{ "prog", "", "x" }, .roundtrip = true },
+        .{ .cmd = "  foo  bar  ", .want = &.{ "foo", "bar" } },
+        .{ .cmd = "x \"a\nb\" y", .want = &.{ "x", "a\nb", "y" } },
+        .{ .cmd = "cmd 'a\\b'", .want = &.{ "cmd", "a\\b" } },
+        .{ .cmd = "x 'a\"b' y", .want = &.{ "x", "a\"b", "y" } },
+        .{ .cmd = "a\\\"b", .want = &.{"a\"b"}, .roundtrip = true },
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    var argv: std.ArrayList([]const u8) = .empty;
-    parseCommandLine(a, &argv, cmd) catch |err| switch (err) {
-        error.OutOfMemory => return error.SkipZigTest,
-        error.UnclosedSingleQuote,
-        error.UnclosedDoubleQuote,
-        error.TrailingBackslash,
-        error.EmptyCommand,
-        => return,
+    for (cases) |c| {
+        var argv: std.ArrayList([]const u8) = .empty;
+
+        try parseCommandLine(a, &argv, c.cmd);
+
+        try std.testing.expectEqual(c.want.len, argv.items.len);
+        for (c.want, argv.items) |w, got| try std.testing.expectEqualStrings(w, got);
+        if (c.borrow_cmd) try expectBorrowedFrom(c.cmd, argv.items);
+        if (c.roundtrip) try roundtripExpect(a, c.cmd);
+    }
+}
+
+test "argv_parse.parseErrors" {
+    const empty_cases = [_][]const u8{ "", "\t", " \t\r\n" };
+    const fail_cases = [_]struct { cmd: []const u8, err: ParseError }{
+        .{ .cmd = "say \"hi", .err = error.UnclosedDoubleQuote },
+        .{ .cmd = "say 'hi", .err = error.UnclosedSingleQuote },
+        .{ .cmd = "oops\\", .err = error.TrailingBackslash },
+        .{ .cmd = "ok bad'", .err = error.UnclosedSingleQuote },
     };
 
-    const joined = try joinCommandLine(a, argv.items);
-    var argv2: std.ArrayList([]const u8) = .empty;
-    parseCommandLine(a, &argv2, joined) catch return error.SkipZigTest;
-    try std.testing.expect(argvEqual(argv.items, argv2.items));
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var argv: std.ArrayList([]const u8) = .empty;
+
+    for (empty_cases) |cmd| {
+        try std.testing.expectError(error.EmptyCommand, parseCommandLine(a, &argv, cmd));
+    }
+    for (fail_cases) |c| {
+        try std.testing.expectError(c.err, parseCommandLine(a, &argv, c.cmd));
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), argv.items.len);
 }
 
-fn fuzzParseCommandLineRoundtrip(_: void, smith: *std.testing.Smith) !void {
-    @disableInstrumentation();
-    var buf: [2048]u8 = undefined;
-    const len = smith.sliceWeightedBytes(buf[0..buf.len], &FuzzByteWeights);
-    try fuzzParseCommandLineRoundtripBody(buf[0..len], std.testing.allocator);
+test "argv_parse.reusedArgvList" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var argv: std.ArrayList([]const u8) = .empty;
+
+    try parseCommandLine(a, &argv, "a b");
+    try std.testing.expectEqual(@as(usize, 2), argv.items.len);
+
+    try parseCommandLine(a, &argv, "only");
+    try std.testing.expectEqual(@as(usize, 1), argv.items.len);
+    try std.testing.expectEqualStrings("only", argv.items[0]);
 }
 
-test "parseCommandLine_stress_randomRoundtrip" {
+test "argv_parse.quoting" {
+    const cases = [_]struct {
+        argv: []const []const u8,
+        want_joined: ?[]const u8 = null,
+    }{
+        .{ .argv = &.{"it's"}, .want_joined = "\"it's\"" },
+        .{ .argv = &.{"a'b\"c"} },
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    for (cases) |c| {
+        const joined = try joinCommandLine(a, c.argv);
+
+        if (c.want_joined) |want| try std.testing.expectEqualStrings(want, joined);
+
+        var got: std.ArrayList([]const u8) = .empty;
+        try parseCommandLine(a, &got, joined);
+        try std.testing.expect(argvEqual(c.argv, got.items));
+    }
+}
+
+test "argv_parse.stressRoundtrip" {
     const gpa = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x7e4a_c0de);
     const random = prng.random();
-    var buf: [512]u8 = undefined;
-    for (0..4096) |_| {
+    // Small random inputs keep stress tests fast.
+    var buf: [STRESS_INPUT_CAP]u8 = undefined;
+
+    for (0..STRESS_ROUNDS) |_| {
         const len = random.intRangeLessThan(usize, 0, buf.len + 1);
         random.bytes(buf[0..len]);
-        fuzzParseCommandLineRoundtripBody(buf[0..len], gpa) catch |err| switch (err) {
+        roundtripBody(buf[0..len], gpa) catch |err| switch (err) {
             error.SkipZigTest => return,
             else => return err,
         };
     }
 }
 
-test "parseCommandLine fuzz roundtrip" {
-    try std.testing.fuzz({}, fuzzParseCommandLineRoundtrip, .{
+test "argv_parse.fuzzRoundtrip" {
+    const Fuzz = struct {
+        fn run(_: void, smith: *std.testing.Smith) !void {
+            @disableInstrumentation();
+            var buf: [FUZZ_INPUT_CAP]u8 = undefined;
+            const len = smith.sliceWeightedBytes(buf[0..], &FUZZ_BYTE_WEIGHTS);
+            try roundtripBody(buf[0..len], std.testing.allocator);
+        }
+    };
+    try std.testing.fuzz({}, Fuzz.run, .{
         .corpus = &.{
             "a",
             "a b",
@@ -423,14 +392,4 @@ test "parseCommandLine fuzz roundtrip" {
             "prog \"\" x",
         },
     });
-}
-
-test "parseCommandLine_unclosedQuotes_andTrailingBackslash_fail" {
-    const gpa = std.testing.allocator;
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(gpa);
-
-    try std.testing.expectError(error.UnclosedDoubleQuote, parseCommandLine(gpa, &argv, "say \"hi"));
-    try std.testing.expectError(error.UnclosedSingleQuote, parseCommandLine(gpa, &argv, "say 'hi"));
-    try std.testing.expectError(error.TrailingBackslash, parseCommandLine(gpa, &argv, "oops\\"));
 }
