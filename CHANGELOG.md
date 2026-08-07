@@ -15,6 +15,7 @@ zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog cov
 
 ### Fixed
 
+- `printNum3SigFigs` renders non-finite values as `n/a` instead of `nan`/`inf` in the results table
 - Read Linux perf counters as `u64` on every target, preserving perf-counter reads on 32-bit x86 where `usize` is only 32 bits
 
 ## [0.6.0] - 2026-06-28

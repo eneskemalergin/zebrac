@@ -1688,6 +1688,10 @@ fn printMeasurement(
 }
 
 fn printNum3SigFigs(w: *std.Io.Writer, num: f64) !void {
+    if (!std.math.isFinite(num)) {
+        try w.writeAll("n/a");
+        return;
+    }
     if (num >= 100) {
         try w.print("{d:.0}", .{num});
     } else if (num >= 10) {
@@ -2471,6 +2475,18 @@ test "main.unitFormat" {
     w = std.Io.Writer.fixed(&buf);
     try printNum3SigFigs(&w, 1234);
     try std.testing.expectEqualStrings("1234", w.buffered());
+}
+
+test "main.printNum3SigFigs.nonFinite" {
+    var buf: [32]u8 = undefined;
+    const non_finite = [_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64) };
+    for (non_finite) |n| {
+        var w = std.Io.Writer.fixed(&buf);
+        try printNum3SigFigs(&w, n);
+        try std.testing.expectEqualStrings("n/a", w.buffered());
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), measureUnitValueVis(&buf, std.math.nan(f64), .count));
 }
 
 test "main.summarizeField.fuzz" {
