@@ -2,7 +2,7 @@
 
 const std = @import("std");
 
-pub const version = "0.6.0";
+pub const version = "0.6.1";
 
 /// Re-wrap help text when this changes.
 pub const wrap_width: usize = 78;

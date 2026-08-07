@@ -1,4 +1,6 @@
-//! zebrac build graph. Steps: fmt, test, ci (GHA check), cross, preflight, release.
+//! zebrac build graph. Default: native ReleaseFast binary.
+//! Steps: fmt, test, ci, preflight, release.
+
 const std = @import("std");
 
 const linux_targets = [_]std.Target.Query{
@@ -16,14 +18,15 @@ const test_roots = [_][]const u8{
 };
 
 const fmt_paths = [_][]const u8{ "build.zig", "src" };
-const ship_optimize: std.builtin.OptimizeMode = .ReleaseSmall;
+const ship_optimize: std.builtin.OptimizeMode = .ReleaseFast;
 
-fn addZebracExe(
+fn addZebrac(
     b: *std.Build,
     root_source: std.Build.LazyPath,
     resolved_target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     strip: bool,
+    omit_frame_pointer: bool,
 ) *std.Build.Step.Compile {
     return b.addExecutable(.{
         .name = "zebrac",
@@ -32,6 +35,7 @@ fn addZebracExe(
             .target = resolved_target,
             .optimize = optimize,
             .strip = strip,
+            .omit_frame_pointer = omit_frame_pointer,
         }),
     });
 }
@@ -50,12 +54,13 @@ pub fn build(b: *std.Build) void {
     const optimize = b.option(
         std.builtin.OptimizeMode,
         "optimize",
-        "Prioritize performance, safety, or binary size (default: ReleaseSmall)",
-    ) orelse .ReleaseSmall;
+        "Prioritize performance, safety, or binary size (default: ReleaseFast)",
+    ) orelse .ReleaseFast;
     const strip = b.option(bool, "strip", "Strip debug info from the binary") orelse (optimize != .Debug);
+    const omit_frame_pointer = b.option(bool, "omit-frame-pointer", "Omit frame pointers") orelse (optimize != .Debug);
 
     const root_source = b.path("src/main.zig");
-    b.installArtifact(addZebracExe(b, root_source, target, optimize, strip));
+    b.installArtifact(addZebrac(b, root_source, target, optimize, strip, omit_frame_pointer));
 
     const fmt_check = b.addFmt(.{ .paths = &fmt_paths, .check = true });
     const fmt_step = b.step("fmt", "zig fmt --check on build.zig and src/");
@@ -72,27 +77,20 @@ pub fn build(b: *std.Build) void {
     ci.dependOn(&fmt_check.step);
     for (test_runs) |run| ci.dependOn(&run.step);
 
-    const cross = b.step("cross", "ReleaseSmall cross-build for all Linux targets");
-    const release = b.step("release", "tagged ReleaseSmall binaries for all Linux targets");
-    var cross_installs: [linux_targets.len]*std.Build.Step.InstallArtifact = undefined;
-
-    for (linux_targets, 0..) |q, i| {
+    const release = b.step("release", "ReleaseFast stripped binaries for all Linux targets");
+    for (linux_targets) |q| {
         const resolved = b.resolveTargetQuery(q);
-        const exe = addZebracExe(b, root_source, resolved, ship_optimize, true);
+        const bin = addZebrac(b, root_source, resolved, ship_optimize, true, true);
         const t = resolved.result;
-        const install = b.addInstallArtifact(exe, .{
+        const install = b.addInstallArtifact(bin, .{
             .dest_dir = .{ .override = .prefix },
             .dest_sub_path = b.fmt("{s}-{s}-{s}", .{
-                @tagName(t.cpu.arch), @tagName(t.os.tag), exe.name,
+                @tagName(t.cpu.arch), @tagName(t.os.tag), bin.name,
             }),
         });
-        cross_installs[i] = install;
-        cross.dependOn(&install.step);
         release.dependOn(&install.step);
     }
 
-    const preflight = b.step("preflight", "fmt --check, tests, and all Linux cross-builds (local before push or tag)");
-    preflight.dependOn(&fmt_check.step);
-    for (test_runs) |run| preflight.dependOn(&run.step);
-    for (cross_installs) |install| preflight.dependOn(&install.step);
+    const preflight = b.step("preflight", "fmt --check and unit tests (same as ci)");
+    preflight.dependOn(ci);
 }

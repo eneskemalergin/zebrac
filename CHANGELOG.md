@@ -7,12 +7,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog covers the poop lineage starting at v0.3.0 and tracks zebrac-specific changes after [0.5.0] section.
 
-## [0.6.1] - Unreleased
+## [0.6.1] - 2026-08-06
+
+Display and terminal polish: sampling and stats are unchanged, but what you see is more honest at the edges (unit labels before rounding mislabels a tier, `n/a` instead of `nan`/`inf`, progress bar tied to stderr TTY and resize). stderr outlier notes wait for several bad metrics, not one. Local `zig build` is one stripped ReleaseFast binary; four Linux arches build in CI and on tag release only.
 
 ### Changed
 
 - stderr outlier `note:` requires at least two metrics at ≥10% outlier rate (tunable `outlier_rate_threshold_percent` and `outlier_note_min_metrics` in `main.zig`); per-metric outliers column and yellow highlight unchanged
 - Progress bar: show when stderr is a TTY (not stdout); bar colors from stderr TTY detection; terminal width refreshed on each draw
+- Default build is ReleaseFast (stripped, native only); CI matrix and tag release cross-build all four Linux targets with ReleaseFast; local `zig build release` is for tag workflow only (not preflight)
 
 ### Fixed
 

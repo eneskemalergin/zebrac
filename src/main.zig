@@ -988,7 +988,7 @@ pub fn main(init: process.Init) !void {
         terminal = Io.Terminal{
             .writer = stdout_w,
             .mode = switch (color) {
-                .auto => try Io.Terminal.detect(
+                .auto => try Io.Terminal.Mode.detect(
                     io,
                     .stdout(),
                     no_color_env,
@@ -1001,7 +1001,7 @@ pub fn main(init: process.Init) !void {
     }
     if (progress.samplingShowsProgressBar(quiet, stderr_is_tty)) {
         const bar_mode = switch (color) {
-            .auto => try Io.Terminal.detect(
+            .auto => try Io.Terminal.Mode.detect(
                 io,
                 .stderr(),
                 no_color_env,
