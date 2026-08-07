@@ -9,6 +9,10 @@ zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog cov
 
 ## [0.6.1] - Unreleased
 
+### Changed
+
+- stderr outlier `note:` requires at least two metrics at ≥10% outlier rate (tunable `outlier_rate_threshold_percent` and `outlier_note_min_metrics` in `main.zig`); per-metric outliers column and yellow highlight unchanged
+
 ### Fixed
 
 - Read Linux perf counters as `u64` on every target, preserving perf-counter reads on 32-bit x86 where `usize` is only 32 bits

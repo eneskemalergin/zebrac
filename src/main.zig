@@ -333,10 +333,6 @@ fn measureOutlier(buf: *[32]u8, count: u64, sample_count: u64) usize {
 
 const delta_baseline_epsilon: f64 = 1e-9;
 
-// --- Compare deltas ---
-// Outlier highlight threshold (%). Used in the delta column and stderr notes.
-const outlier_highlight_threshold_percent: f64 = 10.0;
-
 // Per-field table labels (comptime). JSON includes every field.
 const MeasurementFieldMeta = struct {
     visibility: MeasurementRowVisibility,
@@ -367,7 +363,11 @@ fn measurementRowVisible(visibility: MeasurementRowVisibility, m: Measurement) b
 
 fn formatOutlierLine(buf: *[32]u8, count: u64, sample_count: u64) ![]const u8 {
     var w = std.Io.Writer.fixed(buf);
-    const pct = @as(f64, @floatFromInt(count)) / @as(f64, @floatFromInt(sample_count)) * 100;
+    if (sample_count == 0) {
+        try w.print("{d} (n/a)", .{count});
+        return w.buffered();
+    }
+    const pct = metricOutlierRatePercent(count, sample_count);
     try w.print("{d} ({d:.0}%)", .{ count, pct });
     return w.buffered();
 }
@@ -617,21 +617,34 @@ fn appendCommandOperand(
     });
 }
 
-fn measurementsHaveHighOutlierRate(m: Command.Measurements) bool {
-    inline for (@typeInfo(Command.Measurements).@"struct".fields) |field| {
-        const meas = @field(m, field.name);
-        if (meas.sample_count != 0) {
-            const pct = @as(f64, @floatFromInt(meas.outlier_count)) /
-                @as(f64, @floatFromInt(meas.sample_count)) * 100;
-            if (pct >= outlier_highlight_threshold_percent) return true;
-        }
-    }
-    return false;
+const outlier_rate_threshold_percent: f64 = 10.0;
+const outlier_note_min_metrics: u32 = 2;
+
+fn metricOutlierRatePercent(count: u64, sample_count: u64) f64 {
+    return @as(f64, @floatFromInt(count)) / @as(f64, @floatFromInt(sample_count)) * 100;
 }
 
-fn anyCommandHighOutlierRate(commands: []const Command) bool {
+fn metricExceedsOutlierRateThreshold(meas: Measurement) bool {
+    if (meas.sample_count == 0) return false;
+    return metricOutlierRatePercent(meas.outlier_count, meas.sample_count) >=
+        outlier_rate_threshold_percent;
+}
+
+fn countMetricsExceedingOutlierRateThreshold(m: Command.Measurements) u32 {
+    var count: u32 = 0;
+    inline for (@typeInfo(Command.Measurements).@"struct".fields) |field| {
+        if (metricExceedsOutlierRateThreshold(@field(m, field.name))) count += 1;
+    }
+    return count;
+}
+
+fn measurementsTriggerOutlierNote(m: Command.Measurements) bool {
+    return countMetricsExceedingOutlierRateThreshold(m) >= outlier_note_min_metrics;
+}
+
+fn anyCommandTriggersOutlierNote(commands: []const Command) bool {
     for (commands) |cmd| {
-        if (measurementsHaveHighOutlierRate(cmd.measurements)) return true;
+        if (measurementsTriggerOutlierNote(cmd.measurements)) return true;
     }
     return false;
 }
@@ -1025,8 +1038,12 @@ pub fn main(init: process.Init) !void {
     if (warmup == 0) {
         try run_notes.append(arena, "--warmup 0; first measured run may include cold-start effects");
     }
-    if (anyCommandHighOutlierRate(commands.items)) {
-        try run_notes.append(arena, "outlier rate >=10% on at least one metric; check system load or raise --warmup");
+    if (anyCommandTriggersOutlierNote(commands.items)) {
+        try run_notes.append(arena, try std.fmt.allocPrint(
+            arena,
+            "outlier rate >={d:.0}% on {d}+ metrics; check system load or raise --warmup",
+            .{ outlier_rate_threshold_percent, outlier_note_min_metrics },
+        ));
     }
 
     try help.printRunNotes(stderr_w, run_notes.items);
@@ -1651,8 +1668,7 @@ fn printMeasurement(
     try TableLayout.padVis(w, &vis, layout.outlierStartVis());
     var outlier_buf: [32]u8 = undefined;
     const outlier_line = try formatOutlierLine(&outlier_buf, m.outlier_count, m.sample_count);
-    const outlier_percent = @as(f64, @floatFromInt(m.outlier_count)) / @as(f64, @floatFromInt(m.sample_count)) * 100;
-    if (outlier_percent >= outlier_highlight_threshold_percent)
+    if (metricExceedsOutlierRateThreshold(m))
         try terminal.setColor(.yellow)
     else
         try terminal.setColor(.dim);
@@ -1789,14 +1805,15 @@ fn measurementsFromParts(wall: Measurement, rss: Measurement, count: Measurement
     };
 }
 
-fn commandWithWallOutlierPct(sample_count: u64, outlier_count: u64) Command {
-    var wall = testMeasurement(.count);
+fn commandWithOnlyWallOutlierPct(sample_count: u64, outlier_count: u64) Command {
+    var wall = testMeasurement(.nanoseconds);
     wall.sample_count = sample_count;
     wall.outlier_count = outlier_count;
+    const normal = testMeasurement(.count);
     return .{
         .raw_cmd = "cmd",
         .argv = &.{},
-        .measurements = measurementsFill(wall),
+        .measurements = measurementsFromParts(wall, normal, normal),
         .sample_count = @intCast(sample_count),
         .failed_sample_count = 0,
     };
@@ -2147,21 +2164,55 @@ test "main.jsonOutput" {
 test "main.outlierRateThreshold" {
     var buf: [32]u8 = undefined;
     try std.testing.expectEqualStrings("2 (20%)", try formatOutlierLine(&buf, 2, 10));
+    try std.testing.expectEqualStrings("99 (n/a)", try formatOutlierLine(&buf, 99, 0));
 
-    const cases = [_]struct { outliers: u64, want_high: bool }{
-        .{ .outliers = 0, .want_high = false },
-        .{ .outliers = 1, .want_high = true },
-        .{ .outliers = 2, .want_high = true },
-    };
-    for (cases) |c| {
-        const cmd = commandWithWallOutlierPct(10, c.outliers);
-        try std.testing.expectEqual(c.want_high, anyCommandHighOutlierRate(&.{cmd}));
-    }
+    var meas = testMeasurement(.count);
+    meas.sample_count = 10;
+    meas.outlier_count = 1;
+    try std.testing.expect(metricExceedsOutlierRateThreshold(meas));
+    const all_high = measurementsFill(meas);
+    try std.testing.expect(measurementsTriggerOutlierNote(all_high));
+
+    meas.outlier_count = 0;
+    try std.testing.expect(!metricExceedsOutlierRateThreshold(meas));
+
+    const single_at_threshold = commandWithOnlyWallOutlierPct(10, 1);
+    try std.testing.expect(metricExceedsOutlierRateThreshold(single_at_threshold.measurements.wall_time));
+    try std.testing.expect(!measurementsTriggerOutlierNote(single_at_threshold.measurements));
+    try std.testing.expect(!anyCommandTriggersOutlierNote(&.{single_at_threshold}));
+
+    const single_high_rate = commandWithOnlyWallOutlierPct(10, 2);
+    try std.testing.expect(metricExceedsOutlierRateThreshold(single_high_rate.measurements.wall_time));
+    try std.testing.expect(!measurementsTriggerOutlierNote(single_high_rate.measurements));
+
+    var wall = testMeasurement(.nanoseconds);
+    wall.sample_count = 10;
+    wall.outlier_count = 1;
+    var rss = testMeasurement(.bytes);
+    rss.sample_count = 10;
+    rss.outlier_count = 1;
+    const two_at_threshold = measurementsFromParts(wall, rss, testMeasurement(.count));
+    try std.testing.expect(measurementsTriggerOutlierNote(two_at_threshold));
+
+    wall.outlier_count = 2;
+    rss.outlier_count = 2;
+    const two_high = measurementsFromParts(wall, rss, testMeasurement(.count));
+    try std.testing.expect(measurementsTriggerOutlierNote(two_high));
+    try std.testing.expect(anyCommandTriggersOutlierNote(&.{
+        .{
+            .raw_cmd = "cmd",
+            .argv = &.{},
+            .measurements = two_high,
+            .sample_count = 10,
+            .failed_sample_count = 0,
+        },
+    }));
 
     var zero_n = testMeasurement(.count);
     zero_n.sample_count = 0;
     zero_n.outlier_count = 99;
-    try std.testing.expect(!measurementsHaveHighOutlierRate(measurementsFill(zero_n)));
+    try std.testing.expect(!metricExceedsOutlierRateThreshold(zero_n));
+    try std.testing.expect(!measurementsTriggerOutlierNote(measurementsFill(zero_n)));
 }
 
 test "main.stderrCaptureBuf" {
