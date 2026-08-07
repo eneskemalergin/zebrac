@@ -1,7 +1,4 @@
-//! Spawn commands, collect samples, print a stats table or JSON.
-//!
-//! Operand parsing is in `argv_parse`; help text in `help`; progress bar in `progress`.
-//! One arena per run. Tables on stdout; notes and the bar on stderr.
+//! Spawn commands, collect samples, print stats or JSON.
 
 const std = @import("std");
 const Io = std.Io;
@@ -23,8 +20,6 @@ const default_warmup: usize = 3;
 const perf_ioctl_skip_limit_min: u32 = 32;
 const perf_ioctl_skip_limit_max: u32 = 1024;
 
-// --- Perf counter configuration ---
-
 const PerfMeasurement = struct {
     name: []const u8,
     config: PERF.COUNT.HW,
@@ -38,7 +33,6 @@ const perf_measurements = [_]PerfMeasurement{
     .{ .name = "branch_misses", .config = PERF.COUNT.HW.BRANCH_MISSES },
 };
 
-// --- Command and sample types ---
 const Command = struct {
     raw_cmd: []const u8,
     argv: []const []const u8,
@@ -89,8 +83,6 @@ const ColorMode = enum {
     ansi,
 };
 
-// --- Results table layout ---
-// Column separators (plain bytes, no ANSI). Shared by header and rows.
 const sep_mean: []const u8 = " ± ";
 const sep_minmax: []const u8 = " … ";
 const row_indent: usize = 2;
@@ -257,19 +249,23 @@ const scale_threshold = struct {
     byte_suffix: []const u8 = "",
 };
 
+fn unitScaleMin(div: f64) f64 {
+    return div - div / 2000.0;
+}
+
 const ns_unit_thresholds = [_]scale_threshold{
-    .{ .min = 3600 * 1_000_000_000, .div = 3600 * 1_000_000_000, .ns_suffix = "h" },
-    .{ .min = 60 * 1_000_000_000, .div = 60 * 1_000_000_000, .ns_suffix = "m" },
-    .{ .min = 1_000_000_000, .div = 1_000_000_000, .ns_suffix = "s" },
-    .{ .min = 1_000_000, .div = 1_000_000, .ns_suffix = "ms" },
-    .{ .min = 1_000, .div = 1_000, .ns_suffix = "µs" },
+    .{ .min = unitScaleMin(3600.0 * 1_000_000_000), .div = 3600.0 * 1_000_000_000, .ns_suffix = "h" },
+    .{ .min = unitScaleMin(60.0 * 1_000_000_000), .div = 60.0 * 1_000_000_000, .ns_suffix = "m" },
+    .{ .min = unitScaleMin(1_000_000_000.0), .div = 1_000_000_000.0, .ns_suffix = "s" },
+    .{ .min = unitScaleMin(1_000_000.0), .div = 1_000_000.0, .ns_suffix = "ms" },
+    .{ .min = 1_000.0, .div = 1_000.0, .ns_suffix = "µs" },
 };
 
 const qty_unit_thresholds = [_]scale_threshold{
-    .{ .min = 1_000_000_000_000, .div = 1_000_000_000_000, .count_suffix = "T", .byte_suffix = "TB" },
-    .{ .min = 1_000_000_000, .div = 1_000_000_000, .count_suffix = "G", .byte_suffix = "GB" },
-    .{ .min = 1_000_000, .div = 1_000_000, .count_suffix = "M", .byte_suffix = "MB" },
-    .{ .min = 1_000, .div = 1_000, .count_suffix = "K", .byte_suffix = "KB" },
+    .{ .min = unitScaleMin(1_000_000_000_000.0), .div = 1_000_000_000_000.0, .count_suffix = "T", .byte_suffix = "TB" },
+    .{ .min = unitScaleMin(1_000_000_000.0), .div = 1_000_000_000.0, .count_suffix = "G", .byte_suffix = "GB" },
+    .{ .min = unitScaleMin(1_000_000.0), .div = 1_000_000.0, .count_suffix = "M", .byte_suffix = "MB" },
+    .{ .min = 1_000.0, .div = 1_000.0, .count_suffix = "K", .byte_suffix = "KB" },
 };
 
 fn scaleUnit(x: f64, unit: Measurement.Unit) UnitScaled {
@@ -333,7 +329,6 @@ fn measureOutlier(buf: *[32]u8, count: u64, sample_count: u64) usize {
 
 const delta_baseline_epsilon: f64 = 1e-9;
 
-// Per-field table labels (comptime). JSON includes every field.
 const MeasurementFieldMeta = struct {
     visibility: MeasurementRowVisibility,
     unit: Measurement.Unit,
@@ -593,8 +588,6 @@ fn printResultsTable(
     }
 }
 
-// --- CLI operand parsing ---
-
 fn appendCommandOperand(
     arena: std.mem.Allocator,
     commands: *std.ArrayList(Command),
@@ -648,8 +641,6 @@ fn anyCommandTriggersOutlierNote(commands: []const Command) bool {
     }
     return false;
 }
-
-// --- Command benchmark loop ---
 
 const CommandBenchmarkConfig = struct {
     min_samples: u64,
@@ -870,8 +861,6 @@ fn benchmarkCommand(
     };
     command.sample_count = all_samples.len;
 }
-
-// --- Entry point ---
 
 pub fn main(init: process.Init) !void {
     const io = init.io;
@@ -1098,8 +1087,6 @@ pub fn main(init: process.Init) !void {
     try stdout_w.flush();
 }
 
-// --- JSON export ---
-
 const json_schema_version = 1;
 
 const JsonRunConfig = struct {
@@ -1211,8 +1198,6 @@ const StderrCaptureBuf = struct {
         };
     }
 };
-
-// --- Child stderr capture ---
 
 fn posixWaitStatusToTerm(status: u32) process.Child.Term {
     const W = std.os.linux.W;
@@ -1353,8 +1338,6 @@ fn printCapturedStderr(bytes: []const u8, truncated: bool) void {
     }
 }
 
-// --- Perf sampling ---
-
 const PerfSampleResetError = error{
     BadLeaderFd,
     DisableFailed,
@@ -1466,7 +1449,6 @@ fn perfEventAttrForGroupMember(config: PERF.COUNT.HW, is_leader: bool) std.os.li
     return .{
         .type = PERF.TYPE.HARDWARE,
         .config = @intFromEnum(config),
-        // Keep readPerfFd's one-u64 read contract explicit.
         .read_format = 0,
         .flags = .{
             .disabled = is_leader,
@@ -1488,8 +1470,7 @@ fn closePerfFds(fds: []fd_t) void {
 }
 
 fn openPerfGroup(fds: *[perf_measurements.len]fd_t) void {
-    // One perf group per command; reopening fds every sample is too slow.
-    // Each sample: disable, reset, spawn, read counters, disable again.
+    // Reopen perf fds once per command, not per sample.
     for (perf_measurements, fds, 0..) |measurement, *perf_fd, i| {
         var attr = perfEventAttrForGroupMember(measurement.config, i == 0);
         perf_fd.* = std.posix.perf_event_open(&attr, 0, -1, fds[0], PERF.FLAG.FD_CLOEXEC) catch |err| {
@@ -1518,8 +1499,6 @@ fn readPerfFd(fd: fd_t) !u64 {
     if (n != @sizeOf(u64)) return error.ShortPerfRead;
     return result;
 }
-
-// --- Statistics ---
 
 const Measurement = struct {
     q1: u64,
@@ -1551,7 +1530,6 @@ const Measurement = struct {
         };
     }
 
-    // One scratch buffer; sort once per metric.
     fn summarizeAll(samples: []const Sample, sort_scratch: []Sample) StatsError!Command.Measurements {
         if (samples.len == 0) return error.NoSamples;
         if (sort_scratch.len < samples.len) return error.ScratchTooSmall;
@@ -1701,7 +1679,6 @@ fn printNum3SigFigs(w: *std.Io.Writer, num: f64) !void {
     }
 }
 
-/// 95% t critical value for compare deltas. `df` = Student-t; null = normal (1.96).
 pub fn getStatScore95(df: ?u64) f64 {
     if (df) |dff| {
         const dfv: usize = @intCast(dff);
@@ -1785,8 +1762,6 @@ fn testMeasurement(unit: Measurement.Unit) Measurement {
     };
 }
 
-// --- Test helpers ---
-
 fn measurementsFill(each: Measurement) Command.Measurements {
     var out: Command.Measurements = undefined;
     inline for (@typeInfo(Command.Measurements).@"struct".fields) |field| {
@@ -1807,6 +1782,15 @@ fn measurementsFromParts(wall: Measurement, rss: Measurement, count: Measurement
         .cache_misses = count,
         .branch_misses = count,
     };
+}
+
+fn expectScaledDisplay(x: f64, unit: Measurement.Unit, want: []const u8) !void {
+    var buf: [32]u8 = undefined;
+    const s = scaleUnit(x, unit);
+    var w = std.Io.Writer.fixed(&buf);
+    try printNum3SigFigs(&w, s.val);
+    try w.writeAll(s.suffix);
+    try std.testing.expectEqualStrings(want, w.buffered());
 }
 
 fn commandWithOnlyWallOutlierPct(sample_count: u64, outlier_count: u64) Command {
@@ -2097,8 +2081,6 @@ fn fuzzSummarizeField(_: void, smith: *std.testing.Smith) !void {
     var scratch: [32]Sample = undefined;
     try checkSummarizeFieldInvariants(n, &samples, &scratch);
 }
-
-// --- Tests ---
 
 test "main.jsonOutput" {
     const json_cases = [_]struct { arg: []const u8, want: ?[]const u8 }{
@@ -2447,46 +2429,37 @@ test "main.unitFormat" {
         try std.testing.expectApproxEqAbs(c.val, s.val, 0.001);
     }
 
-    {
-        var buf: [32]u8 = undefined;
-        const value_vis = measureUnitValueVis(&buf, 1.5 * 1_000.0, .nanoseconds);
-        const s = scaleUnit(1.5 * 1_000.0, .nanoseconds);
-        try std.testing.expectEqualStrings("µs", s.suffix);
-        try std.testing.expectEqual(@as(usize, 4), value_vis);
-        try std.testing.expectEqual(@as(usize, 6), measureUnit(&buf, 1.5 * 1_000.0, .nanoseconds));
-        var probe: [32]u8 = undefined;
-        var pw = std.Io.Writer.fixed(&probe);
-        try printNum3SigFigs(&pw, s.val);
-        try pw.writeAll(s.suffix);
-        try std.testing.expectEqual(value_vis + visibleLen(s.suffix), visibleLen(pw.buffered()));
-    }
-
-    {
-        var buf: [32]u8 = undefined;
-        const s = scaleUnit(62.3, .count);
-        try std.testing.expectEqualStrings(plain_unit_suffix, s.suffix);
-        try std.testing.expectEqual(measureUnitValueVis(&buf, 62.3, .count), measureUnit(&buf, 62.3, .count));
-    }
+    const display_cases = [_]struct { x: f64, unit: Measurement.Unit, want: []const u8 }{
+        .{ .x = 999_499.0, .unit = .bytes, .want = "999KB" },
+        .{ .x = 999_999.0, .unit = .bytes, .want = "1.00MB" },
+        .{ .x = 999_499_999.0, .unit = .bytes, .want = "999MB" },
+        .{ .x = 999_500_000.0, .unit = .bytes, .want = "1.00GB" },
+        .{ .x = 999_499_999_999.0, .unit = .bytes, .want = "999GB" },
+        .{ .x = 999_500_000_000.0, .unit = .bytes, .want = "1.00TB" },
+        .{ .x = 999_499_999.0, .unit = .nanoseconds, .want = "999ms" },
+        .{ .x = 999_999_999.0, .unit = .nanoseconds, .want = "1.00s" },
+        .{ .x = 59_999_999_999.0, .unit = .nanoseconds, .want = "1.00m" },
+    };
+    for (display_cases) |c| try expectScaledDisplay(c.x, c.unit, c.want);
 
     var buf: [32]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 6), measureUnit(&buf, 1.5 * 1_000.0, .nanoseconds));
+    try std.testing.expectEqual(measureUnitValueVis(&buf, 62.3, .count), measureUnit(&buf, 62.3, .count));
+
     var w = std.Io.Writer.fixed(&buf);
     try printNum3SigFigs(&w, 5.0);
     try std.testing.expectEqualStrings("5.00", w.buffered());
     w = std.Io.Writer.fixed(&buf);
     try printNum3SigFigs(&w, 1234);
     try std.testing.expectEqualStrings("1234", w.buffered());
-}
 
-test "main.printNum3SigFigs.nonFinite" {
-    var buf: [32]u8 = undefined;
-    const non_finite = [_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64) };
-    for (non_finite) |n| {
-        var w = std.Io.Writer.fixed(&buf);
+    for ([_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64) }) |n| {
+        w = std.Io.Writer.fixed(&buf);
         try printNum3SigFigs(&w, n);
         try std.testing.expectEqualStrings("n/a", w.buffered());
     }
-
     try std.testing.expectEqual(@as(usize, 3), measureUnitValueVis(&buf, std.math.nan(f64), .count));
+    try std.testing.expectEqual(@as(usize, 5), measureUnit(&buf, std.math.inf(f64), .bytes));
 }
 
 test "main.summarizeField.fuzz" {

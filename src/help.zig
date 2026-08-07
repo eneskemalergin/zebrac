@@ -1,33 +1,26 @@
 //! --help, --version, sample limits, run notes.
-//!
-//! Help text is wrapped at `wrap_width` at compile time; run tests after editing line breaks.
 
 const std = @import("std");
 
-/// Release version. Used in --help, --version, and JSON.
 pub const version = "0.6.0";
 
-/// Max help line width. Change this to re-wrap help text.
+/// Re-wrap help text when this changes.
 pub const wrap_width: usize = 78;
 
-/// Hard cap for --max-samples (also in help text).
 pub const max_samples_cap: u64 = 10_000;
 
-/// Bad min/max sample settings.
 pub const SampleLimitsError = error{
     MinSamplesZero,
     MaxSamplesZero,
     MinSamplesExceedsMax,
 };
 
-/// Reject zero bounds and min > max.
 pub fn validateSampleLimits(min_samples: u64, max_samples: u64) SampleLimitsError!void {
     if (min_samples == 0) return error.MinSamplesZero;
     if (max_samples == 0) return error.MaxSamplesZero;
     if (min_samples > max_samples) return error.MinSamplesExceedsMax;
 }
 
-/// Error text when sample limits are invalid.
 pub fn errorMessage(err: SampleLimitsError) []const u8 {
     return switch (err) {
         error.MinSamplesZero => "--min-samples must be at least 1",
@@ -36,7 +29,6 @@ pub fn errorMessage(err: SampleLimitsError) []const u8 {
     };
 }
 
-/// Print run notes on stderr (after sampling, before the table).
 pub fn printRunNotes(w: *std.Io.Writer, notes: []const []const u8) !void {
     if (notes.len == 0) return;
     try w.print("note:\n", .{});
@@ -44,7 +36,6 @@ pub fn printRunNotes(w: *std.Io.Writer, notes: []const []const u8) !void {
     try w.flush();
 }
 
-/// Short usage when a flag is missing its value.
 pub const short_usage =
     \\Usage: zebrac [options] <command> [<command> ...]
     \\
@@ -165,10 +156,8 @@ const usage_rest =
     \\
 ;
 
-/// `zebrac 0.x.x` line for --help and --version.
 pub const version_line: []const u8 = "zebrac " ++ version ++ "\n";
 
-/// Full --help text (version line + usage).
 pub const usage_text: []const u8 = version_line ++ usage_rest;
 
 comptime {

@@ -1,10 +1,7 @@
-//! Split a command operand into argv. No shell magic; no $VAR, globs, or pipes.
-//!
-//! Plain words point into the original string. Quoted or escaped words are copied to the arena.
+//! Split a command operand into argv. No shell.
 
 const std = @import("std");
 
-/// Bad quotes, trailing backslash, or empty operand.
 pub const ParseError = error{
     UnclosedSingleQuote,
     UnclosedDoubleQuote,
@@ -12,10 +9,8 @@ pub const ParseError = error{
     EmptyCommand,
 };
 
-/// Parse error, or arena OOM.
 pub const ParseCommandLineError = ParseError || error{OutOfMemory};
 
-/// Split `cmd` into argv. Clears `argv` first.
 pub fn parseCommandLine(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), cmd: []const u8) ParseCommandLineError!void {
     argv.clearRetainingCapacity();
     errdefer argv.clearRetainingCapacity();
@@ -58,16 +53,13 @@ pub fn parseCommandLine(arena: std.mem.Allocator, argv: *std.ArrayList([]const u
                         if (!word.active) {
                             word.begin(i);
                         } else if (word.materialized) {
-                            // Had quotes or escapes; finish the word in buf.
                             try word.buf.append(arena, c);
                         }
-                        // Plain word: slice points into cmd.
                         i += 1;
                     },
                 }
             },
             .single, .double => {
-                // Inside quotes: literal bytes until the closing quote.
                 const close: u8 = if (mode == .single) '\'' else '"';
                 if (c == close) mode = .bare else try word.pushQuoted(arena, c, i);
                 i += 1;
@@ -94,7 +86,6 @@ pub fn parseCommandLine(arena: std.mem.Allocator, argv: *std.ArrayList([]const u
     }
 }
 
-/// Error message for stderr.
 pub fn errorMessage(err: ParseCommandLineError) []const u8 {
     return switch (err) {
         error.OutOfMemory => "out of memory",
@@ -128,7 +119,6 @@ const Word = struct {
         self.buf.clearRetainingCapacity();
     }
 
-    // First quote or backslash: copy the plain prefix into buf.
     fn materializePrefix(self: *Word, arena: std.mem.Allocator, end: usize) !void {
         if (!self.materialized) {
             try self.buf.appendSlice(arena, self.cmd[self.slice_start..end]);
@@ -148,7 +138,6 @@ const Word = struct {
     }
 };
 
-// Chars that need quoting on round-trip join (tests).
 fn isMeta(c: u8) bool {
     return std.ascii.isWhitespace(c) or c == '"' or c == '\'' or c == '\\';
 }
@@ -164,8 +153,6 @@ fn openQuote(word: *Word, mode: *QuoteMode, arena: std.mem.Allocator, i: *usize,
     mode.* = next;
     i.* += 1;
 }
-
-// Join helpers, tests only.
 
 fn needsQuoting(arg: []const u8) bool {
     if (arg.len == 0) return true;
@@ -359,7 +346,6 @@ test "argv_parse.stressRoundtrip" {
     const gpa = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x7e4a_c0de);
     const random = prng.random();
-    // Small random inputs keep stress tests fast.
     var buf: [STRESS_INPUT_CAP]u8 = undefined;
 
     for (0..STRESS_ROUNDS) |_| {

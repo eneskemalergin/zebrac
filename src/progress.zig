@@ -1,6 +1,4 @@
 //! Progress bar on stderr while samples run.
-//!
-//! Bar width follows terminal columns. `render` caps updates around 20 per second.
 
 const std = @import("std");
 const Io = std.Io;
@@ -25,7 +23,6 @@ const Spinner = struct {
     }
 };
 
-// Box-drawing chars; one column each in most fonts.
 const bar_char = "━";
 const half_bar_left = "╸";
 const half_bar_right = "╺";
@@ -45,12 +42,10 @@ fn barSlotCount(term_cols: usize) usize {
     return term_cols - Spinner.frame1.len - max_run_count_field.len - max_pct_field.len;
 }
 
-/// Bar on when not quiet and stdout is a TTY.
 pub fn samplingShowsProgressBar(quiet: bool, stdout_is_tty: bool) bool {
     return !quiet and stdout_is_tty;
 }
 
-/// Does this look like a progress line? (tests)
 pub fn outputLooksLikeProgressLine(buf: []const u8) bool {
     return std.mem.indexOf(u8, buf, progress_run_suffix) != null and
         std.mem.indexOf(u8, buf, "%") != null;
@@ -98,7 +93,6 @@ const ColorCodes = struct {
     }
 };
 
-/// Bar layout: full blocks, optional half blocks, empty tail.
 pub const BarLayout = struct {
     bar_width: usize,
     full_bars_len: usize,
@@ -161,7 +155,6 @@ pub const ProgressBar = struct {
     buf: Io.Writer.Allocating,
     last_rendered: Io.Timestamp,
 
-    /// `writer` is borrowed; `buf` is ours and cleared each frame.
     pub fn init(
         io: Io,
         allocator: std.mem.Allocator,
@@ -187,7 +180,6 @@ pub const ProgressBar = struct {
         self.buf.deinit();
     }
 
-    /// Format one progress line into `bw`. `term_cols` = full terminal width.
     pub fn formatLine(
         bw: *Io.Writer,
         colors: ColorCodes,
@@ -219,7 +211,6 @@ pub const ProgressBar = struct {
         });
     }
 
-    /// Redraw the bar. Skips if called within 50 ms of the last draw.
     pub fn render(self: *ProgressBar, io: Io) !void {
         const now: Io.Timestamp = .now(io, .awake);
         if (self.last_rendered.durationTo(now).toMilliseconds() < render_throttle_ms) return;
@@ -240,7 +231,6 @@ pub const ProgressBar = struct {
         try self.writer.flush();
     }
 
-    /// Clear the bar line on stderr. Call before printing the results table.
     pub fn clear(self: *ProgressBar) !void {
         try self.writer.writeAll(self.colors.erase_line);
         try self.writer.flush();
@@ -253,7 +243,6 @@ comptime {
         @compileError("barSlotCount must leave room for bar glyphs at default_term_cols");
 }
 
-/// Format one line into a fixed buffer (tests).
 fn formatPreviewLine(
     buf: []u8,
     mode: Io.Terminal.Mode,
@@ -276,7 +265,6 @@ fn countSubstring(hay: []const u8, needle: []const u8) usize {
     return n;
 }
 
-/// Old empty-slot math (pre-2.0.1). Wraps in ReleaseSmall; panics in Debug.
 fn legacyEmptySlots(bar_width: usize, full_bars_len: usize) usize {
     return bar_width - full_bars_len - 1;
 }
