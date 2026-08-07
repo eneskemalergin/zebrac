@@ -42,8 +42,8 @@ fn barSlotCount(term_cols: usize) usize {
     return term_cols - Spinner.frame1.len - max_run_count_field.len - max_pct_field.len;
 }
 
-pub fn samplingShowsProgressBar(quiet: bool, stdout_is_tty: bool) bool {
-    return !quiet and stdout_is_tty;
+pub fn samplingShowsProgressBar(quiet: bool, stderr_is_tty: bool) bool {
+    return !quiet and stderr_is_tty;
 }
 
 pub fn outputLooksLikeProgressLine(buf: []const u8) bool {
@@ -150,6 +150,7 @@ pub const ProgressBar = struct {
     current: u64,
     estimate: u64,
     writer: *Io.Writer,
+    screen: Io.File,
     term_cols: usize,
     colors: ColorCodes,
     buf: Io.Writer.Allocating,
@@ -170,6 +171,7 @@ pub const ProgressBar = struct {
             .current = 0,
             .estimate = 1,
             .writer = writer,
+            .screen = screen,
             .term_cols = term_cols,
             .colors = ColorCodes.init(mode),
             .buf = buf,
@@ -216,6 +218,7 @@ pub const ProgressBar = struct {
         if (self.last_rendered.durationTo(now).toMilliseconds() < render_throttle_ms) return;
         try self.clear();
         self.last_rendered = now;
+        self.term_cols = getScreenWidth(io, self.screen);
         const width = self.term_cols;
         if (width < min_term_cols) {
             @branchHint(.cold);

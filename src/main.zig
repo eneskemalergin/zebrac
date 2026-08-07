@@ -978,7 +978,9 @@ pub fn main(init: process.Init) !void {
         }));
     }
 
-    const stdout_is_tty = Io.File.stdout().isTty(io) catch false;
+    const stderr_is_tty = Io.File.stderr().isTty(io) catch false;
+    const no_color_env = if (init.environ_map.get("NO_COLOR")) |_| true else false;
+    const clicolor_force_env = if (init.environ_map.get("CLICOLOR_FORCE")) |_| true else false;
 
     var bar: ?progress.ProgressBar = null;
     var terminal: ?Io.Terminal = null;
@@ -986,19 +988,29 @@ pub fn main(init: process.Init) !void {
         terminal = Io.Terminal{
             .writer = stdout_w,
             .mode = switch (color) {
-                .auto => try .detect(
+                .auto => try Io.Terminal.detect(
                     io,
                     .stdout(),
-                    if (init.environ_map.get("NO_COLOR")) |_| true else false,
-                    if (init.environ_map.get("CLICOLOR_FORCE")) |_| true else false,
+                    no_color_env,
+                    clicolor_force_env,
                 ),
                 .never => .no_color,
                 .ansi => .escape_codes,
             },
         };
     }
-    if (progress.samplingShowsProgressBar(quiet, stdout_is_tty)) {
-        bar = try progress.ProgressBar.init(io, arena, stderr_w, terminal.?.mode, Io.File.stderr());
+    if (progress.samplingShowsProgressBar(quiet, stderr_is_tty)) {
+        const bar_mode = switch (color) {
+            .auto => try Io.Terminal.detect(
+                io,
+                .stderr(),
+                no_color_env,
+                clicolor_force_env,
+            ),
+            .never => .no_color,
+            .ansi => .escape_codes,
+        };
+        bar = try progress.ProgressBar.init(io, arena, stderr_w, bar_mode, Io.File.stderr());
     }
     defer if (bar) |*b| b.deinit();
 

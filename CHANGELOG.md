@@ -12,6 +12,7 @@ zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog cov
 ### Changed
 
 - stderr outlier `note:` requires at least two metrics at ≥10% outlier rate (tunable `outlier_rate_threshold_percent` and `outlier_note_min_metrics` in `main.zig`); per-metric outliers column and yellow highlight unchanged
+- Progress bar: show when stderr is a TTY (not stdout); bar colors from stderr TTY detection; terminal width refreshed on each draw
 
 ### Fixed
 

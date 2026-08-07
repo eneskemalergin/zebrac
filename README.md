@@ -37,7 +37,7 @@ zig build
 
 You pass one quoted command string per program. With several commands, the first is the baseline and later ones get a % delta in the table. Warmup runs happen first (default 3, not measured), then sampling continues until both `--duration` and `--min-samples` are satisfied, or `--max-samples` (hard cap 10,000) stops the run. Flags and defaults: `zebrac --help`.
 
-While samples run, a progress bar prints on stderr unless stdout is piped or you pass `-q`. The results table still shows unless you use `--quiet`.
+While samples run, a progress bar prints on stderr when stderr is a TTY (unless you pass `-q`). Piping stdout alone does not hide it. The results table still shows unless you use `--quiet`.
 
 ## What it measures
 
