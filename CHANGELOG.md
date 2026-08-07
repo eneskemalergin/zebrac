@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog covers the poop lineage starting at v0.3.0 and tracks zebrac-specific changes after [0.5.0] section.
 
+## [0.6.1] - Unreleased
+
+### Fixed
+
+- Read Linux perf counters as `u64` on every target, preserving perf-counter reads on 32-bit x86 where `usize` is only 32 bits
+
 ## [0.6.0] - 2026-06-28
 
 ### Added

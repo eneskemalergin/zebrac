@@ -1412,7 +1412,7 @@ fn onPerfIoctlSkip(
 fn printShortPerfReadError(counter_name: []const u8) noreturn {
     std.debug.print(
         "\nerror: incomplete read from perf counter '{s}' (expected {d} bytes)\n",
-        .{ counter_name, @sizeOf(usize) },
+        .{ counter_name, @sizeOf(u64) },
     );
     std.debug.print(
         \\hint: perf counter was reset or closed before the value could be read; close other perf tools or try again
@@ -1449,6 +1449,8 @@ fn perfEventAttrForGroupMember(config: PERF.COUNT.HW, is_leader: bool) std.os.li
     return .{
         .type = PERF.TYPE.HARDWARE,
         .config = @intFromEnum(config),
+        // Keep readPerfFd's one-u64 read contract explicit.
+        .read_format = 0,
         .flags = .{
             .disabled = is_leader,
             .exclude_kernel = true,
@@ -1480,8 +1482,8 @@ fn openPerfGroup(fds: *[perf_measurements.len]fd_t) void {
     }
 }
 
-fn readSamplePerfCounters(fds: *const [perf_measurements.len]fd_t) ![perf_measurements.len]usize {
-    var values: [perf_measurements.len]usize = undefined;
+fn readSamplePerfCounters(fds: *const [perf_measurements.len]fd_t) ![perf_measurements.len]u64 {
+    var values: [perf_measurements.len]u64 = undefined;
     for (0..perf_measurements.len) |i| {
         values[i] = readPerfFd(fds[i]) catch |err| switch (err) {
             error.ShortPerfRead => printShortPerfReadError(perf_measurements[i].name),
@@ -1491,10 +1493,12 @@ fn readSamplePerfCounters(fds: *const [perf_measurements.len]fd_t) ![perf_measur
     return values;
 }
 
-fn readPerfFd(fd: fd_t) !usize {
-    var result: usize = 0;
+fn readPerfFd(fd: fd_t) !u64 {
+    // With read_format=0, a perf event fd returns one u64 counter value.
+    // Keep this independent of usize: supported 32-bit x86 has 32-bit usize.
+    var result: u64 = 0;
     const n = try std.posix.read(fd, std.mem.asBytes(&result));
-    if (n != @sizeOf(usize)) return error.ShortPerfRead;
+    if (n != @sizeOf(u64)) return error.ShortPerfRead;
     return result;
 }
 
@@ -2183,6 +2187,8 @@ test "main.perf" {
 
     const leader = perfEventAttrForGroupMember(PERF.COUNT.HW.CPU_CYCLES, true);
     const child = perfEventAttrForGroupMember(PERF.COUNT.HW.INSTRUCTIONS, false);
+    try std.testing.expectEqual(@as(u64, 0), leader.read_format);
+    try std.testing.expectEqual(@as(u64, 0), child.read_format);
     try std.testing.expect(leader.flags.disabled);
     try std.testing.expect(!child.flags.disabled);
 
@@ -2212,6 +2218,20 @@ test "main.perf" {
     _ = std.os.linux.close(pipefd[1]);
     defer _ = std.os.linux.close(pipefd[0]);
     try std.testing.expectError(error.ShortPerfRead, readPerfFd(pipefd[0]));
+
+    var value_pipe: [2]i32 = undefined;
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.pipe(&value_pipe)));
+    defer {
+        _ = std.os.linux.close(value_pipe[0]);
+        _ = std.os.linux.close(value_pipe[1]);
+    }
+    const expected: u64 = 0xFEED_BEEF_0123_4567;
+    const expected_bytes = std.mem.asBytes(&expected);
+    try std.testing.expectEqual(
+        @sizeOf(u64),
+        std.os.linux.write(value_pipe[1], expected_bytes.ptr, expected_bytes.len),
+    );
+    try std.testing.expectEqual(expected, try readPerfFd(value_pipe[0]));
 }
 
 test "main.getStatScore95" {
