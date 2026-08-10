@@ -1,5 +1,4 @@
 //! zebrac build graph. Default: native ReleaseFast binary.
-//! Steps: fmt, test, ci, preflight, release.
 
 const std = @import("std");
 
@@ -40,11 +39,16 @@ fn addZebrac(
     });
 }
 
-fn addModuleTests(b: *std.Build, source: []const u8, host: std.Build.ResolvedTarget) *std.Build.Step.Run {
+fn addModuleTests(
+    b: *std.Build,
+    source: []const u8,
+    host: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Step.Run {
     const mod = b.createModule(.{
         .root_source_file = b.path(source),
         .target = host,
-        .optimize = .Debug,
+        .optimize = optimize,
     });
     return b.addRunArtifact(b.addTest(.{ .root_module = mod }));
 }
@@ -66,16 +70,24 @@ pub fn build(b: *std.Build) void {
     const fmt_step = b.step("fmt", "zig fmt --check on build.zig and src/");
     fmt_step.dependOn(&fmt_check.step);
 
-    const test_step = b.step("test", "Run unit tests");
-    var test_runs: [test_roots.len]*std.Build.Step.Run = undefined;
+    const test_step = b.step("test", "Run Debug unit tests");
+    var debug_test_runs: [test_roots.len]*std.Build.Step.Run = undefined;
     for (test_roots, 0..) |src, i| {
-        test_runs[i] = addModuleTests(b, src, target);
-        test_step.dependOn(&test_runs[i].step);
+        debug_test_runs[i] = addModuleTests(b, src, target, .Debug);
+        test_step.dependOn(&debug_test_runs[i].step);
     }
 
-    const ci = b.step("ci", "zig fmt --check and unit tests (GitHub Actions check job)");
+    const release_test_step = b.step("test-release", "Run ReleaseFast unit tests");
+    var release_test_runs: [test_roots.len]*std.Build.Step.Run = undefined;
+    for (test_roots, 0..) |src, i| {
+        release_test_runs[i] = addModuleTests(b, src, target, ship_optimize);
+        release_test_step.dependOn(&release_test_runs[i].step);
+    }
+
+    const ci = b.step("ci", "zig fmt --check plus Debug and ReleaseFast unit tests");
     ci.dependOn(&fmt_check.step);
-    for (test_runs) |run| ci.dependOn(&run.step);
+    for (debug_test_runs) |run| ci.dependOn(&run.step);
+    for (release_test_runs) |run| ci.dependOn(&run.step);
 
     const release = b.step("release", "ReleaseFast stripped binaries for all Linux targets");
     for (linux_targets) |q| {
@@ -91,6 +103,6 @@ pub fn build(b: *std.Build) void {
         release.dependOn(&install.step);
     }
 
-    const preflight = b.step("preflight", "fmt --check and unit tests (same as ci)");
+    const preflight = b.step("preflight", "fmt --check plus Debug and ReleaseFast unit tests");
     preflight.dependOn(ci);
 }

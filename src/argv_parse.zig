@@ -1,8 +1,11 @@
-//! Split a command operand into argv. No shell.
+//! Splits a command operand into argv for direct execution. No shell expansion.
+//!
+//! Plain words borrow from the command input. Quoted or escaped words use the
+//! caller's arena. Both must outlive the returned argv. A parse error clears argv.
 
 const std = @import("std");
 
-pub const ParseError = error{
+const ParseError = error{
     UnclosedSingleQuote,
     UnclosedDoubleQuote,
     TrailingBackslash,
@@ -94,13 +97,6 @@ pub fn errorMessage(err: ParseCommandLineError) []const u8 {
         error.TrailingBackslash => "trailing backslash with nothing to escape",
         error.EmptyCommand => "empty command (only whitespace, or nothing to run)",
     };
-}
-
-comptime {
-    for (std.meta.fieldNames(ParseError)) |name| {
-        _ = errorMessage(@field(ParseError, name));
-    }
-    _ = errorMessage(error.OutOfMemory);
 }
 
 const QuoteMode = enum { bare, single, double };
@@ -228,11 +224,11 @@ fn expectBorrowedFrom(cmd: []const u8, got: []const []const u8) !void {
     }
 }
 
-const FUZZ_INPUT_CAP: usize = 2048;
-const STRESS_INPUT_CAP: usize = 512;
-const STRESS_ROUNDS: usize = 4096;
+const fuzz_input_cap: usize = 2048;
+const stress_input_cap: usize = 512;
+const stress_rounds: usize = 4096;
 
-const FUZZ_BYTE_WEIGHTS = [_]std.testing.Smith.Weight{
+const fuzz_byte_weights = [_]std.testing.Smith.Weight{
     .rangeAtMost(u8, 0x00, 0xff, 1),
     .rangeAtMost(u8, 0x20, 0x7e, 4),
     .value(u8, ' ', 4),
@@ -243,7 +239,9 @@ const FUZZ_BYTE_WEIGHTS = [_]std.testing.Smith.Weight{
     .value(u8, '\\', 2),
 };
 
-test "argv_parse.examples" {
+// --- Tests ---
+
+test "[unit] - [command parser]: splits documented examples" {
     const cases = [_]struct {
         cmd: []const u8,
         want: []const []const u8,
@@ -280,7 +278,7 @@ test "argv_parse.examples" {
     }
 }
 
-test "argv_parse.parseErrors" {
+test "[failure] - [command parser]: reports invalid quotes and escapes" {
     const empty_cases = [_][]const u8{ "", "\t", " \t\r\n" };
     const fail_cases = [_]struct { cmd: []const u8, err: ParseError }{
         .{ .cmd = "say \"hi", .err = error.UnclosedDoubleQuote },
@@ -304,7 +302,7 @@ test "argv_parse.parseErrors" {
     try std.testing.expectEqual(@as(usize, 0), argv.items.len);
 }
 
-test "argv_parse.reusedArgvList" {
+test "[regression] - [reused argv]: clears earlier words after a parse error" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -313,12 +311,15 @@ test "argv_parse.reusedArgvList" {
     try parseCommandLine(a, &argv, "a b");
     try std.testing.expectEqual(@as(usize, 2), argv.items.len);
 
+    try std.testing.expectError(error.UnclosedSingleQuote, parseCommandLine(a, &argv, "broken '"));
+    try std.testing.expectEqual(@as(usize, 0), argv.items.len);
+
     try parseCommandLine(a, &argv, "only");
     try std.testing.expectEqual(@as(usize, 1), argv.items.len);
     try std.testing.expectEqualStrings("only", argv.items[0]);
 }
 
-test "argv_parse.quoting" {
+test "[unit] - [command parser]: handles quoting and joined words" {
     const cases = [_]struct {
         argv: []const []const u8,
         want_joined: ?[]const u8 = null,
@@ -342,13 +343,13 @@ test "argv_parse.quoting" {
     }
 }
 
-test "argv_parse.stressRoundtrip" {
+test "[property] - [command parser]: reconstructs bounded random arguments" {
     const gpa = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x7e4a_c0de);
     const random = prng.random();
-    var buf: [STRESS_INPUT_CAP]u8 = undefined;
+    var buf: [stress_input_cap]u8 = undefined;
 
-    for (0..STRESS_ROUNDS) |_| {
+    for (0..stress_rounds) |_| {
         const len = random.intRangeLessThan(usize, 0, buf.len + 1);
         random.bytes(buf[0..len]);
         roundtripBody(buf[0..len], gpa) catch |err| switch (err) {
@@ -358,12 +359,12 @@ test "argv_parse.stressRoundtrip" {
     }
 }
 
-test "argv_parse.fuzzRoundtrip" {
+test "[fuzz] - [command parser]: preserves parsed arguments across reconstruction" {
     const Fuzz = struct {
         fn run(_: void, smith: *std.testing.Smith) !void {
             @disableInstrumentation();
-            var buf: [FUZZ_INPUT_CAP]u8 = undefined;
-            const len = smith.sliceWeightedBytes(buf[0..], &FUZZ_BYTE_WEIGHTS);
+            var buf: [fuzz_input_cap]u8 = undefined;
+            const len = smith.sliceWeightedBytes(buf[0..], &fuzz_byte_weights);
             try roundtripBody(buf[0..len], std.testing.allocator);
         }
     };

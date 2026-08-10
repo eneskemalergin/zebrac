@@ -7,6 +7,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog covers the poop lineage starting at v0.3.0 and tracks zebrac-specific changes after [0.5.0] section.
 
+## [0.6.2] - 2026-08-10
+
+0.6.2 is the precision repair I did not expect to need. Identical commands exposed plausible but wrong comparisons in 0.6.1: counters included earlier runs, saved samples affected later processes, and commands ran in separate blocks. Measured runs now get fresh counters, old samples stay out of later processes, and commands run in balanced, equal-count rounds.
+
+Counter reuse and old samples entering later processes affected 0.5.5 through 0.6.1. Page-fault fields did not cause the memory bug, but their larger sample record made the RSS error grow faster.
+
+I am least happy about the comparison stats. The old pooled range could look precise around a wrong result. For now, the table keeps per-command stats and a signed mean delta, but makes no statistical conclusion while I develop something I trust.
+
+Zebrac still waits only for the direct command. Commands that start background work must wait for it themselves, and peak RSS is not total memory for the process tree.
+
+### Changed
+
+- Multi-command sampling: balanced complete rounds for warmups and measurements; exact fixed counts; one checked shared duration budget that stops after a complete round
+- `--allow-failures`: the same bounded child-stderr capture and direct-child wait path for every run; saved failure details print after collection or before an error exit
+- Comparison tables: signed mean delta only; per-command stats unchanged; `major_faults` shown for every command when any command reports a nonzero maximum
+
+### Fixed
+
+- Perf counters included earlier executions or events that ran for only part of a sample; each measured target now gets one complete counter group
+- Stored samples and progress storage entered later targets; both now stay out of child processes
+- Errors after target start could discard and repeat real work; they now stop collection, with target failures reported first
+- Missing `wait4` data now stops the run; x86 uses the correct i386 layout instead of reading zero RSS and faults
+- Duration overflow is rejected before target start, and the final repeated flag value controls behavior, notes, and JSON
+- Comparisons with too few samples or a zero or near-zero baseline now show `n/a`
+- Child waits no longer add 50 ms on older kernels or leave a target running after a wait failure; timing stops before cleanup
+- Fast progress now draws its final frame and stays aligned at large run counts
+- Benchmark headings preserve quoted argument boundaries and label one sample as `1 run`
+- JSON replaces only after a complete write, keeps existing permissions, replaces symlink paths instead of their targets, and names failures
+
+### Removed
+
+- Pooled comparison ranges, the 1% warning rule, and the `!` / `*` comparison marks. (They will likely be back at some point, when I finish my research on some additional stats work.)
+
 ## [0.6.1] - 2026-08-06
 
 Display and terminal polish: sampling and stats are unchanged, but what you see is more honest at the edges (unit labels before rounding mislabels a tier, `n/a` instead of `nan`/`inf`, progress bar tied to stderr TTY and resize). stderr outlier notes wait for several bad metrics, not one. Local `zig build` is one stripped ReleaseFast binary; four Linux arches build in CI and on tag release only.

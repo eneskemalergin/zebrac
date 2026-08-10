@@ -11,10 +11,10 @@
   <a href="https://github.com/eneskemalergin/zebrac/actions/workflows/ci.yml">
     <img src="https://github.com/eneskemalergin/zebrac/actions/workflows/ci.yml/badge.svg?style=flat-square" alt="CI">
   </a>
-  <img src="https://img.shields.io/badge/version-v0.6.1-8A2BE2?style=flat-square" alt="v0.6.1">
+  <img src="https://img.shields.io/badge/version-v0.6.2-8A2BE2?style=flat-square" alt="v0.6.2">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/license-MIT-4B9D6E?style=flat-square" alt="MIT">
-  <img src="https://img.shields.io/badge/linux-x86__64%20%7C%20aarch64%20%7C%20riscv64-1793D1?style=flat-square" alt="Linux">
+  <img src="https://img.shields.io/badge/linux-x86%20%7C%20x86__64%20%7C%20aarch64%20%7C%20riscv64-1793D1?style=flat-square" alt="Linux">
 </p>
 
 <p align="center">
@@ -35,17 +35,19 @@ zig build
 ./zig-out/bin/zebrac ./app-old ./app-new
 ```
 
-You pass one quoted command string per program. With several commands, the first is the baseline and later ones get a % delta in the table. Warmup runs happen first (default 3, not measured), then sampling continues until both `--duration` and `--min-samples` are satisfied, or `--max-samples` (hard cap 10,000) stops the run. Flags and defaults: `zebrac --help`.
+You pass one quoted command string per program. With several commands, the first is the baseline and later ones get a % delta in the table. Warmups run first and are not measured. Zebrac then runs every command once per round in a changing order. Equal minimum and maximum sample limits give an exact count. With several commands, the time budget is `--duration` multiplied by the command count, and zebrac finishes the current round before stopping. Every command therefore keeps the same sample count. Flags and defaults: `zebrac --help`.
 
 While samples run, a progress bar prints on stderr when stderr is a TTY (unless you pass `-q`). Piping stdout alone does not hide it. The results table still shows unless you use `--quiet`.
 
 ## What it measures
 
-Nine fields per sample (`wall_time`, `peak_rss`, `minor_faults`, `major_faults`, and the five perf counters: `cpu_cycles`, `instructions`, `cache_references`, `cache_misses`, `branch_misses`). Wall time and memory peak are self-explanatory; `minor_faults` are page faults that never touched disk, `major_faults` are ones that did.
+Nine fields per sample: `wall_time`, `peak_rss`, `minor_faults`, `major_faults`, and five perf counters (`cpu_cycles`, `instructions`, `cache_references`, `cache_misses`, `branch_misses`). Wall time starts just before zebrac starts the program and ends when that program exits. `peak_rss` is Linux's reported memory high-water mark for that program. Minor faults do not require disk I/O; major faults do. Each measured sample gets a new perf counter group. Zebrac rejects the counters unless the kernel reports that they ran for all of their enabled time.
 
-`major_faults` drops out of the printed table if every sample was zero. JSON always keeps it. Each metric gets mean, σ, min, max, quartiles, and an outlier count. Pass two commands and the second table adds % vs the first; `!` means probably slower, `*` probably faster, dim means probably noise.
+Zebrac waits only for the program it starts. If that program starts background work, it must wait for the work before it exits. Otherwise the background process can overlap later samples. Waiting keeps the work inside the wall-time sample, but `peak_rss` still covers only that program, not every process that it starts.
 
-zebrac execs your program directly (no `/bin/sh`). Paths with spaces need quoting ([below](#quoting)). Compared to upstream [poop](https://github.com/andrewrk/poop), this fork adds warmup, min/max sample limits, `--json`, `--` to stop flag parsing, and `--json=path` for awkward paths.
+`major_faults` drops out of the printed tables only if every command reported zero. JSON always keeps it. Each metric gets mean, σ, min, max, quartiles, and an outlier count. With two or more commands, each command keeps its own samples and summary. Later tables show the signed change in their mean relative to the first command: `+N%` means more of that measurement and `-N%` means less. Only wall time maps directly to slower or faster. The percentage does not include an uncertainty range or warning mark. If any command has fewer than two samples, every table shows `n/a` for that metric. A first-command mean that is zero or nearly zero also shows `n/a`.
+
+Zebrac starts your program directly without `/bin/sh`. Paths with spaces need quoting ([below](#quoting)). Compared to upstream [poop](https://github.com/andrewrk/poop), this fork adds warmup, min/max sample limits, `--json`, `--` to stop flag parsing, and `--json=path` for awkward paths.
 
 ## Examples
 
@@ -53,8 +55,8 @@ zebrac execs your program directly (no `/bin/sh`). Paths with spaces need quotin
 # two builds, second column shows % vs the first
 zebrac ./app-old ./app-new
 
-# spaced path and args
-zebrac './build/my app' "./build/my app --release"
+# spaced executable path; inner quotes must reach zebrac
+zebrac "'./build/my app'" "'./build/my app' --release"
 
 # stop sampling after ~2s of wall time (still honors --min-samples)
 zebrac --duration 2000 'curl https://example.com'
@@ -73,9 +75,9 @@ zebrac -d 500 -- '/bin/true --version'
 
 ## Quoting
 
-Your shell handles zebrac's flags. Each command string is split again inside zebrac before exec:
+Your shell handles zebrac's flags. Each command string is split again inside zebrac before exec. Quotes needed by the command must remain inside that string:
 
-- `foo bar` - two words (split on space, tab, or newline)
+- `foo bar` - two words; unquoted spaces, tabs, newlines, carriage returns, form feeds, and vertical tabs separate words
 - `'...'` and `"..."` - literal text, no escapes inside
 - `\x` - outside quotes, takes the next character literally (`\\` -> `\`)
 - `echo'hi'` - adjacent quote and text glue into one word (`echohi`)
@@ -84,7 +86,9 @@ No `$VAR`, backticks, globs, pipes, or redirects.
 
 ## JSON output
 
-`--json` writes summaries to `zebrac-results.json` by default. Use `--json=path` when the path starts with `-`.
+`--json` writes summaries to `zebrac-results.json` by default. When it comes before the command, use `--json -- './myapp'` so the command is not mistaken for a path. Use `--json=path` when the path starts with `-`.
+
+Zebrac finishes the JSON in the destination directory before it replaces the requested path. If writing fails, an existing regular file stays unchanged. A successful replacement keeps that file's permissions. The destination path itself is replaced, so a symlink at that path is not followed.
 
 The CLI table scales numbers (ms, KB) and can compare runs with a delta column. JSON keeps raw units (nanoseconds, bytes, counts) and does not store which command was the baseline or any compare %. It always includes `major_faults` even when the table hid that row. Under `-f`, JSON has `failed_sample_count`; the table shows `(N runs, M failed)` when M > 0.
 
@@ -113,12 +117,12 @@ zig build
 ./zig-out/bin/zebrac --help
 ```
 
-Default `zig build` installs one stripped ReleaseFast binary to `zig-out/bin/zebrac` (native arch only). Debug: `zig build -Doptimize=Debug`. Before a tag, run `zig build preflight` (fmt + tests). CI cross-builds all four Linux targets on every push; tag push also runs `zig build release` for tarballs (`zig-out/{arch}-linux-zebrac`).
+Default `zig build` installs one stripped ReleaseFast binary to `zig-out/bin/zebrac` (native arch only). Debug: `zig build -Doptimize=Debug`. `zig build test` runs Debug tests; `zig build test-release` runs the same tests in ReleaseFast. Before a tag, run `zig build preflight` (fmt + both test modes). CI cross-builds all four Linux targets on every push; tag push also runs `zig build release` for tarballs (`zig-out/{arch}-linux-zebrac`).
 
 ## Releasing
 
 1. Bump `version` in `src/help.zig`, the README badge, and add a `CHANGELOG.md` section.
-2. Commit on `main`, then tag and push: `git tag v0.6.1 && git push origin v0.6.1`
+2. Commit on `main`, then tag and push: `git tag v0.6.2 && git push origin v0.6.2`
 3. [release.yml](.github/workflows/release.yml) runs CI, builds all four Linux targets, packages `zebrac-<tag>-<arch>-linux.tar.gz` plus `SHA256SUMS`, and opens a GitHub Release with the matching CHANGELOG section as release notes.
 
 ## Compared to Hyperfine
