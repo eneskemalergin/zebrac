@@ -3156,7 +3156,7 @@ test "[unit] - [JSON v1]: keeps the exact schema, fields, and raw units" {
         .sample_count = 5,
         .failed_sample_count = 2,
     }};
-    const config = JsonRunConfig{
+    var config = JsonRunConfig{
         .duration_ms = 500,
         .min_samples = 2,
         .max_samples = help.max_samples_cap,
@@ -3243,6 +3243,94 @@ test "[unit] - [JSON v1]: keeps the exact schema, fields, and raw units" {
             measurement.unit,
         );
     }
+
+    config.max_samples_requested = null;
+    w = .fixed(&buf);
+    try printJsonOutput(&w, &commands, config);
+    const unclamped = try std.json.parseFromSlice(Parsed, std.testing.allocator, w.buffered(), .{});
+    defer unclamped.deinit();
+    try std.testing.expectEqual(@as(?u64, null), unclamped.value.config.max_samples_requested);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "\"max_samples_requested\": null") != null);
+}
+
+test "[integration] - [JSON v1]: preserves parsed UTF-8, quoting, and empty arguments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const raw = "/bin/true 'caf\xc3\xa9' \"two words\" '' '\"quoted\"' 'line\tbreak\nnext'";
+    const expected_argv = [_][]const u8{ "/bin/true", "caf\xc3\xa9", "two words", "", "\"quoted\"", "line\tbreak\nnext" };
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv_parse.parseCommandLine(arena.allocator(), &argv, raw);
+    try std.testing.expectEqual(expected_argv.len, argv.items.len);
+    for (argv.items, expected_argv) |actual, expected| try std.testing.expectEqualStrings(expected, actual);
+
+    var commands = [_]Command{.{
+        .raw_cmd = raw,
+        .argv = argv.items,
+        .measurements = measurementsFromParts(testMeasurement(.nanoseconds), testMeasurement(.bytes), testMeasurement(.count)),
+        .sample_count = 2,
+        .failed_sample_count = 0,
+    }};
+    var buffer: [8192]u8 = undefined;
+    var writer = Io.Writer.fixed(&buffer);
+    try printJsonOutput(&writer, &commands, .{
+        .duration_ms = 0,
+        .min_samples = 2,
+        .max_samples = 2,
+        .max_samples_requested = null,
+        .warmup = 0,
+        .allow_failures = false,
+    });
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, writer.buffered(), .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("results").?.array.items[0].object;
+    try std.testing.expectEqualStrings(raw, result.get("command").?.string);
+    const json_argv = result.get("argv").?.array.items;
+    try std.testing.expectEqual(expected_argv.len, json_argv.len);
+    for (json_argv, expected_argv) |actual, expected| try std.testing.expectEqualStrings(expected, actual.string);
+}
+
+test "[regression] - [JSON v1]: characterizes the deferred non-UTF-8 array defect" {
+    const raw = "/bin/true '\xff' '\xc3' ''";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv_parse.parseCommandLine(arena.allocator(), &argv, raw);
+    try std.testing.expectEqual(@as(usize, 4), argv.items.len);
+    try std.testing.expectEqualStrings("\xff", argv.items[1]);
+    try std.testing.expectEqualStrings("\xc3", argv.items[2]);
+    var commands = [_]Command{.{
+        .raw_cmd = raw,
+        .argv = argv.items,
+        .measurements = measurementsFromParts(testMeasurement(.nanoseconds), testMeasurement(.bytes), testMeasurement(.count)),
+        .sample_count = 2,
+        .failed_sample_count = 2,
+    }};
+    var buffer: [8192]u8 = undefined;
+    var writer = Io.Writer.fixed(&buffer);
+    try printJsonOutput(&writer, &commands, .{
+        .duration_ms = 0,
+        .min_samples = 2,
+        .max_samples = 2,
+        .max_samples_requested = null,
+        .warmup = 0,
+        .allow_failures = true,
+    });
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, writer.buffered(), .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("results").?.array.items[0].object;
+    // Characterize the existing schema defect without changing accepted bytes.
+    const json_raw = result.get("command").?.array.items;
+    try std.testing.expectEqual(raw.len, json_raw.len);
+    for (json_raw, raw) |actual, expected| try std.testing.expectEqual(@as(i64, expected), actual.integer);
+    const json_argv = result.get("argv").?.array.items;
+    try std.testing.expectEqual(@as(usize, 4), json_argv.len);
+    try std.testing.expectEqualStrings("/bin/true", json_argv[0].string);
+    for (json_argv[1..3], [_]i64{ 255, 195 }) |actual, expected| {
+        try std.testing.expectEqual(@as(usize, 1), actual.array.items.len);
+        try std.testing.expectEqual(expected, actual.array.items[0].integer);
+    }
+    try std.testing.expectEqualStrings("", json_argv[3].string);
+    try std.testing.expectEqual(@as(i64, 2), result.get("failed_sample_count").?.integer);
 }
 
 test "[failure] - [JSON output]: stops on a failed write and explains file errors" {

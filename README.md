@@ -104,7 +104,9 @@ data = json.load(open("zebrac-results.json"))
 print(data["results"][0]["minor_faults"]["mean"])
 ```
 
-Each result has `sample_count`, `failed_sample_count`, `argv`, and the nine metrics above. Each metric object carries `mean`, `std_dev`, `min`, `max`, `median`, `q1`, `q3`, `outlier_count`, `sample_count`, `unit`. Root also has `schema_version`, `zebrac_version`, and `config` (duration, sample limits, warmup, `allow_failures`, `max_samples_cap`, and `max_samples_requested` when clamped).
+Each result has `sample_count`, `failed_sample_count`, `argv`, and the nine metrics above. Each metric object carries `mean`, `std_dev`, `min`, `max`, `median`, `q1`, `q3`, `outlier_count`, `sample_count`, `unit`. Root also has `schema_version`, `zebrac_version`, and `config` (duration, sample limits, warmup, `allow_failures`, `max_samples_cap`, and nullable `max_samples_requested`).
+
+`max_samples_requested` is always present: it is `null` unless the requested maximum was clamped. With valid UTF-8 command text, `command` and each `argv` entry are strings. Known schema v1 defect: invalid UTF-8 text becomes an array of byte values instead. Those commands still execute; readers that require strings should use valid UTF-8 command text.
 
 ## Build
 
