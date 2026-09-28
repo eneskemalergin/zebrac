@@ -3484,10 +3484,7 @@ test "[unit] - [perf counters]: validates setup, reads, and schedule times" {
     }.disableOnPipe);
     try withPipe(struct {
         fn resetOnPipe(fd: fd_t) !void {
-            resetPerfGroupBeforeSample(fd) catch |err| switch (err) {
-                error.DisableBeforeSpawnFailed, error.ResetFailed => {},
-                else => return err,
-            };
+            try std.testing.expectError(error.DisableBeforeSpawnFailed, resetPerfGroupBeforeSample(fd));
         }
     }.resetOnPipe);
 
