@@ -59,16 +59,18 @@ const usage_rest =
     \\  Program paths with spaces need quotes inside the command string.
     \\  Zebrac waits only for the program it starts. If that program starts
     \\  background work, it must wait for that work before it exits. Otherwise
-    \\  the work can overlap later samples. peak_rss covers only that program,
-    \\  not every process that it starts.
+    \\  the work can overlap later samples. Linux wait4 RSS and faults can
+    \\  include descendants that the command waited for. RSS is a maximum,
+    \\  not total simultaneous memory for the process tree. Memory inherited
+    \\  before exec can also set the RSS high-water mark.
     \\
     \\  Two or more commands: first is the baseline, rest show delta %.
     \\
     \\What gets measured (each measured run):
     \\  wall_time        elapsed time, nanoseconds
     \\  peak_rss         peak resident set size, bytes
-    \\  minor_faults     page faults not requiring disk I/O
-    \\  major_faults     page faults requiring disk I/O (table row hidden
+    \\  minor_faults     page faults not requiring I/O
+    \\  major_faults     page faults requiring I/O (table row hidden
     \\                   only when every command's max is 0; always in JSON)
     \\  cpu_cycles       perf hardware counter
     \\  instructions     perf hardware counter
@@ -149,6 +151,8 @@ const usage_rest =
     \\  not by itself mean better or worse. The percentage has no uncertainty
     \\  range or warning mark. If any command has fewer than two samples, all
     \\  tables show n/a. A baseline mean near zero also shows n/a.
+    \\  One sample cannot estimate spread. Its displayed standard deviation
+    \\  is still zero by convention, not evidence of no variation.
     \\
     \\Environment:
     \\  NO_COLOR          if set (even empty), disables color in auto mode
@@ -220,7 +224,9 @@ test "[unit] - [help text]: includes current commands, limits, and output rules"
         .{ .haystack = usage_text, .needle = version_line },
         .{ .haystack = usage_text, .needle = "first is the baseline" },
         .{ .haystack = usage_text, .needle = "waits only for the program it starts" },
-        .{ .haystack = usage_text, .needle = "not every process that it starts" },
+        .{ .haystack = usage_text, .needle = "include descendants that the command waited for" },
+        .{ .haystack = usage_text, .needle = "not total simultaneous memory" },
+        .{ .haystack = usage_text, .needle = "before exec can also set the RSS high-water mark" },
         .{ .haystack = usage_text, .needle = "perf_event_paranoid" },
         .{ .haystack = usage_text, .needle = "--version" },
         .{ .haystack = usage_text, .needle = "NO_COLOR" },
@@ -231,6 +237,7 @@ test "[unit] - [help text]: includes current commands, limits, and output rules"
         .{ .haystack = usage_text, .needle = "fewer than two samples" },
         .{ .haystack = usage_text, .needle = "all\n  tables show n/a" },
         .{ .haystack = usage_text, .needle = "baseline mean near zero" },
+        .{ .haystack = usage_text, .needle = "One sample cannot estimate spread" },
         .{ .haystack = usage_text, .needle = "Pipes and redirects do not run" },
         .{ .haystack = usage_text, .needle = "zebrac --json -- './myapp'" },
         .{

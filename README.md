@@ -41,11 +41,15 @@ While samples run, a progress bar prints on stderr when stderr is a TTY (unless 
 
 ## What it measures
 
-Nine fields per sample: `wall_time`, `peak_rss`, `minor_faults`, `major_faults`, and five perf counters (`cpu_cycles`, `instructions`, `cache_references`, `cache_misses`, `branch_misses`). Wall time starts just before zebrac starts the program and ends when that program exits. `peak_rss` is Linux's reported memory high-water mark for that program. Minor faults do not require disk I/O; major faults do. Each measured sample gets a new perf counter group. Zebrac rejects the counters unless the kernel reports that they ran for all of their enabled time.
+Nine fields per sample: `wall_time`, `peak_rss`, `minor_faults`, `major_faults`, and five perf counters (`cpu_cycles`, `instructions`, `cache_references`, `cache_misses`, `branch_misses`). Wall time starts just before zebrac starts the program and ends when that program exits. Each measured sample gets a new perf counter group. Zebrac rejects the counters unless the kernel reports that they ran for all of their enabled time.
 
-Zebrac waits only for the program it starts. If that program starts background work, it must wait for the work before it exits. Otherwise the background process can overlap later samples. Waiting keeps the work inside the wall-time sample, but `peak_rss` still covers only that program, not every process that it starts.
+`peak_rss` is the maximum RSS returned by Linux `wait4`, converted from KiB to bytes. It can include descendants the command waited for; it is not total simultaneous process-tree memory. Memory inherited before `exec` can also set the high-water mark. Fault counts can include waited-for descendants. Minor faults require no I/O; major faults require I/O.
+
+Zebrac waits only for the program it starts. If that program starts background work, it must wait for the work before it exits. Otherwise the background process can overlap later samples. Waiting keeps that work inside the wall-time sample. Resource accounting and hardware counters need not cover the same processes or interval.
 
 `major_faults` drops out of the printed tables only if every command reported zero. JSON always keeps it. Each metric gets mean, σ, min, max, quartiles, and an outlier count. With two or more commands, each command keeps its own samples and summary. Later tables show the signed change in their mean relative to the first command: `+N%` means more of that measurement and `-N%` means less. Only wall time maps directly to slower or faster. The percentage does not include an uncertainty range or warning mark. If any command has fewer than two samples, every table shows `n/a` for that metric. A first-command mean that is zero or nearly zero also shows `n/a`.
+
+One sample cannot estimate spread. The table and JSON still report zero standard deviation for one sample as a convention, not evidence of no variation. A zero outlier count in a small sample does not establish stability.
 
 Zebrac starts your program directly without `/bin/sh`. Paths with spaces need quoting ([below](#quoting)). Compared to upstream [poop](https://github.com/andrewrk/poop), this fork adds warmup, min/max sample limits, `--json`, `--` to stop flag parsing, and `--json=path` for awkward paths.
 
