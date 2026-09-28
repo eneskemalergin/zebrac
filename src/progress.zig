@@ -531,6 +531,50 @@ test "[edge] - [progress buffer]: maximum terminal width fits the fixed buffer" 
     try std.testing.expect(writer.end <= max_buffer_bytes);
 }
 
+test "[edge] - [progress width]: keeps exact logical widths and recognized styling" {
+    const plain_storage = try std.testing.allocator.alloc(u8, max_buffer_bytes);
+    defer std.testing.allocator.free(plain_storage);
+    const color_storage = try std.testing.allocator.alloc(u8, max_buffer_bytes);
+    defer std.testing.allocator.free(color_storage);
+    const stripped_storage = try std.testing.allocator.alloc(u8, max_buffer_bytes);
+    defer std.testing.allocator.free(stripped_storage);
+
+    for ([_]usize{ 0, 22, 23, 60, 80, 120, 65_535 }) |width| {
+        const plain_len = try formatPreviewLine(plain_storage, .no_color, width, 10_000, 10_000);
+        const color_len = try formatPreviewLine(color_storage, .escape_codes, width, 10_000, 10_000);
+        const plain = plain_storage[0..plain_len];
+        const colored = color_storage[0..color_len];
+        var stripped = Io.Writer.fixed(stripped_storage);
+        var offset: usize = 0;
+        var resets: usize = 0;
+        while (offset < colored.len) {
+            if (colored[offset] == '\x1b') {
+                const known = [_][]const u8{ "\x1b[36m", "\x1b[0m", "\x1b[38;5;205m", "\x1b[37m", "\x1b[2m" };
+                for (known) |sequence| {
+                    if (std.mem.startsWith(u8, colored[offset..], sequence)) {
+                        if (std.mem.eql(u8, sequence, "\x1b[0m")) resets += 1;
+                        offset += sequence.len;
+                        break;
+                    }
+                } else return error.UnexpectedProgressEscape;
+            } else {
+                try stripped.writeByte(colored[offset]);
+                offset += 1;
+            }
+        }
+        try std.testing.expectEqualStrings(plain, stripped.buffered());
+        if (width < 23) {
+            try std.testing.expectEqual(@as(usize, 0), plain.len);
+            try std.testing.expectEqual(@as(usize, 0), resets);
+        } else {
+            try std.testing.expectEqual(width, try std.unicode.utf8CountCodepoints(plain));
+            try std.testing.expectEqual(@as(usize, 2), resets);
+            try std.testing.expect(std.mem.startsWith(u8, plain, Spinner.frame1 ++ " 10000 runs "));
+            try std.testing.expect(std.mem.endsWith(u8, plain, " 100% "));
+        }
+    }
+}
+
 test "[unit] - [progress visibility]: follows quiet and stderr terminal state" {
     const show_cases = [_]struct { quiet: bool, tty: bool, want: bool }{
         .{ .quiet = true, .tty = true, .want = false },
