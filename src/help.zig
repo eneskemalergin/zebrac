@@ -2,7 +2,7 @@
 
 const std = @import("std");
 
-pub const version = "0.6.2";
+pub const version = "0.6.3";
 
 pub const max_samples_cap: u64 = 10_000;
 const wrap_width: usize = 78;

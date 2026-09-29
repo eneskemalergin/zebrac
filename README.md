@@ -11,7 +11,7 @@
   <a href="https://github.com/eneskemalergin/zebrac/actions/workflows/ci.yml">
     <img src="https://github.com/eneskemalergin/zebrac/actions/workflows/ci.yml/badge.svg?style=flat-square" alt="CI">
   </a>
-  <img src="https://img.shields.io/badge/version-v0.6.2-8A2BE2?style=flat-square" alt="v0.6.2">
+  <img src="https://img.shields.io/badge/version-v0.6.3-8A2BE2?style=flat-square" alt="v0.6.3">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/license-MIT-4B9D6E?style=flat-square" alt="MIT">
   <img src="https://img.shields.io/badge/linux-x86%20%7C%20x86__64%20%7C%20aarch64%20%7C%20riscv64-1793D1?style=flat-square" alt="Linux">
@@ -128,7 +128,7 @@ Default `zig build` installs one stripped ReleaseFast binary to `zig-out/bin/zeb
 ## Releasing
 
 1. Bump `version` in `src/help.zig`, the README badge, and add a `CHANGELOG.md` section.
-2. Commit on `main`, then tag and push: `git tag v0.6.2 && git push origin v0.6.2`
+2. Commit on `main`, then tag and push: `git tag v0.6.3 && git push origin v0.6.3`
 3. [release.yml](.github/workflows/release.yml) runs CI, builds all four Linux targets, packages `zebrac-<tag>-<arch>-linux.tar.gz` plus `SHA256SUMS`, and opens a GitHub Release with the matching CHANGELOG section as release notes.
 
 ## Compared to Hyperfine

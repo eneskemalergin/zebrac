@@ -7,6 +7,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog covers the poop lineage starting at v0.3.0 and tracks zebrac-specific changes after [0.5.0] section.
 
+## [0.6.3] - Unreleased
+
+### Fixed
+
+- Help and README now explain that RSS and fault counts can include descendants the command waited for. RSS is a maximum, not total simultaneous process-tree memory; background work can still outlive the direct command.
+- The perf-reset regression test now requires the expected failure instead of accepting an incorrect successful reset.
+
+### Added
+
+- Regression tests for valid UTF-8 command text, quoting, empty arguments, nullable JSON configuration, progress widths, and color resets.
+- Documentation of the existing single-sample zero-spread convention and the JSON v1 defect that serializes invalid UTF-8 command bytes as arrays. Accepted commands and JSON behavior are unchanged.
+
 ## [0.6.2] - 2026-08-10
 
 0.6.2 is the precision repair I did not expect to need. Identical commands exposed plausible but wrong comparisons in 0.6.1: counters included earlier runs, saved samples affected later processes, and commands ran in separate blocks. Measured runs now get fresh counters, old samples stay out of later processes, and commands run in balanced, equal-count rounds.
