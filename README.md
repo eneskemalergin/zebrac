@@ -39,6 +39,8 @@ You pass one quoted command string per program. With several commands, the first
 
 While samples run, a progress bar prints on stderr when stderr is a TTY (unless you pass `-q`). Piping stdout alone does not hide it. The results table still shows unless you use `--quiet`.
 
+All command tables in one report share column widths, so the same fields line up across commands. A command with wider values can make the other tables wider too.
+
 ## What it measures
 
 Nine fields per sample: `wall_time`, `peak_rss`, `minor_faults`, `major_faults`, and five perf counters (`cpu_cycles`, `instructions`, `cache_references`, `cache_misses`, `branch_misses`). Wall time starts just before zebrac starts the program and ends when that program exits. Each measured sample gets a new perf counter group. Zebrac rejects the counters unless the kernel reports that they ran for all of their enabled time.
@@ -49,6 +51,8 @@ Zebrac waits only for the program it starts. If that program starts background w
 
 `major_faults` drops out of the printed tables only if every command reported zero. JSON always keeps it. Each metric gets mean, σ, min, max, quartiles, and an outlier count. With two or more commands, each command keeps its own samples and summary. Later tables show the signed change in their mean relative to the first command: `+N%` means more of that measurement and `-N%` means less. Only wall time maps directly to slower or faster. The percentage does not include an uncertainty range or warning mark. If any command has fewer than two samples, every table shows `n/a` for that metric. A first-command mean that is zero or nearly zero also shows `n/a`.
 
+For `n` sorted samples, median and quartiles select existing values without interpolation. Using zero-based indexes and integer division, median selects `n / 2`, `q1` selects `n / 4`, and `q3` selects `n - n / 4`. For fewer than four samples, `q3` selects the last value instead. An even sample count uses the upper-middle value as median: `[10, 20, 30, 40]` gives `q1 = 20`, `median = 30`, and `q3 = 40`. Standard deviation uses the sample formula with divisor `n - 1` for two or more samples.
+
 One sample cannot estimate spread. The table and JSON still report zero standard deviation for one sample as a convention, not evidence of no variation. A zero outlier count in a small sample does not establish stability.
 
 Zebrac starts your program directly without `/bin/sh`. Paths with spaces need quoting ([below](#quoting)). Compared to upstream [poop](https://github.com/andrewrk/poop), this fork adds warmup, min/max sample limits, `--json`, `--` to stop flag parsing, and `--json=path` for awkward paths.
@@ -56,8 +60,11 @@ Zebrac starts your program directly without `/bin/sh`. Paths with spaces need qu
 ## Examples
 
 ```bash
-# two builds, second column shows % vs the first
+# two builds; delta compares the second command with the first
 zebrac ./app-old ./app-new
+
+# exactly 20 measured runs and 3 unmeasured warmups per command
+zebrac --duration 0 --min-samples 20 --max-samples 20 --warmup 3 ./app-old ./app-new
 
 # spaced executable path; inner quotes must reach zebrac
 zebrac "'./build/my app'" "'./build/my app' --release"
@@ -70,7 +77,9 @@ zebrac --warmup 10 --min-samples 20 './myapp'
 # CI: no table, write JSON
 zebrac --quiet --json ./ci-results.json --duration 5000 './myapp'
 
-# keep sampling when exit code != 0; first failure prints stderr, rest get a count
+# keep sampling when exit code != 0; count failed measured runs
+# after collection, print the first measured failure's stderr per command
+# report later measured failures as a count; exclude warmup failures
 zebrac -f './might-fail.sh' './baseline.sh'
 
 # operand looks like a flag; everything after -- is the command
