@@ -291,6 +291,34 @@ const TableLayout = struct {
         return layout;
     }
 
+    fn computeReport(
+        commands: []const Command,
+        show_major_faults: bool,
+        all_commands_have_two_samples: bool,
+    ) TableLayout {
+        const with_delta = commands.len >= 2;
+        var layout = compute(
+            commands[0].measurements,
+            null,
+            with_delta,
+            show_major_faults,
+            all_commands_have_two_samples,
+        );
+        for (commands[1..]) |command| {
+            const next = compute(
+                command.measurements,
+                commands[0].measurements,
+                with_delta,
+                show_major_faults,
+                all_commands_have_two_samples,
+            );
+            inline for (@typeInfo(TableLayout).@"struct".fields) |field| {
+                @field(layout, field.name) = @max(@field(layout, field.name), @field(next, field.name));
+            }
+        }
+        return layout;
+    }
+
     fn meanSepVis(self: TableLayout) usize {
         return self.name_w + col_gap + self.mean_w;
     }
@@ -366,9 +394,9 @@ const TableLayout = struct {
         try padVis(w, &vis, layout.outlierStartVis());
         try printStyledLabel(w, t, "outliers", &.{ .bold, .bright_yellow });
         vis = layout.outlierStartVis() + "outliers".len;
-        try padVis(w, &vis, layout.outlierStartVis() + layout.outlier_w);
 
         if (with_delta) {
+            try padVis(w, &vis, layout.outlierStartVis() + layout.outlier_w);
             try gap(w, &vis);
             try padVis(w, &vis, layout.deltaStartVis());
             try printStyledLabel(w, t, "delta", &.{.bold});
@@ -658,7 +686,6 @@ fn writeDelta(
     try w.writeAll(text);
     if (color_enabled) try terminal.setColor(.reset);
     vis.* = col_start + visibleLen(text);
-    try TableLayout.padVis(w, vis, col_start + layout.delta_w);
 }
 
 fn jsonPathFromEqualsArg(arg: []const u8) ?[]const u8 {
@@ -724,22 +751,69 @@ fn exitSampleLimitError(err: help.SampleLimitsError) noreturn {
     process.exit(1);
 }
 
+fn printCommandResults(
+    stdout_w: *Io.Writer,
+    terminal: ?Io.Terminal,
+    commands: []const Command,
+) !void {
+    const t = terminal orelse return;
+    const show_major_faults = anyCommandHasMajorFaults(commands);
+    var all_commands_have_two_samples = true;
+    for (commands) |command| {
+        if (command.sample_count < 2) {
+            all_commands_have_two_samples = false;
+            break;
+        }
+    }
+    const layout = TableLayout.computeReport(
+        commands,
+        show_major_faults,
+        all_commands_have_two_samples,
+    );
+    const with_delta = commands.len >= 2;
+    for (commands, 1..) |command, command_n| {
+        const run_noun = if (command.sample_count == 1) "run" else "runs";
+        try t.setColor(.bold);
+        try stdout_w.print("Benchmark {d}", .{command_n});
+        try t.setColor(.dim);
+        if (command.failed_sample_count > 0) {
+            try stdout_w.print(" ({d} {s}, {d} failed)", .{
+                command.sample_count,
+                run_noun,
+                command.failed_sample_count,
+            });
+        } else {
+            try stdout_w.print(" ({d} {s})", .{ command.sample_count, run_noun });
+        }
+        try t.setColor(.reset);
+        try stdout_w.print(": {s}\n", .{command.raw_cmd});
+
+        const baseline: ?Command.Measurements = if (command_n == 1) null else commands[0].measurements;
+        try printResultsTable(
+            stdout_w,
+            t,
+            layout,
+            command.measurements,
+            baseline,
+            with_delta,
+            show_major_faults,
+            all_commands_have_two_samples,
+        );
+
+        try stdout_w.flush();
+    }
+}
+
 fn printResultsTable(
     w: *Io.Writer,
     terminal: Io.Terminal,
+    layout: TableLayout,
     measurements: Command.Measurements,
     baseline: ?Command.Measurements,
     with_delta: bool,
     show_major_faults: bool,
     all_commands_have_two_samples: bool,
 ) !void {
-    const layout = TableLayout.compute(
-        measurements,
-        baseline,
-        with_delta,
-        show_major_faults,
-        all_commands_have_two_samples,
-    );
     try TableLayout.printHeader(w, terminal, layout, with_delta);
     inline for (@typeInfo(Command.Measurements).@"struct".fields) |field| {
         const m = @field(measurements, field.name);
@@ -1754,47 +1828,7 @@ fn runMain(init: process.Init) !void {
 
     try help.printRunNotes(stderr_w, run_notes.items);
 
-    const show_major_faults = anyCommandHasMajorFaults(commands.items);
-    var all_commands_have_two_samples = true;
-    for (commands.items) |command| {
-        if (command.sample_count < 2) {
-            all_commands_have_two_samples = false;
-            break;
-        }
-    }
-    for (commands.items, 1..) |*command, command_n| {
-        if (terminal) |t| {
-            const run_noun = if (command.sample_count == 1) "run" else "runs";
-            try t.setColor(.bold);
-            try stdout_w.print("Benchmark {d}", .{command_n});
-            try t.setColor(.dim);
-            if (command.failed_sample_count > 0) {
-                try stdout_w.print(" ({d} {s}, {d} failed)", .{
-                    command.sample_count,
-                    run_noun,
-                    command.failed_sample_count,
-                });
-            } else {
-                try stdout_w.print(" ({d} {s})", .{ command.sample_count, run_noun });
-            }
-            try t.setColor(.reset);
-            try stdout_w.print(": {s}\n", .{command.raw_cmd});
-
-            const with_delta = commands.items.len >= 2;
-            const baseline: ?Command.Measurements = if (command_n == 1) null else commands.items[0].measurements;
-            try printResultsTable(
-                stdout_w,
-                t,
-                command.measurements,
-                baseline,
-                with_delta,
-                show_major_faults,
-                all_commands_have_two_samples,
-            );
-
-            try stdout_w.flush();
-        }
-    }
+    try printCommandResults(stdout_w, terminal, commands.items);
 
     if (json_path) |path| {
         var file_buf: [json_file_buf_len]u8 = undefined;
@@ -2740,9 +2774,9 @@ fn printMeasurement(
     try w.writeAll(outlier_line);
     try terminal.setColor(.reset);
     vis = layout.outlierStartVis() + visibleLen(outlier_line);
-    try TableLayout.padVis(w, &vis, layout.outlierStartVis() + layout.outlier_w);
 
     if (with_delta) {
+        try TableLayout.padVis(w, &vis, layout.outlierStartVis() + layout.outlier_w);
         try TableLayout.gap(w, &vis);
         try TableLayout.padVis(w, &vis, layout.deltaStartVis());
         try writeDelta(
@@ -2957,6 +2991,7 @@ fn renderResultsTableForTest(
     try printResultsTable(
         &w,
         term,
+        TableLayout.compute(measurements, baseline, baseline != null, show_major_faults, true),
         measurements,
         baseline,
         baseline != null,
@@ -4445,6 +4480,7 @@ test "[unit] - [comparison table]: renders signed, zero, and unavailable deltas"
     try printResultsTable(
         &baseline_writer,
         baseline_term,
+        TableLayout.compute(baseline, null, true, true, false),
         baseline,
         null,
         true,
@@ -4462,6 +4498,7 @@ test "[unit] - [comparison table]: renders signed, zero, and unavailable deltas"
     try printResultsTable(
         &candidate_writer,
         candidate_term,
+        TableLayout.compute(one_sample, baseline, true, true, false),
         one_sample,
         baseline,
         true,
@@ -4530,4 +4567,464 @@ test "[unit] - [number formatting]: scales units and preserves table alignment" 
 
 test "[fuzz] - [metric summary]: keeps bounds and counts valid" {
     try std.testing.fuzz({}, fuzzSummarizeField, .{});
+}
+
+// Synthetic summaries exercise rendering; they are not measured target results.
+fn reportMeasurementForTest(
+    unit: Measurement.Unit,
+    mean: f64,
+    std_dev: f64,
+    min: u64,
+    max: u64,
+    outliers: u64,
+    count: u64,
+) Measurement {
+    return .{
+        .unit = unit,
+        .mean = mean,
+        .std_dev = std_dev,
+        .min = min,
+        .max = max,
+        .q1 = min,
+        .median = min + (max - min) / 2,
+        .q3 = max,
+        .outlier_count = outliers,
+        .sample_count = count,
+    };
+}
+
+fn reportCommandForTest(which: enum { a, b, c, zero, extreme }, count: u64) Command {
+    const m = reportMeasurementForTest;
+    const measurements: Command.Measurements = switch (which) {
+        .a => .{
+            .wall_time = m(.nanoseconds, 659_000, 27_800, 638_000, 719_000, 1, count),
+            .peak_rss = m(.bytes, 1_160_000, 23_200, 1_150_000, 1_220_000, 0, count),
+            .minor_faults = m(.count, 62.3, 0.58, 60, 63, 0, count),
+            .major_faults = m(.count, 0, 0, 0, 0, 0, count),
+            .cpu_cycles = m(.count, 584_000, 233_000, 334_000, 795_000, 2, count),
+            .instructions = m(.count, 999_499, 0, 999_499, 999_499, 0, count),
+            .cache_references = m(.count, 10_000, 10, 9_990, 10_010, 0, count),
+            .cache_misses = m(.count, 0, 0, 0, 0, 0, count),
+            .branch_misses = m(.count, 9, 2, 5, 12, 0, count),
+        },
+        .b => .{
+            .wall_time = m(.nanoseconds, 1_500_000, 100_000, 1_000_000, 2_000_000, 12, count),
+            .peak_rss = m(.bytes, 999_500, 500, 999_000, 1_000_000, 0, count),
+            .minor_faults = m(.count, 62.300001, 0.58, 60, 63, 0, count),
+            .major_faults = m(.count, 1, 0.5, 0, 3, 0, count),
+            .cpu_cycles = m(.count, 584_000_000, 233_000_000, 334_000_000, 795_000_000, 0, count),
+            .instructions = m(.count, 999_500, 0, 999_500, 999_500, 0, count),
+            .cache_references = m(.count, 250, 25, 200, 300, 0, count),
+            .cache_misses = m(.count, 1.25, 1, 0, 4, 0, count),
+            .branch_misses = m(.count, 9_000, 2_000, 5_000, 12_000, 0, count),
+        },
+        .c => .{
+            .wall_time = m(.nanoseconds, 3_600_000_000, 600_000_000, 1_000_000, 59_999_999_999, 0, count),
+            .peak_rss = m(.bytes, 1_100_000_000, 1_000_000, 1_050_000_000, 1_150_000_000, 1200, count),
+            .minor_faults = m(.count, 620, 5, 600, 640, 0, count),
+            .major_faults = m(.count, 0, 0, 0, 0, 0, count),
+            .cpu_cycles = m(.count, 42, 0, 42, 42, 0, count),
+            .instructions = m(.count, 1_000_000_000_000, 1_000_000_000, 900_000_000_000, 1_100_000_000_000, 0, count),
+            .cache_references = m(.count, 9, 3, 1, 15, 0, count),
+            .cache_misses = m(.count, 0, 0, 0, 0, 0, count),
+            .branch_misses = m(.count, 9.0000001, 2, 5, 12, 0, count),
+        },
+        .zero, .extreme => blk: {
+            const value: u64 = if (which == .zero) 0 else std.math.maxInt(u64);
+            var result: Command.Measurements = undefined;
+            inline for (@typeInfo(Command.Measurements).@"struct".fields) |field| {
+                @field(result, field.name) = m(
+                    measurementFieldMeta(field.name).unit,
+                    @floatFromInt(value),
+                    0,
+                    value,
+                    value,
+                    0,
+                    count,
+                );
+            }
+            break :blk result;
+        },
+    };
+    return .{
+        .raw_cmd = switch (which) {
+            .a => "demo --mode alpha",
+            .b => "demo --mode beta",
+            .c => "demo --mode gamma",
+            .zero => "demo --mode zero",
+            .extreme => "demo --mode extreme",
+        },
+        .argv = &.{},
+        .measurements = measurements,
+        .sample_count = @intCast(count),
+        .failed_sample_count = 0,
+    };
+}
+
+fn reportCommandsForTest(name: []const u8, storage: *[3]Command) ![]Command {
+    storage[0] = reportCommandForTest(.a, 100);
+    if (std.mem.eql(u8, name, "single")) return storage[0..1];
+    if (std.mem.eql(u8, name, "single-wide")) {
+        storage[0] = reportCommandForTest(.c, 10_000);
+        return storage[0..1];
+    }
+    storage[1] = reportCommandForTest(.a, 100);
+    if (std.mem.eql(u8, name, "aa")) return storage[0..2];
+    storage[1] = reportCommandForTest(.b, 100);
+    storage[1].failed_sample_count = 3;
+    if (std.mem.eql(u8, name, "ab")) return storage[0..2];
+    if (std.mem.eql(u8, name, "three")) {
+        storage.* = .{ reportCommandForTest(.a, 10_000), reportCommandForTest(.b, 10_000), reportCommandForTest(.c, 10_000) };
+        storage[2].failed_sample_count = 10_000;
+        return storage;
+    }
+    if (std.mem.eql(u8, name, "zero")) {
+        storage.* = .{ reportCommandForTest(.zero, 2), reportCommandForTest(.zero, 2), undefined };
+        return storage[0..2];
+    }
+    if (std.mem.eql(u8, name, "extreme")) {
+        storage.* = .{ reportCommandForTest(.zero, 5), reportCommandForTest(.extreme, 5), undefined };
+        return storage[0..2];
+    }
+    if (std.mem.eql(u8, name, "headings")) {
+        storage[0].raw_cmd = "demo --label 'café' --text 'a command heading longer than the numeric grid remains outside the table'";
+        storage[1].raw_cmd = "demo --tab '\t' --lines 'first\nsecond'";
+        return storage[0..2];
+    }
+    const count = std.fmt.parseInt(u64, name, 10) catch return error.UnknownReportCase;
+    if (count != 1 and count != 2 and count != 3 and count != 5) return error.UnknownReportCase;
+    storage.* = .{ reportCommandForTest(.a, count), reportCommandForTest(.b, count), undefined };
+    for (storage[0..2]) |*command| {
+        inline for (@typeInfo(Command.Measurements).@"struct".fields) |field| {
+            const measurement = &@field(command.measurements, field.name);
+            measurement.outlier_count = 0;
+            if (count == 1) {
+                measurement.mean = @floatFromInt(measurement.min);
+                measurement.std_dev = 0;
+                measurement.max = measurement.min;
+                measurement.q1 = measurement.min;
+                measurement.median = measurement.min;
+                measurement.q3 = measurement.min;
+            }
+        }
+    }
+    if (count == 1) storage[1].failed_sample_count = 1;
+    return storage[0..2];
+}
+
+// Exact complete reports with shared widths and no final-cell padding.
+const ExpectedReportsForTest = struct {
+    const single =
+        \\Benchmark 1 (100 runs): demo --mode alpha
+        \\  measurement         mean ± σ          min … max     outliers
+        \\  wall_time          659µs ± 27.8µs   638µs … 719µs   1 (1%)
+        \\  peak_rss          1.16MB ± 23.2KB  1.15MB … 1.22MB  0 (0%)
+        \\  minor_faults        62.3 ± 0.58      60.0 … 63.0    0 (0%)
+        \\  cpu_cycles          584K ± 233K      334K … 795K    2 (2%)
+        \\  instructions        999K ± 0.00      999K … 999K    0 (0%)
+        \\  cache_references   10.0K ± 10.0     9.99K … 10.0K   0 (0%)
+        \\  cache_misses        0.00 ± 0.00      0.00 … 0.00    0 (0%)
+        \\  branch_misses       9.00 ± 2.00      5.00 … 12.0    0 (0%)
+        \\
+    ;
+    const aa =
+        \\Benchmark 1 (100 runs): demo --mode alpha
+        \\  measurement         mean ± σ          min … max     outliers  delta
+        \\  wall_time          659µs ± 27.8µs   638µs … 719µs   1 (1%)    0%
+        \\  peak_rss          1.16MB ± 23.2KB  1.15MB … 1.22MB  0 (0%)    0%
+        \\  minor_faults        62.3 ± 0.58      60.0 … 63.0    0 (0%)    0%
+        \\  cpu_cycles          584K ± 233K      334K … 795K    2 (2%)    0%
+        \\  instructions        999K ± 0.00      999K … 999K    0 (0%)    0%
+        \\  cache_references   10.0K ± 10.0     9.99K … 10.0K   0 (0%)    0%
+        \\  cache_misses        0.00 ± 0.00      0.00 … 0.00    0 (0%)    n/a
+        \\  branch_misses       9.00 ± 2.00      5.00 … 12.0    0 (0%)    0%
+        \\Benchmark 2 (100 runs): demo --mode alpha
+        \\  measurement         mean ± σ          min … max     outliers  delta
+        \\  wall_time          659µs ± 27.8µs   638µs … 719µs   1 (1%)    0%
+        \\  peak_rss          1.16MB ± 23.2KB  1.15MB … 1.22MB  0 (0%)    0%
+        \\  minor_faults        62.3 ± 0.58      60.0 … 63.0    0 (0%)    0%
+        \\  cpu_cycles          584K ± 233K      334K … 795K    2 (2%)    0%
+        \\  instructions        999K ± 0.00      999K … 999K    0 (0%)    0%
+        \\  cache_references   10.0K ± 10.0     9.99K … 10.0K   0 (0%)    0%
+        \\  cache_misses        0.00 ± 0.00      0.00 … 0.00    0 (0%)    n/a
+        \\  branch_misses       9.00 ± 2.00      5.00 … 12.0    0 (0%)    0%
+        \\
+    ;
+    const ab =
+        \\Benchmark 1 (100 runs): demo --mode alpha
+        \\  measurement         mean ± σ          min … max     outliers  delta
+        \\  wall_time          659µs ± 27.8µs   638µs … 719µs   1 (1%)    0%
+        \\  peak_rss          1.16MB ± 23.2KB  1.15MB … 1.22MB  0 (0%)    0%
+        \\  minor_faults        62.3 ± 0.58      60.0 … 63.0    0 (0%)    0%
+        \\  major_faults        0.00 ± 0.00      0.00 … 0.00    0 (0%)    n/a
+        \\  cpu_cycles          584K ± 233K      334K … 795K    2 (2%)    0%
+        \\  instructions        999K ± 0.00      999K … 999K    0 (0%)    0%
+        \\  cache_references   10.0K ± 10.0     9.99K … 10.0K   0 (0%)    0%
+        \\  cache_misses        0.00 ± 0.00      0.00 … 0.00    0 (0%)    n/a
+        \\  branch_misses       9.00 ± 2.00      5.00 … 12.0    0 (0%)    0%
+        \\Benchmark 2 (100 runs, 3 failed): demo --mode beta
+        \\  measurement         mean ± σ          min … max     outliers  delta
+        \\  wall_time         1.50ms ± 100µs   1.00ms … 2.00ms  12 (12%)  +127.6%
+        \\  peak_rss          1.00MB ± 500      999KB … 1.00MB  0 (0%)    -13.8%
+        \\  minor_faults        62.3 ± 0.58      60.0 … 63.0    0 (0%)    0%
+        \\  major_faults        1.00 ± 0.50      0.00 … 3.00    0 (0%)    n/a
+        \\  cpu_cycles          584M ± 233M      334M … 795M    0 (0%)    +99900.0%
+        \\  instructions       1.00M ± 0.00     1.00M … 1.00M   0 (0%)    0%
+        \\  cache_references     250 ± 25.0       200 … 300     0 (0%)    -97.5%
+        \\  cache_misses        1.25 ± 1.00      0.00 … 4.00    0 (0%)    n/a
+        \\  branch_misses      9.00K ± 2.00K    5.00K … 12.0K   0 (0%)    +99900.0%
+        \\
+    ;
+    const three =
+        \\Benchmark 1 (10000 runs): demo --mode alpha
+        \\  measurement         mean ± σ          min … max     outliers    delta
+        \\  wall_time          659µs ± 27.8µs   638µs … 719µs   1 (0%)      0%
+        \\  peak_rss          1.16MB ± 23.2KB  1.15MB … 1.22MB  0 (0%)      0%
+        \\  minor_faults        62.3 ± 0.58      60.0 … 63.0    0 (0%)      0%
+        \\  major_faults        0.00 ± 0.00      0.00 … 0.00    0 (0%)      n/a
+        \\  cpu_cycles          584K ± 233K      334K … 795K    2 (0%)      0%
+        \\  instructions        999K ± 0.00      999K … 999K    0 (0%)      0%
+        \\  cache_references   10.0K ± 10.0     9.99K … 10.0K   0 (0%)      0%
+        \\  cache_misses        0.00 ± 0.00      0.00 … 0.00    0 (0%)      n/a
+        \\  branch_misses       9.00 ± 2.00      5.00 … 12.0    0 (0%)      0%
+        \\Benchmark 2 (10000 runs): demo --mode beta
+        \\  measurement         mean ± σ          min … max     outliers    delta
+        \\  wall_time         1.50ms ± 100µs   1.00ms … 2.00ms  12 (0%)     +127.6%
+        \\  peak_rss          1.00MB ± 500      999KB … 1.00MB  0 (0%)      -13.8%
+        \\  minor_faults        62.3 ± 0.58      60.0 … 63.0    0 (0%)      0%
+        \\  major_faults        1.00 ± 0.50      0.00 … 3.00    0 (0%)      n/a
+        \\  cpu_cycles          584M ± 233M      334M … 795M    0 (0%)      +99900.0%
+        \\  instructions       1.00M ± 0.00     1.00M … 1.00M   0 (0%)      0%
+        \\  cache_references     250 ± 25.0       200 … 300     0 (0%)      -97.5%
+        \\  cache_misses        1.25 ± 1.00      0.00 … 4.00    0 (0%)      n/a
+        \\  branch_misses      9.00K ± 2.00K    5.00K … 12.0K   0 (0%)      +99900.0%
+        \\Benchmark 3 (10000 runs, 10000 failed): demo --mode gamma
+        \\  measurement         mean ± σ          min … max     outliers    delta
+        \\  wall_time          3.60s ± 600ms   1.00ms … 1.00m   0 (0%)      +546182.2%
+        \\  peak_rss          1.10GB ± 1.00MB  1.05GB … 1.15GB  1200 (12%)  +94727.6%
+        \\  minor_faults         620 ± 5.00       600 … 640     0 (0%)      +895.2%
+        \\  major_faults        0.00 ± 0.00      0.00 … 0.00    0 (0%)      n/a
+        \\  cpu_cycles          42.0 ± 0.00      42.0 … 42.0    0 (0%)      -100.0%
+        \\  instructions       1.00T ± 1.00G     900G … 1.10T   0 (0%)      +100050025.1%
+        \\  cache_references    9.00 ± 3.00      1.00 … 15.0    0 (0%)      -99.9%
+        \\  cache_misses        0.00 ± 0.00      0.00 … 0.00    0 (0%)      n/a
+        \\  branch_misses       9.00 ± 2.00      5.00 … 12.0    0 (0%)      0%
+        \\
+    ;
+};
+
+test "[regression] - [report output]: prints four complete reports" {
+    const cases = .{
+        .{ "single", ExpectedReportsForTest.single },
+        .{ "aa", ExpectedReportsForTest.aa },
+        .{ "ab", ExpectedReportsForTest.ab },
+        .{ "three", ExpectedReportsForTest.three },
+    };
+    inline for (cases) |case| {
+        var storage: [3]Command = undefined;
+        const commands = try reportCommandsForTest(case[0], &storage);
+        var buffer: [16 * 1024]u8 = undefined;
+        var writer = Io.Writer.fixed(&buffer);
+        const terminal = Io.Terminal{ .writer = &writer, .mode = .no_color };
+        try printCommandResults(&writer, terminal, commands);
+        try std.testing.expectEqualStrings(case[1], writer.buffered());
+    }
+}
+
+const ReportColumnsForTest = struct {
+    name: []const u8,
+    command_count: usize,
+    rows_per_command: usize,
+    mean_separator: usize = 26,
+    minmax_separator: usize = 43,
+    outliers: usize = 54,
+    delta: ?usize = 64,
+};
+
+const report_cases_for_test = [_]ReportColumnsForTest{
+    .{ .name = "single", .command_count = 1, .rows_per_command = 8, .delta = null },
+    .{ .name = "aa", .command_count = 2, .rows_per_command = 8 },
+    .{ .name = "ab", .command_count = 2, .rows_per_command = 9 },
+    .{ .name = "three", .command_count = 3, .rows_per_command = 9, .delta = 66 },
+    .{ .name = "single-wide", .command_count = 1, .rows_per_command = 8, .delta = null },
+    .{ .name = "1", .command_count = 2, .rows_per_command = 8 },
+    .{ .name = "2", .command_count = 2, .rows_per_command = 9 },
+    .{ .name = "3", .command_count = 2, .rows_per_command = 9 },
+    .{ .name = "5", .command_count = 2, .rows_per_command = 9 },
+    .{ .name = "zero", .command_count = 2, .rows_per_command = 8 },
+    .{ .name = "extreme", .command_count = 2, .rows_per_command = 9, .mean_separator = 30, .minmax_separator = 51, .outliers = 66, .delta = 76 },
+    .{ .name = "headings", .command_count = 2, .rows_per_command = 9 },
+};
+
+fn requireReportForTest(ok: bool) error{BadReport}!void {
+    if (!ok) return error.BadReport;
+}
+
+fn reportColumnForTest(line: []const u8, byte_index: usize) !usize {
+    return std.unicode.utf8CountCodepoints(line[0..byte_index]) catch error.BadReport;
+}
+
+fn checkReportColumnsForTest(report: []const u8, expected: ReportColumnsForTest) !void {
+    const names = [_][]const u8{ "wall_time", "peak_rss", "minor_faults", "major_faults", "cpu_cycles", "instructions", "cache_references", "cache_misses", "branch_misses" };
+    var headings: usize = 0;
+    var headers: usize = 0;
+    var rows: usize = 0;
+    try requireReportForTest(std.mem.endsWith(u8, report, "\n"));
+    var lines = std.mem.splitScalar(u8, report, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "Benchmark ")) headings += 1;
+        if (!std.mem.startsWith(u8, line, "  ")) continue;
+        try requireReportForTest(line[line.len - 1] != ' ');
+        const mean_at = std.mem.indexOf(u8, line, " ± ") orelse return error.BadReport;
+        const min_at = std.mem.indexOf(u8, line, " … ") orelse return error.BadReport;
+        try requireReportForTest(try reportColumnForTest(line, mean_at) == expected.mean_separator);
+        try requireReportForTest(try reportColumnForTest(line, min_at) == expected.minmax_separator);
+        try requireReportForTest(mean_at > 0 and line[mean_at - 1] != ' ');
+        try requireReportForTest(min_at > 0 and line[min_at - 1] != ' ');
+        if (std.mem.startsWith(u8, line, "  measurement ")) {
+            headers += 1;
+            const outlier_at = std.mem.indexOf(u8, line, "outliers") orelse return error.BadReport;
+            try requireReportForTest(try reportColumnForTest(line, outlier_at) == expected.outliers);
+            if (expected.delta) |column| {
+                const delta_at = std.mem.indexOf(u8, line, "delta") orelse return error.BadReport;
+                try requireReportForTest(try reportColumnForTest(line, delta_at) == column);
+            } else try requireReportForTest(std.mem.indexOf(u8, line, "delta") == null);
+        } else {
+            var index = rows % expected.rows_per_command;
+            if (expected.rows_per_command == 8 and index >= 3) index += 1;
+            const name = names[index];
+            try requireReportForTest(std.mem.startsWith(u8, line[2..], name));
+            try requireReportForTest(line[2 + name.len] == ' ');
+            const pct_at = std.mem.indexOf(u8, line, " (") orelse return error.BadReport;
+            var outlier_at = pct_at;
+            while (outlier_at > 0 and std.ascii.isDigit(line[outlier_at - 1])) outlier_at -= 1;
+            try requireReportForTest(try reportColumnForTest(line, outlier_at) == expected.outliers);
+            const close_at = std.mem.indexOfScalarPos(u8, line, pct_at, ')') orelse return error.BadReport;
+            if (expected.delta) |column| {
+                var delta_at = close_at + 1;
+                while (delta_at < line.len and line[delta_at] == ' ') delta_at += 1;
+                try requireReportForTest(delta_at < line.len);
+                try requireReportForTest(try reportColumnForTest(line, delta_at) == column);
+            } else try requireReportForTest(close_at + 1 == line.len);
+            rows += 1;
+        }
+    }
+    try requireReportForTest(headings == expected.command_count);
+    try requireReportForTest(headers == expected.command_count);
+    try requireReportForTest(rows == expected.command_count * expected.rows_per_command);
+}
+
+fn stripReportStylingForTest(input: []const u8, out: []u8, with_delta: bool) ![]const u8 {
+    const allowed = [_]u8{ 0, 1, 2, 32, 33, 35, 36, 92, 93 };
+    const header_codes = [_]u8{ 92, 0, 1, 0, 32, 0, 1, 36, 0, 1, 0, 35, 0, 1, 93, 0, 1, 0 };
+    const value_codes = [_]u8{ 92, 2, 0, 32, 2, 0, 36, 2, 0, 35, 2, 0 };
+    var codes: [32]u8 = undefined;
+    var codes_len: usize = 0;
+    var i: usize = 0;
+    var o: usize = 0;
+    var line_start: usize = 0;
+    while (i < input.len) {
+        if (input[i] == '\x1b') {
+            var matched = false;
+            for (allowed) |code| {
+                var sequence: [8]u8 = undefined;
+                const text = try std.fmt.bufPrint(&sequence, "\x1b[{d}m", .{code});
+                if (std.mem.startsWith(u8, input[i..], text)) {
+                    try requireReportForTest(codes_len < codes.len);
+                    codes[codes_len] = code;
+                    codes_len += 1;
+                    i += text.len;
+                    matched = true;
+                    break;
+                }
+            }
+            try requireReportForTest(matched);
+            continue;
+        }
+        if (input[i] == '\n') {
+            const line = out[line_start..o];
+            if (std.mem.startsWith(u8, line, "  measurement ")) {
+                const end: usize = if (with_delta) 18 else 16;
+                try requireReportForTest(std.mem.eql(u8, codes[0..codes_len], header_codes[0..end]));
+            } else if (std.mem.startsWith(u8, line, "  ")) {
+                try requireReportForTest(codes_len == @as(usize, if (with_delta) 17 else 15));
+                try requireReportForTest(std.mem.eql(u8, codes[0..12], &value_codes));
+                try requireReportForTest(codes[12] == 2 or codes[12] == 33);
+                const suffix: []const u8 = if (with_delta) &.{ 0, 2, 0, 0 } else &.{ 0, 0 };
+                try requireReportForTest(std.mem.eql(u8, codes[13..codes_len], suffix));
+            } else if (std.mem.startsWith(u8, line, "Benchmark ")) {
+                try requireReportForTest(std.mem.eql(u8, codes[0..codes_len], &.{ 1, 2, 0 }));
+            } else try requireReportForTest(codes_len == 0);
+            codes_len = 0;
+            line_start = o + 1;
+        }
+        try requireReportForTest(o < out.len);
+        out[o] = input[i];
+        o += 1;
+        i += 1;
+    }
+    try requireReportForTest(codes_len == 0 and line_start == o);
+    return out[0..o];
+}
+
+test "[property] - [report output]: preserves columns and styling in twelve cases" {
+    for (report_cases_for_test) |case| {
+        var storage: [3]Command = undefined;
+        const commands = try reportCommandsForTest(case.name, &storage);
+        var plain: [8192]u8 = undefined;
+        var ansi: [8192]u8 = undefined;
+        var stripped: [8192]u8 = undefined;
+        var plain_writer = Io.Writer.fixed(&plain);
+        var ansi_writer = Io.Writer.fixed(&ansi);
+        try printCommandResults(&plain_writer, .{ .writer = &plain_writer, .mode = .no_color }, commands);
+        try printCommandResults(&ansi_writer, .{ .writer = &ansi_writer, .mode = .escape_codes }, commands);
+        const text = plain_writer.buffered();
+        try checkReportColumnsForTest(text, case);
+        try std.testing.expectEqualStrings(text, try stripReportStylingForTest(ansi_writer.buffered(), &stripped, case.delta != null));
+        for (commands) |command| try std.testing.expect(std.mem.indexOf(u8, text, command.raw_cmd) != null);
+        if (std.mem.eql(u8, case.name, "1")) {
+            try std.testing.expectEqual(@as(usize, 16), std.mem.count(u8, text, "n/a"));
+            try std.testing.expectEqual(@as(usize, 16), std.mem.count(u8, text, " ± 0.00"));
+            try std.testing.expect(std.mem.indexOf(u8, text, "Benchmark 2 (1 run, 1 failed):") != null);
+        }
+        if (std.mem.eql(u8, case.name, "zero")) try std.testing.expectEqual(@as(usize, 16), std.mem.count(u8, text, "n/a"));
+        if (std.mem.eql(u8, case.name, "extreme")) {
+            try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, text, "18446744TB"));
+            try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, text, "5124096h"));
+        }
+    }
+}
+
+test "[failure] - [report output]: rejects padding, row, and styling mutations" {
+    const expected = ExpectedReportsForTest.ab;
+    const case = report_cases_for_test[2];
+    var changed: [8192]u8 = undefined;
+    var writer = Io.Writer.fixed(&changed);
+    const separator = std.mem.indexOf(u8, expected, " ± ").?;
+    try writer.print("{s} {s}", .{ expected[0..separator], expected[separator..] });
+    try std.testing.expectError(error.BadReport, checkReportColumnsForTest(writer.buffered(), case));
+
+    const row_start = std.mem.indexOf(u8, expected, "  wall_time").?;
+    const row_end = std.mem.indexOfScalarPos(u8, expected, row_start, '\n').? + 1;
+    writer = .fixed(&changed);
+    try writer.print("{s}{s}", .{ expected[0..row_start], expected[row_end..] });
+    try std.testing.expectError(error.BadReport, checkReportColumnsForTest(writer.buffered(), case));
+
+    const second = std.mem.indexOf(u8, expected, "Benchmark 2").?;
+    const second_table = std.mem.indexOfScalarPos(u8, expected, second, '\n').? + 1;
+    writer = .fixed(&changed);
+    try writer.print("{s} {s}", .{ expected[0..second_table], expected[second_table..] });
+    try std.testing.expectError(error.BadReport, checkReportColumnsForTest(writer.buffered(), case));
+
+    var storage: [3]Command = undefined;
+    var colored: [8192]u8 = undefined;
+    var stripped: [8192]u8 = undefined;
+    var color_writer = Io.Writer.fixed(&colored);
+    try printCommandResults(&color_writer, .{ .writer = &color_writer, .mode = .escape_codes }, try reportCommandsForTest("ab", &storage));
+    const ansi = color_writer.buffered();
+    const reset = std.mem.indexOf(u8, ansi, "\x1b[0m").?;
+    writer = .fixed(&changed);
+    try writer.print("{s}{s}", .{ ansi[0..reset], ansi[reset + 4 ..] });
+    try std.testing.expectError(error.BadReport, stripReportStylingForTest(writer.buffered(), &stripped, true));
+    try std.testing.expectError(error.BadReport, stripReportStylingForTest("\x1b[2J", &stripped, true));
 }

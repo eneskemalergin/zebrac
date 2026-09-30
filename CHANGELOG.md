@@ -11,12 +11,13 @@ zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog cov
 
 ### Fixed
 
+- Result tables share column widths across commands and omit trailing padding after the final cell. Labels, values, units, statistics, and JSON remain unchanged.
 - Help and README now explain that RSS and fault counts can include descendants the command waited for. RSS is a maximum, not total simultaneous process-tree memory; background work can still outlive the direct command.
 - The perf-reset regression test now requires the expected failure instead of accepting an incorrect successful reset.
 
 ### Added
 
-- Regression tests for valid UTF-8 command text, quoting, empty arguments, nullable JSON configuration, progress widths, and color resets.
+- Regression tests for complete result tables, shared columns, valid UTF-8 command text, quoting, empty arguments, nullable JSON configuration, progress widths, and color resets.
 - Documentation of the existing single-sample zero-spread convention and the JSON v1 defect that serializes invalid UTF-8 command bytes as arrays. Accepted commands and JSON behavior are unchanged.
 
 ## [0.6.2] - 2026-08-10
