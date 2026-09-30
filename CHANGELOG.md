@@ -7,7 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog covers the poop lineage starting at v0.3.0 and tracks zebrac-specific changes after [0.5.0] section.
 
-## [0.6.3] - Unreleased
+## [0.6.3] - 2026-09-30
+
+0.6.3 aligns columns across command tables and clarifies what zebrac reports. Command syntax, statistical calculations, and JSON schema v1 are unchanged from 0.6.2.
+
+Upgrades from 0.6.1 also receive the 0.6.2 measurement repairs: fresh perf counters per execution, saved samples kept out of later targets, and balanced equal-count sampling across commands.
 
 ### Fixed
 
@@ -18,7 +22,9 @@ zebrac is a fork of [poop](https://github.com/andrewrk/poop). This changelog cov
 ### Added
 
 - Regression tests for complete result tables, shared columns, valid UTF-8 command text, quoting, empty arguments, nullable JSON configuration, progress widths, and color resets.
-- Documentation of the existing single-sample zero-spread convention and the JSON v1 defect that serializes invalid UTF-8 command bytes as arrays. Accepted commands and JSON behavior are unchanged.
+- Documentation of exact sample counts, median/quartile selections, sample standard deviation, failure reporting, and the existing single-sample zero-spread convention.
+- Documentation of the JSON v1 defect that serializes invalid UTF-8 command bytes as arrays. Accepted commands and JSON behavior are unchanged.
+- README link to isocost for speed and memory figures from zebrac JSON.
 
 ## [0.6.2] - 2026-08-10
 
