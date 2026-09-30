@@ -121,6 +121,8 @@ Each result has `sample_count`, `failed_sample_count`, `argv`, and the nine metr
 
 `max_samples_requested` is always present: it is `null` unless the requested maximum was clamped. With valid UTF-8 command text, `command` and each `argv` entry are strings. Known schema v1 defect: invalid UTF-8 text becomes an array of byte values instead. Those commands still execute; readers that require strings should use valid UTF-8 command text.
 
+To compare tools on run time and peak memory together, [isocost](https://github.com/eneskemalergin/isocost) reads this JSON and draws speed and memory figures relative to a reference tool, with a Markdown report and a JSON summary.
+
 ## Build
 
 [Zig](https://ziglang.org/) 0.16.0.
